@@ -62,10 +62,10 @@ marshal :: proc(v: any, opt: Marshal_Options = {}, allocator := context.allocato
 }
 
 marshal_to_builder :: proc(b: ^strings.Builder, v: any, opt: ^Marshal_Options) -> Marshal_Error {
-	return marshal_to_writer(strings.to_writer(b), v, opt)
+	return marshal_to_writer(strings.to_writer(b), v, nil, opt)
 }
 
-marshal_to_writer :: proc(w: io.Writer, v: any, opt: ^Marshal_Options) -> (err: Marshal_Error) {
+marshal_to_writer :: proc(w: io.Writer, v: any, p_ti: ^runtime.Type_Info, opt: ^Marshal_Options) -> (err: Marshal_Error) {
 	if v == nil {
 		io.write_string(w, "null") or_return
 		return
@@ -218,7 +218,7 @@ marshal_to_writer :: proc(w: io.Writer, v: any, opt: ^Marshal_Options) -> (err: 
 		for i in 0..<info.count {
 			opt_write_iteration(w, opt, i) or_return
 			data := uintptr(v.data) + uintptr(i*info.elem_size)
-			marshal_to_writer(w, any{rawptr(data), info.elem.id}, opt) or_return
+			marshal_to_writer(w, any{rawptr(data), info.elem.id}, ti, opt) or_return
 		}
 		opt_write_end(w, opt, ']') or_return
 		
@@ -228,7 +228,7 @@ marshal_to_writer :: proc(w: io.Writer, v: any, opt: ^Marshal_Options) -> (err: 
 		for i in 0..<info.count {
 			opt_write_iteration(w, opt, i) or_return
 			data := uintptr(v.data) + uintptr(i*info.elem_size)
-			marshal_to_writer(w, any{rawptr(data), info.elem.id}, opt) or_return
+			marshal_to_writer(w, any{rawptr(data), info.elem.id}, ti, opt) or_return
 		}
 		opt_write_end(w, opt, ']') or_return
 		
@@ -238,7 +238,7 @@ marshal_to_writer :: proc(w: io.Writer, v: any, opt: ^Marshal_Options) -> (err: 
 		for i in 0..<array.len {
 			opt_write_iteration(w, opt, i) or_return
 			data := uintptr(array.data) + uintptr(i*info.elem_size)
-			marshal_to_writer(w, any{rawptr(data), info.elem.id}, opt) or_return
+			marshal_to_writer(w, any{rawptr(data), info.elem.id}, ti, opt) or_return
 		}
 		opt_write_end(w, opt, ']') or_return
 
@@ -248,7 +248,7 @@ marshal_to_writer :: proc(w: io.Writer, v: any, opt: ^Marshal_Options) -> (err: 
 		for i in 0..<slice.len {
 			opt_write_iteration(w, opt, i) or_return
 			data := uintptr(slice.data) + uintptr(i*info.elem_size)
-			marshal_to_writer(w, any{rawptr(data), info.elem.id}, opt) or_return
+			marshal_to_writer(w, any{rawptr(data), info.elem.id}, ti, opt) or_return
 		}
 		opt_write_end(w, opt, ']') or_return
 
@@ -293,7 +293,7 @@ marshal_to_writer :: proc(w: io.Writer, v: any, opt: ^Marshal_Options) -> (err: 
 					}
 				}
 
-				marshal_to_writer(w, any{value, info.value.id}, opt) or_return
+				marshal_to_writer(w, any{value, info.value.id}, ti, opt) or_return
 			}
 		}
 
@@ -301,6 +301,7 @@ marshal_to_writer :: proc(w: io.Writer, v: any, opt: ^Marshal_Options) -> (err: 
 
 	case runtime.Type_Info_Struct:
 		opt_write_start(w, opt, '{') or_return
+
 		
 		for name, i in info.names {
 			opt_write_iteration(w, opt, i) or_return
@@ -312,7 +313,20 @@ marshal_to_writer :: proc(w: io.Writer, v: any, opt: ^Marshal_Options) -> (err: 
 
 			id := info.types[i].id
 			data := rawptr(uintptr(v.data) + info.offsets[i])
-			marshal_to_writer(w, any{data, id}, opt) or_return
+			marshal_to_writer(w, any{data, id}, ti, opt) or_return
+		}
+
+
+		if p_ti != nil {
+			opt_write_iteration(w, opt, len(info.names)) or_return
+			if p_ti_variant, ok := p_ti.variant.(runtime.Type_Info_Union); ok {
+				v_type_info := type_info_of(v.id)
+
+				if named, ok := v_type_info.variant.(runtime.Type_Info_Named); ok {
+					opt_write_key(w, opt, "__variant") or_return
+					marshal_to_writer(w, named.name, ti, opt) or_return
+				}
+			}
 		}
 
 		opt_write_end(w, opt, '}') or_return
@@ -338,11 +352,11 @@ marshal_to_writer :: proc(w: io.Writer, v: any, opt: ^Marshal_Options) -> (err: 
 			io.write_string(w, "null") or_return
 		} else {
 			id := info.variants[tag-1].id
-			return marshal_to_writer(w, any{v.data, id}, opt)
+			return marshal_to_writer(w, any{v.data, id}, ti, opt)
 		}
 
 	case runtime.Type_Info_Enum:
-		return marshal_to_writer(w, any{v.data, info.base.id}, opt)
+		return marshal_to_writer(w, any{v.data, info.base.id}, ti, opt)
 
 	case runtime.Type_Info_Bit_Set:
 		is_bit_set_different_endian_to_platform :: proc(ti: ^runtime.Type_Info) -> bool {

@@ -204,14 +204,58 @@ unmarshal_value :: proc(p: ^Parser, v: any) -> (err: Unmarshal_Error) {
 	
 	v := v
 	ti := reflect.type_info_base(type_info_of(v.id))
-	// NOTE: If it's a union with only one variant, then treat it as that variant
-	if u, ok := ti.variant.(reflect.Type_Info_Union); ok && len(u.variants) == 1 && token.kind != .Null {
-		variant := u.variants[0]
-		v.id = variant.id
-		ti = reflect.type_info_base(variant)
-		if !reflect.is_pointer_internally(variant) {
-			tag := any{rawptr(uintptr(v.data) + u.tag_offset), u.tag_type.id}
-			assign_int(tag, 1)
+	if u, ok := ti.variant.(reflect.Type_Info_Union); ok && token.kind != .Null {
+		// NOTE: If it's a union with multiple variant, check if the __variant field was written
+		// and get the variant name from it. If found, then use the variant name to find the
+		// correct variant and set the id and tag
+		if len(u.variants) > 1 {
+			pv := p^
+			expect_token(&pv, .Open_Brace)
+
+			variant_set := false
+
+			variant_set_loop: for pv.curr_token.kind != .Close_Brace {
+				key, _ := parse_object_key(&pv, context.temp_allocator)
+				expect_token(&pv, .Colon) or_return
+				field := parse_value(&pv) or_return
+
+				if key == "__variant" {
+					if variant_name, ok := field.(String); ok {
+						for variant, variant_idx in u.variants {
+							if named, ok := variant.variant.(runtime.Type_Info_Named); ok {
+								if named.name == variant_name {
+									v.id = variant.id
+
+									if !reflect.is_pointer_internally(variant) {
+										tag := any{rawptr(uintptr(v.data) + u.tag_offset), u.tag_type.id}
+										assign_int(tag, variant_idx + 1)
+									}
+
+									variant_set = true
+									ti = reflect.type_info_base(variant)
+									break variant_set_loop
+								}
+							}
+						}
+					}
+				}
+
+				parse_comma(&pv)
+			}
+
+			if !variant_set {
+				return .Invalid_Data
+			}
+
+		// NOTE: If it's a union with only one variant, then treat it as that variant
+		} else if len(u.variants) == 1 {
+			variant := u.variants[0]
+			v.id = variant.id
+			ti = reflect.type_info_base(variant)
+			if !reflect.is_pointer_internally(variant) {
+				tag := any{rawptr(uintptr(v.data) + u.tag_offset), u.tag_type.id}
+				assign_int(tag, 1)
+			}
 		}
 	}
 	
