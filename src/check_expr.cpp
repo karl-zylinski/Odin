@@ -349,6 +349,10 @@ gb_internal bool find_or_generate_polymorphic_procedure(CheckerContext *old_c, E
 		return false;
 	}
 
+	if (base_entity->flags & EntityFlag_Disabled) {
+		return false;
+	}
+
 	String name = base_entity->token.string;
 
 	Type *src = base_type(base_entity->type);
@@ -462,7 +466,7 @@ gb_internal bool find_or_generate_polymorphic_procedure(CheckerContext *old_c, E
 
 
 	{
-		// LEAK TODO(bill): This is technically a memory leak as it has to generate the type twice
+		// LEAK NOTE(bill): This is technically a memory leak as it has to generate the type twice
 		bool prev_no_polymorphic_errors = nctx.no_polymorphic_errors;
 		defer (nctx.no_polymorphic_errors = prev_no_polymorphic_errors);
 		nctx.no_polymorphic_errors = false;
@@ -470,7 +474,7 @@ gb_internal bool find_or_generate_polymorphic_procedure(CheckerContext *old_c, E
 		// NOTE(bill): Reset scope from the failed procedure type
 		scope_reset(scope);
 
-		// LEAK TODO(bill): Cloning this AST may be leaky
+		// LEAK NOTE(bill): Cloning this AST may be leaky but this is not really an issue due to arena-based allocation
 		Ast *cloned_proc_type_node = clone_ast(pt->node);
 		success = check_procedure_type(&nctx, final_proc_type, cloned_proc_type_node, &operands);
 		if (!success) {
@@ -778,16 +782,6 @@ gb_internal i64 check_distance_between_types(CheckerContext *c, Operand *operand
 		}
 	}
 
-	// ^T <- rawptr
-#if 0
-	// TODO(bill): Should C-style (not C++) pointer cast be allowed?
-	if (is_type_pointer(dst) && is_type_rawptr(src)) {
-	    return true;
-	}
-#endif
-#if 1
-
-
 	// rawptr <- ^T
 	if (are_types_identical(type, t_rawptr) && is_type_pointer(src)) {
 		return 5;
@@ -808,7 +802,6 @@ gb_internal i64 check_distance_between_types(CheckerContext *c, Operand *operand
 			return 4;
 		}
 	}
-#endif
 
 	if (is_type_polymorphic(dst) && !is_type_polymorphic(src)) {
 		bool modify_type = !c->no_polymorphic_errors;
@@ -824,7 +817,6 @@ gb_internal i64 check_distance_between_types(CheckerContext *c, Operand *operand
 			}
 		}
 
-		// TODO(bill): Determine which rule is a better on in practice
 		if (dst->Union.variants.count == 1) {
 			Type *vt = dst->Union.variants[0];
 			i64 score = check_distance_between_types(c, operand, vt);
@@ -864,8 +856,8 @@ gb_internal i64 check_distance_between_types(CheckerContext *c, Operand *operand
 		}
 	}
 
-	if (is_type_relative_slice(dst)) {
-		i64 score = check_distance_between_types(c, operand, dst->RelativeSlice.slice_type);
+	if (is_type_relative_multi_pointer(dst)) {
+		i64 score = check_distance_between_types(c, operand, dst->RelativeMultiPointer.pointer_type);
 		if (score >= 0) {
 			return score+2;
 		}
@@ -1013,8 +1005,8 @@ gb_internal AstPackage *get_package_of_type(Type *type) {
 		case Type_RelativePointer:
 			type = type->RelativePointer.pointer_type;
 			continue;
-		case Type_RelativeSlice:
-			type = type->RelativeSlice.slice_type;
+		case Type_RelativeMultiPointer:
+			type = type->RelativeMultiPointer.pointer_type;
 			continue;
 		}
 		return nullptr;
@@ -1093,7 +1085,7 @@ gb_internal void check_assignment(CheckerContext *c, Operand *operand, Type *typ
 
 			// TODO(bill): is this a good enough error message?
 			error(operand->expr,
-			      "Cannot assign overloaded procedure '%s' to '%s' in %.*s",
+			      "Cannot assign overloaded procedure group '%s' to '%s' in %.*s",
 			      expr_str,
 			      op_type_str,
 			      LIT(context_name));
@@ -1120,7 +1112,6 @@ gb_internal void check_assignment(CheckerContext *c, Operand *operand, Type *typ
 
 		switch (operand->mode) {
 		case Addressing_Builtin:
-			// TODO(bill): Actually allow built in procedures to be passed around and thus be created on use
 			error(operand->expr,
 			      "Cannot assign built-in procedure '%s' in %.*s",
 			      expr_str,
@@ -1412,9 +1403,6 @@ gb_internal bool is_polymorphic_type_assignable(CheckerContext *c, Type *poly, T
 		return false;
 	case Type_Proc:
 		if (source->kind == Type_Proc) {
-			// return check_is_assignable_to(c, &o, poly);
-			// TODO(bill): Polymorphic type assignment
-			#if 1
 			TypeProc *x = &poly->Proc;
 			TypeProc *y = &source->Proc;
 			if (x->calling_convention != y->calling_convention) {
@@ -1447,7 +1435,6 @@ gb_internal bool is_polymorphic_type_assignable(CheckerContext *c, Type *poly, T
 			}
 
 			return true;
-			#endif
 		}
 		return false;
 	case Type_Map:
@@ -1699,7 +1686,6 @@ gb_internal bool check_unary_op(CheckerContext *c, Operand *o, Token op) {
 		gb_string_free(str);
 		return false;
 	}
-	// TODO(bill): Handle errors correctly
 	Type *type = base_type(core_array_type(o->type));
 	gbString str = nullptr;
 	switch (op.kind) {
@@ -1743,7 +1729,6 @@ gb_internal bool check_unary_op(CheckerContext *c, Operand *o, Token op) {
 gb_internal bool check_binary_op(CheckerContext *c, Operand *o, Token op) {
 	Type *main_type = o->type;
 
-	// TODO(bill): Handle errors correctly
 	Type *type = base_type(core_array_type(main_type));
 	Type *ct = core_type(type);
 
@@ -2261,7 +2246,7 @@ gb_internal bool check_is_not_addressable(CheckerContext *c, Operand *o) {
 }
 
 gb_internal void check_old_for_or_switch_value_usage(Ast *expr) {
-	if (!build_context.strict_style) {
+	if (!(build_context.strict_style || (check_vet_flags(expr) & VetFlag_Style))) {
 		return;
 	}
 
@@ -2351,7 +2336,7 @@ gb_internal void check_unary_expr(CheckerContext *c, Operand *o, Token op, Ast *
 				o->type = alloc_type_pointer(o->type);
 			}
 		} else {
-			if (build_context.strict_style && ast_node_expect(node, Ast_UnaryExpr)) {
+			if (ast_node_expect(node, Ast_UnaryExpr)) {
 				ast_node(ue, UnaryExpr, node);
 				check_old_for_or_switch_value_usage(ue->expr);
 			}
@@ -2775,8 +2760,6 @@ gb_internal void check_shift(CheckerContext *c, Operand *x, Operand *y, Ast *nod
 		gb_string_free(err_str);
 	}
 
-	// TODO(bill): Should we support shifts for fixed arrays and #simd vectors?
-
 	if (!is_type_integer(x->type)) {
 		gbString err_str = expr_to_string(x->expr);
 		error(node, "Shift operand '%s' must be an integer", err_str);
@@ -3099,7 +3082,7 @@ gb_internal void check_cast(CheckerContext *c, Operand *x, Type *type) {
 		update_untyped_expr_type(c, x->expr, final_type, true);
 	}
 
-	if (build_context.vet_extra) {
+	if (check_vet_flags(x->expr) & VetFlag_Extra) {
 		if (are_types_identical(x->type, type)) {
 			gbString str = type_to_string(type);
 			warning(x->expr, "Unneeded cast to the same type '%s'", str);
@@ -3171,7 +3154,7 @@ gb_internal bool check_transmute(CheckerContext *c, Ast *node, Operand *o, Type 
 		return false;
 	}
 
-	if (build_context.vet_extra) {
+	if (check_vet_flags(node) & VetFlag_Extra) {
 		if (are_types_identical(o->type, dst_t)) {
 			gbString str = type_to_string(dst_t);
 			warning(o->expr, "Unneeded transmute to the same type '%s'", str);
@@ -4437,7 +4420,6 @@ gb_internal ExactValue get_constant_field_single(CheckerContext *c, ExactValue v
 	case_end;
 
 	default:
-		// TODO(bill): Should this be a general fallback?
 		if (success_) *success_ = true;
 		if (finish_) *finish_ = true;
 		return empty_exact_value;
@@ -4793,8 +4775,6 @@ gb_internal Entity *check_selector(CheckerContext *c, Operand *operand, Ast *nod
 	}
 
 	if (entity == nullptr && selector->kind == Ast_Ident && is_type_array(type_deref(operand->type))) {
-		// TODO(bill): Simd_Vector swizzling
-
 		String field_name = selector->Ident.token.string;
 		if (1 < field_name.len && field_name.len <= 4) {
 			u8 swizzles_xyzw[4] = {'x', 'y', 'z', 'w'};
@@ -5112,27 +5092,6 @@ gb_internal bool check_identifier_exists(Scope *s, Ast *node, bool nested = fals
 	return false;
 }
 
-gb_internal isize add_dependencies_from_unpacking(CheckerContext *c, Entity **lhs, isize lhs_count, isize tuple_index, isize tuple_count) {
-	if (lhs != nullptr && c->decl != nullptr) {
-		for (isize j = 0; (tuple_index + j) < lhs_count && j < tuple_count; j++) {
-			Entity *e = lhs[tuple_index + j];
-			if (e != nullptr) {
-				DeclInfo *decl = decl_info_of_entity(e);
-				if (decl != nullptr) {
-					rw_mutex_shared_lock(&decl->deps_mutex);
-					rw_mutex_lock(&c->decl->deps_mutex);
-					for (Entity *dep : decl->deps) {
-						ptr_set_add(&c->decl->deps, dep);
-					}
-					rw_mutex_unlock(&c->decl->deps_mutex);
-					rw_mutex_shared_unlock(&decl->deps_mutex);
-				}
-			}
-		}
-	}
-	return tuple_count;
-}
-
 gb_internal bool check_no_copy_assignment(Operand const &o, String const &context) {
 	if (o.type && is_type_no_copy(o.type)) {
 		Ast *expr = unparen_expr(o.expr);
@@ -5240,6 +5199,31 @@ enum UnpackFlag : u32 {
 
 
 gb_internal bool check_unpack_arguments(CheckerContext *ctx, Entity **lhs, isize lhs_count, Array<Operand> *operands, Slice<Ast *> const &rhs_arguments, UnpackFlags flags) {
+	auto const &add_dependencies_from_unpacking = [](CheckerContext *c, Entity **lhs, isize lhs_count, isize tuple_index, isize tuple_count) -> isize {
+		if (lhs == nullptr || c->decl == nullptr) {
+			return tuple_count;
+		}
+		for (isize j = 0; (tuple_index + j) < lhs_count && j < tuple_count; j++) {
+			Entity *e = lhs[tuple_index + j];
+			if (e == nullptr) {
+				continue;
+			}
+			DeclInfo *decl = decl_info_of_entity(e);
+			if (decl == nullptr) {
+				continue;
+			}
+			rw_mutex_shared_lock(&decl->deps_mutex);
+			rw_mutex_lock(&c->decl->deps_mutex);
+			for (Entity *dep : decl->deps) {
+				ptr_set_add(&c->decl->deps, dep);
+			}
+			rw_mutex_unlock(&c->decl->deps_mutex);
+			rw_mutex_shared_unlock(&decl->deps_mutex);
+		}
+		return tuple_count;
+	};
+
+
 	bool allow_ok    = (flags & UnpackFlag_AllowOk) != 0;
 	bool is_variadic = (flags & UnpackFlag_IsVariadic) != 0;
 	bool allow_undef = (flags & UnpackFlag_AllowUndef) != 0;
@@ -5494,6 +5478,8 @@ gb_internal CallArgumentError check_call_arguments_internal(CheckerContext *c, A
 
 	auto variadic_operands = slice(slice_from_array(positional_operands), positional_operand_count, positional_operands.count);
 
+	bool named_variadic_param = false;
+
 	if (named_operands.count != 0) {
 		GB_ASSERT(ce->split_args->named.count == named_operands.count);
 		for_array(i, ce->split_args->named) {
@@ -5518,6 +5504,9 @@ gb_internal CallArgumentError check_call_arguments_internal(CheckerContext *c, A
 				}
 				err = CallArgumentError_ParameterNotFound;
 				continue;
+			}
+			if (pt->variadic && param_index == pt->variadic_index) {
+				named_variadic_param = true;
 			}
 			if (visited[param_index]) {
 				if (show_error) {
@@ -5720,11 +5709,6 @@ gb_internal CallArgumentError check_call_arguments_internal(CheckerContext *c, A
 				}
 				continue;
 			}
-
-			if (param_is_variadic) {
-				continue;
-			}
-
 			score += eval_param_and_score(c, o, e->type, err, param_is_variadic, e, show_error);
 		}
 	}
@@ -7153,7 +7137,7 @@ gb_internal ExprKind check_call_expr(CheckerContext *c, Operand *operand, Ast *c
 		i32 id = operand->builtin_id;
 		Entity *e = entity_of_node(operand->expr);
 		if (e != nullptr && e->token.string == "expand_to_tuple") {
-			warning(operand->expr, "'expand_to_tuple' has been replaced with 'expand_values'");
+			error(operand->expr, "'expand_to_tuple' has been replaced with 'expand_values'");
 		}
 		if (!check_builtin_procedure(c, operand, call, id, type_hint)) {
 			operand->mode = Addressing_Invalid;
@@ -7174,6 +7158,7 @@ gb_internal ExprKind check_call_expr(CheckerContext *c, Operand *operand, Ast *c
 				c->decl->defer_used += 1;
 			}
 		}
+		add_entity_use(c, operand->expr, initial_entity);
 	}
 
 	if (operand->mode != Addressing_ProcGroup) {
@@ -7381,11 +7366,11 @@ gb_internal bool check_set_index_data(Operand *o, Type *t, bool indirection, i64
 		}
 		return true;
 
-	case Type_RelativeSlice:
+	case Type_RelativeMultiPointer:
 		{
-			Type *slice_type = base_type(t->RelativeSlice.slice_type);
-			GB_ASSERT(slice_type->kind == Type_Slice);
-			o->type = slice_type->Slice.elem;
+			Type *pointer_type = base_type(t->RelativeMultiPointer.pointer_type);
+			GB_ASSERT(pointer_type->kind == Type_MultiPointer);
+			o->type = pointer_type->MultiPointer.elem;
 			if (o->mode != Addressing_Constant) {
 				o->mode = Addressing_Variable;
 			}
@@ -7773,7 +7758,10 @@ gb_internal void add_constant_switch_case(CheckerContext *ctx, SeenMap *seen, Op
 		multi_map_get_all(seen, key, taps);
 		for (isize i = 0; i < count; i++) {
 			TypeAndToken tap = taps[i];
-			if (!are_types_identical(operand.type, tap.type)) {
+			Operand to = {};
+			to.mode = Addressing_Value;
+			to.type = tap.type;
+			if (!check_is_assignable_to_with_score(ctx, &to, operand.type, nullptr)) {
 				continue;
 			}
 
@@ -7816,20 +7804,8 @@ gb_internal void add_to_seen_map(CheckerContext *ctx, SeenMap *seen, TokenKind u
 				break;
 			}
 
-			bool found = false;
-			for (Entity *f : bt->Enum.fields) {
-				GB_ASSERT(f->kind == Entity_Constant);
-
-				i64 fv = exact_value_to_i64(f->Constant.value);
-				if (fv == vi) {
-					found = true;
-					break;
-				}
-			}
-			if (found) {
-				v.value = exact_value_i64(vi);
-				add_constant_switch_case(ctx, seen, v);
-			}
+			v.value = exact_value_i64(vi);
+			add_constant_switch_case(ctx, seen, v);
 		}
 	} else {
 		add_constant_switch_case(ctx, seen, lhs);
@@ -9517,14 +9493,14 @@ gb_internal ExprKind check_index_expr(CheckerContext *c, Operand *o, Ast *node, 
 
 	if (is_const) {
 		if (is_type_array(t)) {
-			// OKay
+			// Okay
 		} else if (is_type_slice(t)) {
 			// Okay
 		} else if (is_type_enumerated_array(t)) {
 			// Okay
 		} else if (is_type_string(t)) {
 			// Okay
-		} else if (is_type_relative_slice(t)) {
+		} else if (is_type_relative_multi_pointer(t)) {
 			// Okay
 		} else if (is_type_matrix(t)) {
 			// Okay
@@ -9662,17 +9638,9 @@ gb_internal ExprKind check_slice_expr(CheckerContext *c, Operand *o, Ast *node, 
 		}
 		break;
 
-	case Type_RelativeSlice:
+	case Type_RelativeMultiPointer:
 		valid = true;
-		o->type = t->RelativeSlice.slice_type;
-		if (o->mode != Addressing_Variable) {
-			gbString str = expr_to_string(node);
-			error(node, "Cannot relative slice '%s', as value is not addressable", str);
-			gb_string_free(str);
-			o->mode = Addressing_Invalid;
-			o->expr = node;
-			return kind;
-		}
+		o->type = type_deref(o->type);
 		break;
 
 	case Type_EnumeratedArray:
@@ -9751,7 +9719,18 @@ gb_internal ExprKind check_slice_expr(CheckerContext *c, Operand *o, Ast *node, 
 			x[i:n] -> []T
 		*/
 		o->type = alloc_type_slice(t->MultiPointer.elem);
+	} else if (t->kind == Type_RelativeMultiPointer && se->high != nullptr) {
+		/*
+			x[:]   -> [^]T
+			x[i:]  -> [^]T
+			x[:n]  -> []T
+			x[i:n] -> []T
+		*/
+		Type *pointer_type = base_type(t->RelativeMultiPointer.pointer_type);
+		GB_ASSERT(pointer_type->kind == Type_MultiPointer);
+		o->type = alloc_type_slice(pointer_type->MultiPointer.elem);
 	}
+
 
 	o->mode = Addressing_Value;
 
@@ -10028,7 +10007,7 @@ gb_internal ExprKind check_expr_base_internal(CheckerContext *c, Operand *o, Ast
 			Type *type = type_of_expr(ac->expr);
 			check_cast(c, o, type_hint);
 			if (is_type_typed(type) && are_types_identical(type, type_hint)) {
-				if (build_context.vet_extra) {
+				if (check_vet_flags(node) & VetFlag_Extra) {
 					error(node, "Redundant 'auto_cast' applied to expression");
 				}
 			}

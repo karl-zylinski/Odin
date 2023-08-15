@@ -207,7 +207,7 @@ marshal_to_writer :: proc(w: io.Writer, v: any, p_ti: ^runtime.Type_Info, opt: ^
 	case runtime.Type_Info_Relative_Pointer:
 		return .Unsupported_Type
 
-	case runtime.Type_Info_Relative_Slice:
+	case runtime.Type_Info_Relative_Multi_Pointer:
 		return .Unsupported_Type
 		
 	case runtime.Type_Info_Matrix:
