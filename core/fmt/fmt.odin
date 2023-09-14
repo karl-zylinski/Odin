@@ -327,7 +327,7 @@ ctprintf :: proc(format: string, args: ..any) -> cstring {
 // Returns: A formatted string
 //
 sbprint :: proc(buf: ^strings.Builder, args: ..any, sep := " ") -> string {
-	wprint(strings.to_writer(buf), ..args, sep=sep)
+	wprint(strings.to_writer(buf), ..args, sep=sep, flush=true)
 	return strings.to_string(buf^)
 }
 // Formats and writes to a strings.Builder buffer using the default print settings
@@ -340,7 +340,7 @@ sbprint :: proc(buf: ^strings.Builder, args: ..any, sep := " ") -> string {
 // Returns: The resulting formatted string
 //
 sbprintln :: proc(buf: ^strings.Builder, args: ..any, sep := " ") -> string {
-	wprintln(strings.to_writer(buf), ..args, sep=sep)
+	wprintln(strings.to_writer(buf), ..args, sep=sep, flush=true)
 	return strings.to_string(buf^)
 }
 // Formats and writes to a strings.Builder buffer according to the specified format string
@@ -353,7 +353,7 @@ sbprintln :: proc(buf: ^strings.Builder, args: ..any, sep := " ") -> string {
 // Returns: The resulting formatted string
 //
 sbprintf :: proc(buf: ^strings.Builder, fmt: string, args: ..any) -> string {
-	wprintf(strings.to_writer(buf), fmt, ..args)
+	wprintf(strings.to_writer(buf), fmt, ..args, flush=true)
 	return strings.to_string(buf^)
 }
 // Formats and writes to an io.Writer using the default print settings
@@ -365,7 +365,7 @@ sbprintf :: proc(buf: ^strings.Builder, fmt: string, args: ..any) -> string {
 //
 // Returns: The number of bytes written
 //
-wprint :: proc(w: io.Writer, args: ..any, sep := " ") -> int {
+wprint :: proc(w: io.Writer, args: ..any, sep := " ", flush := true) -> int {
 	fi: Info
 	fi.writer = w
 
@@ -391,7 +391,9 @@ wprint :: proc(w: io.Writer, args: ..any, sep := " ") -> int {
 
 		fmt_value(&fi, args[i], 'v')
 	}
-	io.flush(auto_cast w)
+	if flush {
+		io.flush(w)
+	}
 
 	return fi.n
 }
@@ -404,7 +406,7 @@ wprint :: proc(w: io.Writer, args: ..any, sep := " ") -> int {
 //
 // Returns: The number of bytes written
 //
-wprintln :: proc(w: io.Writer, args: ..any, sep := " ") -> int {
+wprintln :: proc(w: io.Writer, args: ..any, sep := " ", flush := true) -> int {
 	fi: Info
 	fi.writer = w
 
@@ -416,7 +418,9 @@ wprintln :: proc(w: io.Writer, args: ..any, sep := " ") -> int {
 		fmt_value(&fi, args[i], 'v')
 	}
 	io.write_byte(fi.writer, '\n', &fi.n)
-	io.flush(auto_cast w)
+	if flush {
+		io.flush(w)
+	}
 	return fi.n
 }
 // Formats and writes to an io.Writer according to the specified format string
@@ -428,7 +432,7 @@ wprintln :: proc(w: io.Writer, args: ..any, sep := " ") -> int {
 //
 // Returns: The number of bytes written
 //
-wprintf :: proc(w: io.Writer, fmt: string, args: ..any) -> int {
+wprintf :: proc(w: io.Writer, fmt: string, args: ..any, flush := true) -> int {
 	fi: Info
 	arg_index: int = 0
 	end := len(fmt)
@@ -698,8 +702,9 @@ wprintf :: proc(w: io.Writer, fmt: string, args: ..any) -> int {
 		}
 		io.write_string(fi.writer, ")", &fi.n)
 	}
-
-	io.flush(auto_cast w)
+	if flush {
+		io.flush(w)
+	}
 
 	return fi.n
 }
@@ -711,9 +716,11 @@ wprintf :: proc(w: io.Writer, fmt: string, args: ..any) -> int {
 //
 // Returns: The number of bytes written and an io.Error if encountered
 //
-wprint_type :: proc(w: io.Writer, info: ^runtime.Type_Info) -> (int, io.Error) {
+wprint_type :: proc(w: io.Writer, info: ^runtime.Type_Info, flush := true) -> (int, io.Error) {
 	n, err := reflect.write_type(w, info)
-	io.flush(auto_cast w)
+	if flush {
+		io.flush(w)
+	}
 	return n, err
 }
 // Writes a typeid value to an io.Writer
@@ -724,9 +731,11 @@ wprint_type :: proc(w: io.Writer, info: ^runtime.Type_Info) -> (int, io.Error) {
 //
 // Returns: The number of bytes written and an io.Error if encountered
 //
-wprint_typeid :: proc(w: io.Writer, id: typeid) -> (int, io.Error) {
+wprint_typeid :: proc(w: io.Writer, id: typeid, flush := true) -> (int, io.Error) {
 	n, err := reflect.write_type(w, type_info_of(id))
-	io.flush(auto_cast w)
+	if flush {
+		io.flush(w)
+	}
 	return n, err
 }
 // Parses an integer from a given string starting at a specified offset
@@ -1039,6 +1048,65 @@ _fmt_int_128 :: proc(fi: ^Info, u: u128, base: int, is_signed: bool, bit_size: i
 	fi.zero = false
 	_pad(fi, s)
 }
+// Units of measurements:
+__MEMORY_LOWER := " b kib mib gib tib pib eib"
+__MEMORY_UPPER := " B KiB MiB GiB TiB PiB EiB"
+// Formats an integer value as bytes with the best representation.
+//
+// Inputs:
+// - fi: A pointer to an Info structure
+// - u: The integer value to format
+// - is_signed: A boolean indicating if the integer is signed
+// - bit_size: The bit size of the integer
+// - digits: A string containing the digits for formatting
+//
+_fmt_memory :: proc(fi: ^Info, u: u64, is_signed: bool, bit_size: int, units: string) {
+	abs, neg := strconv.is_integer_negative(u, is_signed, bit_size)
+
+	// Default to a precision of 2, but if less than a kb, 0
+	prec := fi.prec if (fi.prec_set || abs < mem.Kilobyte) else 2
+
+	div, off, unit_len := 1, 0, 1
+	for n := abs; n >= mem.Kilobyte; n /= mem.Kilobyte {
+		div *= mem.Kilobyte
+		off += 4
+
+		// First iteration is slightly different because you go from
+		// units of length 1 to units of length 2.
+		if unit_len == 1 {
+			off = 2
+			unit_len  = 3
+		}
+	}
+
+	// If hash, we add a space between the value and the suffix.
+	if fi.hash {
+		unit_len += 1
+	} else {
+		off += 1
+	}
+
+	amt := f64(abs) / f64(div)
+	if neg {
+		amt = -amt
+	}
+
+	buf: [256]byte
+	str := strconv.append_float(buf[:], amt, 'f', prec, 64)
+
+	// Add the unit at the end.
+	copy(buf[len(str):], units[off:off+unit_len])
+	str = string(buf[:len(str)+unit_len])
+	 
+	 if !fi.plus {
+	 	// Strip sign from "+<value>" but not "+Inf".
+	 	if str[0] == '+' && str[1] != 'I' {
+			str = str[1:] 
+		}
+	}
+
+	_pad(fi, str)
+}
 // Hex Values:
 __DIGITS_LOWER := "0123456789abcdefx"
 __DIGITS_UPPER := "0123456789ABCDEFX"
@@ -1087,6 +1155,8 @@ fmt_int :: proc(fi: ^Info, u: u64, is_signed: bool, bit_size: int, verb: rune) {
 			io.write_string(fi.writer, "U+", &fi.n)
 			_fmt_int(fi, u, 16, false, bit_size, __DIGITS_UPPER)
 		}
+	case 'm': _fmt_memory(fi, u, is_signed, bit_size, __MEMORY_LOWER)
+	case 'M': _fmt_memory(fi, u, is_signed, bit_size, __MEMORY_UPPER)
 
 	case:
 		fmt_bad_verb(fi, verb)
