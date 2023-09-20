@@ -62,10 +62,10 @@ marshal :: proc(v: any, opt: Marshal_Options = {}, allocator := context.allocato
 }
 
 marshal_to_builder :: proc(b: ^strings.Builder, v: any, opt: ^Marshal_Options) -> Marshal_Error {
-	return marshal_to_writer(strings.to_writer(b), v, nil, opt)
+	return marshal_to_writer(strings.to_writer(b), v, opt)
 }
 
-marshal_to_writer :: proc(w: io.Writer, v: any, p_ti: ^runtime.Type_Info, opt: ^Marshal_Options) -> (err: Marshal_Error) {
+marshal_to_writer :: proc(w: io.Writer, v: any, opt: ^Marshal_Options) -> (err: Marshal_Error) {
 	if v == nil {
 		io.write_string(w, "null") or_return
 		return
@@ -218,7 +218,7 @@ marshal_to_writer :: proc(w: io.Writer, v: any, p_ti: ^runtime.Type_Info, opt: ^
 		for i in 0..<info.count {
 			opt_write_iteration(w, opt, i) or_return
 			data := uintptr(v.data) + uintptr(i*info.elem_size)
-			marshal_to_writer(w, any{rawptr(data), info.elem.id}, ti, opt) or_return
+			marshal_to_writer(w, any{rawptr(data), info.elem.id}, opt) or_return
 		}
 		opt_write_end(w, opt, ']') or_return
 		
@@ -228,7 +228,7 @@ marshal_to_writer :: proc(w: io.Writer, v: any, p_ti: ^runtime.Type_Info, opt: ^
 		for i in 0..<info.count {
 			opt_write_iteration(w, opt, i) or_return
 			data := uintptr(v.data) + uintptr(i*info.elem_size)
-			marshal_to_writer(w, any{rawptr(data), info.elem.id}, ti, opt) or_return
+			marshal_to_writer(w, any{rawptr(data), info.elem.id}, opt) or_return
 		}
 		opt_write_end(w, opt, ']') or_return
 		
@@ -238,7 +238,7 @@ marshal_to_writer :: proc(w: io.Writer, v: any, p_ti: ^runtime.Type_Info, opt: ^
 		for i in 0..<array.len {
 			opt_write_iteration(w, opt, i) or_return
 			data := uintptr(array.data) + uintptr(i*info.elem_size)
-			marshal_to_writer(w, any{rawptr(data), info.elem.id}, ti, opt) or_return
+			marshal_to_writer(w, any{rawptr(data), info.elem.id}, opt) or_return
 		}
 		opt_write_end(w, opt, ']') or_return
 
@@ -248,7 +248,7 @@ marshal_to_writer :: proc(w: io.Writer, v: any, p_ti: ^runtime.Type_Info, opt: ^
 		for i in 0..<slice.len {
 			opt_write_iteration(w, opt, i) or_return
 			data := uintptr(slice.data) + uintptr(i*info.elem_size)
-			marshal_to_writer(w, any{rawptr(data), info.elem.id}, ti, opt) or_return
+			marshal_to_writer(w, any{rawptr(data), info.elem.id}, opt) or_return
 		}
 		opt_write_end(w, opt, ']') or_return
 
@@ -293,7 +293,7 @@ marshal_to_writer :: proc(w: io.Writer, v: any, p_ti: ^runtime.Type_Info, opt: ^
 					}
 				}
 
-				marshal_to_writer(w, any{value, info.value.id}, ti, opt) or_return
+				marshal_to_writer(w, any{value, info.value.id}, opt) or_return
 			}
 		}
 
@@ -301,7 +301,6 @@ marshal_to_writer :: proc(w: io.Writer, v: any, p_ti: ^runtime.Type_Info, opt: ^
 
 	case runtime.Type_Info_Struct:
 		opt_write_start(w, opt, '{') or_return
-
 		
 		for name, i in info.names {
 			opt_write_iteration(w, opt, i) or_return
@@ -313,50 +312,33 @@ marshal_to_writer :: proc(w: io.Writer, v: any, p_ti: ^runtime.Type_Info, opt: ^
 
 			id := info.types[i].id
 			data := rawptr(uintptr(v.data) + info.offsets[i])
-			marshal_to_writer(w, any{data, id}, ti, opt) or_return
-		}
-
-
-		if p_ti != nil {
-			opt_write_iteration(w, opt, len(info.names)) or_return
-			if p_ti_variant, ok := p_ti.variant.(runtime.Type_Info_Union); ok {
-				v_type_info := type_info_of(v.id)
-
-				if named, ok := v_type_info.variant.(runtime.Type_Info_Named); ok {
-					opt_write_key(w, opt, "__variant") or_return
-					marshal_to_writer(w, named.name, ti, opt) or_return
-				}
-			}
+			marshal_to_writer(w, any{data, id}, opt) or_return
 		}
 
 		opt_write_end(w, opt, '}') or_return
 
 	case runtime.Type_Info_Union:
-		tag_ptr := uintptr(v.data) + info.tag_offset
-		tag_any := any{rawptr(tag_ptr), info.tag_type.id}
-
-		tag: i64 = -1
-		switch i in tag_any {
-		case u8:   tag = i64(i)
-		case i8:   tag = i64(i)
-		case u16:  tag = i64(i)
-		case i16:  tag = i64(i)
-		case u32:  tag = i64(i)
-		case i32:  tag = i64(i)
-		case u64:  tag = i64(i)
-		case i64:  tag = i64(i)
-		case: panic("Invalid union tag type")
-		}
+		tag := reflect.get_union_variant_raw_tag(v)
 
 		if v.data == nil || tag == 0 {
 			io.write_string(w, "null") or_return
 		} else {
+			opt_write_start(w, opt, '{') or_return
+
+		  	opt_write_iteration(w, opt, 0) or_return
+			opt_write_key(w, opt, "tag") or_return
+			marshal_to_writer(w, tag, opt) or_return
+
 			id := info.variants[tag-1].id
-			return marshal_to_writer(w, any{v.data, id}, ti, opt)
+		  	opt_write_iteration(w, opt, 1) or_return
+			opt_write_key(w, opt, "data") or_return
+			marshal_to_writer(w, any{v.data, id}, opt) or_return
+
+			opt_write_end(w, opt, '}') or_return
 		}
 
 	case runtime.Type_Info_Enum:
-		return marshal_to_writer(w, any{v.data, info.base.id}, ti, opt)
+		return marshal_to_writer(w, any{v.data, info.base.id}, opt)
 
 	case runtime.Type_Info_Bit_Set:
 		is_bit_set_different_endian_to_platform :: proc(ti: ^runtime.Type_Info) -> bool {

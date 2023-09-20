@@ -212,15 +212,20 @@ unmarshal_value :: proc(p: ^Parser, v: any) -> (err: Unmarshal_Error) {
 			pv := p^
 			expect_token(&pv, .Open_Brace)
 
-			variant_set := false
+			tag_set := false
+			union_v := v
 
-			variant_set_loop: for pv.curr_token.kind != .Close_Brace {
+			for pv.curr_token.kind != .Close_Brace {
 				key, _ := parse_object_key(&pv, context.temp_allocator)
 				expect_token(&pv, .Colon) or_return
 				field := parse_value(&pv) or_return
 
-				if key == "__variant" {
-					if variant_name, ok := field.(String); ok {
+				if key == "tag" {
+					if tag, ok := field.(i64); ok {
+						reflect.set_union_variant_raw_tag(union_v, tag)
+						tag_set = true
+						id := u.variants[tag-1].id
+						ti = type_info_of(id)
 						for variant, variant_idx in u.variants {
 							if named, ok := variant.variant.(runtime.Type_Info_Named); ok {
 								if named.name == variant_name {
@@ -231,19 +236,22 @@ unmarshal_value :: proc(p: ^Parser, v: any) -> (err: Unmarshal_Error) {
 										assign_int(tag, variant_idx + 1)
 									}
 
-									variant_set = true
+									tag_set = true
 									ti = reflect.type_info_base(variant)
-									break variant_set_loop
 								}
 							}
 						}
 					}
 				}
 
+				if key == "data" {
+					
+				}
+
 				parse_comma(&pv)
 			}
 
-			if !variant_set {
+			if !tag_set || !data_set {
 				return .Invalid_Data
 			}
 
