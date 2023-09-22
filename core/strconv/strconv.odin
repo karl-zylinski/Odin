@@ -927,6 +927,7 @@ parse_f64_prefix :: proc(str: string) -> (value: f64, nr: int, ok: bool) {
 		decimal_point := 0
 
 		use_trimmed_len := false
+		has_trailing_zeroes := true
 		trimmed_len := len(s)
 
 		// Trim off any trailing zeroes after the decimal point. Makes sure we
@@ -936,17 +937,26 @@ parse_f64_prefix :: proc(str: string) -> (value: f64, nr: int, ok: bool) {
 			switch c {
 				case '.':
 					use_trimmed_len = true
-					trimmed_len -= 1
+
+					if has_trailing_zeroes {
+						trimmed_len -= 1
+					}
+
 					break loop_trim
 
 				case '0':
-					trimmed_len -= 1
+					if has_trailing_zeroes {
+						trimmed_len -= 1
+					}
 
-				case: break loop_trim
+				case:
+					has_trailing_zeroes = false
 			}
 		}
 
-		loop: for ; i < (use_trimmed_len ? trimmed_len : len(s)); i += 1 {
+		len_s := use_trimmed_len ? trimmed_len : len(s)
+
+		loop: for ; i < len_s; i += 1 {
 			switch c := s[i]; true {
 			case c == '_':
 				underscores = true
@@ -1000,7 +1010,7 @@ parse_f64_prefix :: proc(str: string) -> (value: f64, nr: int, ok: bool) {
 			nd_mant *= 4
 		}
 
-		if i < len(s) && lower(s[i]) == exp_char {
+		if i < len_s && lower(s[i]) == exp_char {
 			i += 1
 			if i >= len(s) { return }
 			exp_sign := 1
@@ -1008,11 +1018,11 @@ parse_f64_prefix :: proc(str: string) -> (value: f64, nr: int, ok: bool) {
 			case '+': i += 1
 			case '-': i += 1; exp_sign = -1
 			}
-			if i >= len(s) || s[i] < '0' || s[i] > '9' {
+			if i >= len_s || s[i] < '0' || s[i] > '9' {
 				return
 			}
 			e := 0
-			for ; i < len(s) && ('0' <= s[i] && s[i] <= '9' || s[i] == '_'); i += 1 {
+			for ; i < len_s && ('0' <= s[i] && s[i] <= '9' || s[i] == '_'); i += 1 {
 				if s[i] == '_' {
 					underscores = true
 					continue
