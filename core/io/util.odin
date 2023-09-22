@@ -95,6 +95,7 @@ write_f64 :: proc(w: Writer, val: f64, n_written: ^int = nil) -> (n: int, err: E
 	}
 
 	use_trimmed_len := false
+	has_trailing_zeroes := true
 	trimmed_len := len(s)
 
 	// Trim off any trailing zeroes after the decimal point. Makes sure we
@@ -104,15 +105,23 @@ write_f64 :: proc(w: Writer, val: f64, n_written: ^int = nil) -> (n: int, err: E
 		switch c {
 			case '.':
 				use_trimmed_len = true
-				trimmed_len -= 1
+
+				if has_trailing_zeroes {
+					trimmed_len -= 1
+				}
+
 				break loop_trim
 
 			case '0':
-				trimmed_len -= 1
+				if has_trailing_zeroes {
+					trimmed_len -= 1
+				}
 
-			case: break loop_trim
+			case:
+				has_trailing_zeroes = false
 		}
 	}
+
 
 	return write_string(w, string(s[:use_trimmed_len ? trimmed_len : len(s)]), n_written)
 }	
