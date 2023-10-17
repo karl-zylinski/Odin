@@ -4733,8 +4733,7 @@ gb_internal void check_add_foreign_import_decl(CheckerContext *ctx, Ast *decl) {
 	}
 
 	if (has_asm_extension(fullpath)) {
-		if (build_context.metrics.arch != TargetArch_amd64 ||
-		    build_context.metrics.os   != TargetOs_windows) {
+		if (build_context.metrics.arch != TargetArch_amd64) {
 			error(decl, "Assembly files are not yet supported on this platform: %.*s_%.*s",
 			      LIT(target_os_names[build_context.metrics.os]), LIT(target_arch_names[build_context.metrics.arch]));
 		}
@@ -5848,6 +5847,8 @@ gb_internal void check_deferred_procedures(Checker *c) {
 }
 
 gb_internal void check_unique_package_names(Checker *c) {
+	ERROR_BLOCK();
+
 	StringMap<AstPackage *> pkgs = {}; // Key: package name
 	string_map_init(&pkgs, 2*c->info.packages.count);
 	defer (string_map_destroy(&pkgs));
