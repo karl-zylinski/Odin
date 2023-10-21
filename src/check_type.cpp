@@ -613,6 +613,9 @@ gb_internal void check_struct_type(CheckerContext *ctx, Type *struct_type, Ast *
 	
 	scope_reserve(ctx->scope, min_field_count);
 
+	rw_mutex_lock(&struct_type->Struct.fields_mutex);
+	defer (rw_mutex_unlock(&struct_type->Struct.fields_mutex));
+
 	if (st->is_raw_union && min_field_count > 1) {
 		struct_type->Struct.is_raw_union = true;
 		context = str_lit("struct #raw_union");
@@ -1055,24 +1058,6 @@ gb_internal void check_bit_set_type(CheckerContext *c, Type *type, Type *named_t
 		type->BitSet.upper = upper;
 	} else {
 		Type *elem = check_type_expr(c, bs->elem, nullptr);
-
-		#if 0
-		if (named_type != nullptr && named_type->kind == Type_Named &&
-		    elem->kind == Type_Enum) {
-			// NOTE(bill): Anonymous enumeration
-
-			String prefix = named_type->Named.name;
-			String enum_name = concatenate_strings(heap_allocator(), prefix, str_lit(".enum"));
-
-			Token token = make_token_ident(enum_name);
-
-			Entity *e = alloc_entity_type_name(nullptr, token, nullptr, EntityState_Resolved);
-			Type *named = alloc_type_named(enum_name, elem, e);
-			e->type = named;
-			e->TypeName.is_type_alias = true;
-			elem = named;
-		}
-		#endif
 
 		type->BitSet.elem = elem;
 		if (!is_type_valid_bit_set_elem(elem)) {
@@ -2812,7 +2797,7 @@ gb_internal bool check_type_internal(CheckerContext *ctx, Ast *e, Type **type, T
 				Type *bt = base_type(index);
 				GB_ASSERT(bt->kind == Type_Enum);
 
-				Type *t = alloc_type_enumerated_array(elem, index, bt->Enum.min_value, bt->Enum.max_value, Token_Invalid);
+				Type *t = alloc_type_enumerated_array(elem, index, bt->Enum.min_value, bt->Enum.max_value, bt->Enum.fields.count, Token_Invalid);
 
 				bool is_sparse = false;
 				if (at->tag != nullptr) {

@@ -2462,8 +2462,9 @@ gb_internal void add_comparison_procedures_for_fields(CheckerContext *c, Type *t
 			add_package_dependency(c, "runtime", "quaternion256_ne");
 			break;
 		case Basic_cstring:
-			add_package_dependency(c, "runtime", "cstring_to_string");
-			/*fallthrough*/
+			add_package_dependency(c, "runtime", "cstring_eq");
+			add_package_dependency(c, "runtime", "cstring_ne");
+			break;
 		case Basic_string:
 			add_package_dependency(c, "runtime", "string_eq");
 			add_package_dependency(c, "runtime", "string_ne");
@@ -2621,7 +2622,16 @@ gb_internal void check_comparison(CheckerContext *c, Ast *node, Operand *x, Oper
 			if (!is_type_untyped(x->type)) size = gb_max(size, type_size_of(x->type));
 			if (!is_type_untyped(y->type)) size = gb_max(size, type_size_of(y->type));
 
-			if (is_type_string(x->type) || is_type_string(y->type)) {
+			if (is_type_cstring(x->type) && is_type_cstring(y->type)) {
+				switch (op) {
+				case Token_CmpEq: add_package_dependency(c, "runtime", "cstring_eq"); break;
+				case Token_NotEq: add_package_dependency(c, "runtime", "cstring_ne"); break;
+				case Token_Lt:    add_package_dependency(c, "runtime", "cstring_lt"); break;
+				case Token_Gt:    add_package_dependency(c, "runtime", "cstring_gt"); break;
+				case Token_LtEq:  add_package_dependency(c, "runtime", "cstring_le"); break;
+				case Token_GtEq:  add_package_dependency(c, "runtime", "cstring_gt"); break;
+				}
+			} else if (is_type_string(x->type) || is_type_string(y->type)) {
 				switch (op) {
 				case Token_CmpEq: add_package_dependency(c, "runtime", "string_eq"); break;
 				case Token_NotEq: add_package_dependency(c, "runtime", "string_ne"); break;
@@ -3092,14 +3102,6 @@ gb_internal void check_cast(CheckerContext *c, Operand *x, Type *type) {
 		update_untyped_expr_type(c, x->expr, final_type, true);
 	}
 
-	if (check_vet_flags(x->expr) & VetFlag_Extra) {
-		if (are_types_identical(x->type, type)) {
-			gbString str = type_to_string(type);
-			warning(x->expr, "Unneeded cast to the same type '%s'", str);
-			gb_string_free(str);
-		}
-	}
-
 	x->type = type;
 }
 
@@ -3162,14 +3164,6 @@ gb_internal bool check_transmute(CheckerContext *c, Ast *node, Operand *o, Type 
 		o->mode = Addressing_Invalid;
 		o->expr = node;
 		return false;
-	}
-
-	if (check_vet_flags(node) & VetFlag_Extra) {
-		if (are_types_identical(o->type, dst_t)) {
-			gbString str = type_to_string(dst_t);
-			warning(o->expr, "Unneeded transmute to the same type '%s'", str);
-			gb_string_free(str);
-		}
 	}
 
 	o->expr = node;
@@ -3673,18 +3667,7 @@ gb_internal void check_binary_expr(CheckerContext *c, Operand *x, Ast *node, Typ
 		ExactValue b = y->value;
 
 		if (!is_type_constant_type(x->type)) {
-		#if 0
-			gbString xt = type_to_string(x->type);
-			gbString err_str = expr_to_string(node);
-			error(op, "Invalid type, '%s', for constant binary expression '%s'", xt, err_str);
-			gb_string_free(err_str);
-			gb_string_free(xt);
-			x->mode = Addressing_Invalid;
-		#else
-			// NOTE(bill, 2021-04-21): The above is literally a useless error message.
-			// Why did I add it in the first place?!
 			x->mode = Addressing_Value;
-		#endif
 			return;
 		}
 
@@ -3825,6 +3808,15 @@ gb_internal void update_untyped_expr_type(CheckerContext *c, Ast *e, Type *type,
 		}
 
 		update_untyped_expr_type(c, ore->expr, type, final);
+	case_end;
+
+	case_ast_node(obe, OrBranchExpr, e);
+		if (old->value.kind != ExactValue_Invalid) {
+			// See above note in UnaryExpr case
+			break;
+		}
+
+		update_untyped_expr_type(c, obe->expr, type, final);
 	case_end;
 
 	case_ast_node(oee, OrElseExpr, e);
@@ -8194,6 +8186,104 @@ gb_internal ExprKind check_or_return_expr(CheckerContext *c, Operand *o, Ast *no
 	return Expr_Expr;
 }
 
+gb_internal ExprKind check_or_branch_expr(CheckerContext *c, Operand *o, Ast *node, Type *type_hint) {
+	ast_node(be, OrBranchExpr, node);
+
+	String name = be->token.string;
+	Operand x = {};
+	check_multi_expr_with_type_hint(c, &x, be->expr, type_hint);
+	if (x.mode == Addressing_Invalid) {
+		o->mode = Addressing_Value;
+		o->type = t_invalid;
+		o->expr = node;
+		return Expr_Expr;
+	}
+
+	Type *left_type = nullptr;
+	Type *right_type = nullptr;
+	check_or_return_split_types(c, &x, name, &left_type, &right_type);
+	add_type_and_value(c, be->expr, x.mode, x.type, x.value);
+
+	if (right_type == nullptr) {
+		check_or_else_expr_no_value_error(c, name, x, type_hint);
+	} else {
+		if (is_type_boolean(right_type) || type_has_nil(right_type)) {
+			// okay
+		} else {
+			gbString s = type_to_string(right_type);
+			error(node, "'%.*s' requires a boolean or nil-able type, got %s", s);
+			gb_string_free(s);
+		}
+	}
+
+	o->expr = node;
+	o->type = left_type;
+	if (left_type != nullptr) {
+		o->mode = Addressing_Value;
+	} else {
+		o->mode = Addressing_NoValue;
+	}
+
+	if (c->curr_proc_sig == nullptr) {
+		error(node, "'%.*s' can only be used within a procedure", LIT(name));
+	}
+
+	Ast *label = be->label;
+
+	switch (be->token.kind) {
+	case Token_or_break:
+		if ((c->stmt_flags & Stmt_BreakAllowed) == 0 && label == nullptr) {
+			error(be->token, "'%.*s' only allowed in non-inline loops or 'switch' statements", LIT(name));
+		}
+		break;
+	case Token_or_continue:
+		if ((c->stmt_flags & Stmt_ContinueAllowed) == 0 && label == nullptr) {
+			error(be->token, "'%.*s' only allowed in non-inline loops", LIT(name));
+		}
+		break;
+	}
+
+	if (label != nullptr) {
+		if (label->kind != Ast_Ident) {
+			error(label, "A branch statement's label name must be an identifier");
+			return Expr_Expr;
+		}
+		Ast *ident = label;
+		String name = ident->Ident.token.string;
+		Operand o = {};
+		Entity *e = check_ident(c, &o, ident, nullptr, nullptr, false);
+		if (e == nullptr) {
+			error(ident, "Undeclared label name: %.*s", LIT(name));
+			return Expr_Expr;
+		}
+		add_entity_use(c, ident, e);
+		if (e->kind != Entity_Label) {
+			error(ident, "'%.*s' is not a label", LIT(name));
+			return Expr_Expr;
+		}
+		Ast *parent = e->Label.parent;
+		GB_ASSERT(parent != nullptr);
+		switch (parent->kind) {
+		case Ast_BlockStmt:
+		case Ast_IfStmt:
+		case Ast_SwitchStmt:
+			if (be->token.kind != Token_or_break) {
+				error(label, "Label '%.*s' can only be used with 'or_break'", LIT(e->token.string));
+			}
+			break;
+		case Ast_RangeStmt:
+		case Ast_ForStmt:
+			if ((be->token.kind != Token_or_break) && (be->token.kind != Token_or_continue)) {
+				error(label, "Label '%.*s' can only be used with 'or_break' and 'or_continue'", LIT(e->token.string));
+			}
+			break;
+
+		}
+	}
+
+	return Expr_Expr;
+}
+
 
 gb_internal void check_compound_literal_field_values(CheckerContext *c, Slice<Ast *> const &elems, Operand *o, Type *type, bool &is_constant) {
 	Type *bt = base_type(type);
@@ -9948,6 +10038,10 @@ gb_internal ExprKind check_expr_base_internal(CheckerContext *c, Operand *o, Ast
 		return check_or_return_expr(c, o, node, type_hint);
 	case_end;
 
+	case_ast_node(re, OrBranchExpr, node);
+		return check_or_branch_expr(c, o, node, type_hint);
+	case_end;
+
 	case_ast_node(cl, CompoundLit, node);
 		kind = check_compound_literal(c, o, node, type_hint);
 	case_end;
@@ -10014,14 +10108,7 @@ gb_internal ExprKind check_expr_base_internal(CheckerContext *c, Operand *o, Ast
 			return kind;
 		}
 		if (type_hint) {
-			Type *type = type_of_expr(ac->expr);
 			check_cast(c, o, type_hint);
-			if (is_type_typed(type) && are_types_identical(type, type_hint)) {
-				if (check_vet_flags(node) & VetFlag_Extra) {
-					error(node, "Redundant 'auto_cast' applied to expression");
-				}
-			}
-
 		}
 		o->expr = node;
 		return Expr_Expr;
@@ -10512,6 +10599,16 @@ gb_internal gbString write_expr_to_string(gbString str, Ast *node, bool shorthan
 	case_ast_node(oe, OrReturnExpr, node);
 		str = write_expr_to_string(str, oe->expr, shorthand);
 		str = gb_string_appendc(str, " or_return");
+	case_end;
+
+	case_ast_node(oe, OrBranchExpr, node);
+		str = write_expr_to_string(str, oe->expr, shorthand);
+		str = gb_string_append_rune(str, ' ');
+		str = string_append_token(str, oe->token);
+		if (oe->label) {
+			str = gb_string_append_rune(str, ' ');
+			str = write_expr_to_string(str, oe->label, shorthand);
+		}
 	case_end;
 
 	case_ast_node(pe, ParenExpr, node);

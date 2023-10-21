@@ -102,7 +102,12 @@ gb_internal void check_stmt_list(CheckerContext *ctx, Slice<Ast *> const &stmts,
 			new_flags |= Stmt_FallthroughAllowed;
 		}
 
+		u32 prev_stmt_flags = ctx->stmt_flags;
+		ctx->stmt_flags = new_flags;
+
 		check_stmt(ctx, n, new_flags);
+
+		ctx->stmt_flags = prev_stmt_flags;
 
 		if (i+1 < max_non_constant_declaration) {
 			switch (n->kind) {
@@ -1893,7 +1898,7 @@ gb_internal void check_value_decl_stmt(CheckerContext *ctx, Ast *node, u32 mod_f
 		}
 
 		if (is_arch_wasm() && e->Variable.thread_local_model.len != 0) {
-			error(e->token, "@(thread_local) is not supported for this target platform");
+			// error(e->token, "@(thread_local) is not supported for this target platform");
 		}
 
 
@@ -2286,6 +2291,23 @@ gb_internal void check_return_stmt(CheckerContext *ctx, Ast *node) {
 			}
 		}
 	}
+
+	for (Operand &o : operands) {
+		if (o.expr == nullptr) {
+			continue;
+		}
+		if (o.expr->kind != Ast_CompoundLit || !is_type_slice(o.type)) {
+			continue;
+		}
+		ast_node(cl, CompoundLit, o.expr);
+		if (cl->elems.count == 0) {
+			continue;
+		}
+		gbString s = type_to_string(o.type);
+		error(o.expr, "It is unsafe to return a compound literal of a slice ('%s') with elements from a procedure, as the contents of the slice uses the current stack frame's memory", s);
+		gb_string_free(s);
+	}
+
 }
 
 gb_internal void check_for_stmt(CheckerContext *ctx, Ast *node, u32 mod_flags) {
