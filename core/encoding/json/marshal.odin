@@ -19,7 +19,7 @@ Marshal_Error :: union #shared_nil {
 	io.Error,
 }
 
-// Careful with MJSON maps & mjson_keys_use_quotes=false as keys with whitespace will lead to bad results
+// careful with MJSON maps & non quotes usage as keys with whitespace will lead to bad results
 Marshal_Options :: struct {
 	// output based on spec
 	spec: Specification,
@@ -30,8 +30,7 @@ Marshal_Options :: struct {
 	// Use spaces for indentation instead of tabs
 	use_spaces: bool,
 
-	// Given use_spaces being true, use this many spaces per indent level.
-	// Defaulting to 0 means 4 spaces.
+	// Given use_spaces true, use this many spaces per indent level. 0 means 4 spaces.
 	spaces: int,
 
 	// Output uint as hex in JSON5 & MJSON
