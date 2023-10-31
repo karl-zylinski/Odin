@@ -7,6 +7,7 @@ import "core:strconv"
 import "core:strings"
 import "core:reflect"
 import "core:io"
+import "core:slice"
 
 Marshal_Data_Error :: enum {
 	None,
@@ -18,29 +19,47 @@ Marshal_Error :: union #shared_nil {
 	io.Error,
 }
 
-// careful with MJSON maps & non quotes usage as keys without whitespace will lead to bad results
+// Options for marshalling (see marshal/marshal_to_writer/marshal_to_builder
+// procs) or writing (see write/write_to_builder/write_to_writer procs).
+//
+// WARNING: If you use MJSON spec and have keys containing whitespace, then make
+// sure to set mjson_keys_use_quotes=true. Not doing so will lead to bad data.
 Marshal_Options :: struct {
 	// output based on spec
 	spec: Specification,
 
-	// use line breaks & tab|spaces
+	// Use line breaks & tabs/spaces
 	pretty: bool, 
 
-	// spacing
+	// Use spaces for indentation instead of tabs
 	use_spaces: bool,
+
+	// Given use_spaces being true, use this many spaces per indent level.
+	// Defaulting to 0 means 4 spaces.
 	spaces: int,
 
-	// state
-	indentation: int,
-
-	// option to output uint in JSON5 & MJSON
+	// Output uint as hex in JSON5 & MJSON
 	write_uint_as_hex: bool, 
 
-	// mjson output options
+	// If spec is MJSON and this is true, then keys will be quoted.
+	//
+	// WARNING: If your keys contain whitespace and this is false, then the
+	// output will be bad.
 	mjson_keys_use_quotes: bool,
+
+	// If spec is MJSON and this is true, then use '=' as delimiter between
+	// keys and values, otherwise ':' is used.
 	mjson_keys_use_equal_sign: bool,
 
-	// mjson state
+	// If you use the write/write_to_builder/write_to_builder procs and this is
+	// true, then sort the json Objects by key before outputting. Does nothing
+	// when using marshal/marshal_to_writer/marshal_to_builder procs.
+	//
+	// NOTE: This will temp allocate and sort a list for each object.
+	sort_objects_by_key: bool,
+
+	// Internal state used during marshal / write
+	indentation: int,
 	mjson_skipped_first_braces_start: bool,
 	mjson_skipped_first_braces_end: bool,
 }
@@ -424,8 +443,9 @@ opt_write_key :: proc(w: io.Writer, opt: ^Marshal_Options, name: string) -> (err
 
 // insert start byte and increase indentation on pretty
 opt_write_start :: proc(w: io.Writer, opt: ^Marshal_Options, c: byte) -> (err: io.Error)  {
-	// skip mjson starting braces
-	if opt.spec == .MJSON && !opt.mjson_skipped_first_braces_start {
+	// Skip MJSON starting braces. We make sure to only do this for c == '{',
+	// skipping a starting '[' is not allowed.
+	if opt.spec == .MJSON && !opt.mjson_skipped_first_braces_start && opt.indentation == 0 && c == '{' {
 		opt.mjson_skipped_first_braces_start = true
 		return
 	}
@@ -473,11 +493,9 @@ opt_write_iteration :: proc(w: io.Writer, opt: ^Marshal_Options, iteration: int)
 
 // decrease indent, write spacing and insert end byte
 opt_write_end :: proc(w: io.Writer, opt: ^Marshal_Options, c: byte) -> (err: io.Error)  {
-	if opt.spec == .MJSON && opt.mjson_skipped_first_braces_start && !opt.mjson_skipped_first_braces_end {
-		if opt.indentation == 0 {
-			opt.mjson_skipped_first_braces_end = true
-			return
-		}
+	if opt.spec == .MJSON && opt.mjson_skipped_first_braces_start && !opt.mjson_skipped_first_braces_end && opt.indentation == 0 && c == '}' {
+		opt.mjson_skipped_first_braces_end = true
+		return
 	}
 
 	opt.indentation -= 1
@@ -506,6 +524,83 @@ opt_write_indentation :: proc(w: io.Writer, opt: ^Marshal_Options) -> (err: io.E
 		for _ in 0..<opt.indentation {
 			io.write_byte(w, '\t') or_return
 		}
+	}
+
+	return
+}
+
+// Similar to marshal, but writes a JSON value directly instead marshaling
+// using reflection.
+write :: proc(value: Value, opt: Marshal_Options = {}, allocator := context.allocator) -> (data: []byte, err: Marshal_Error) {
+	b := strings.builder_make(allocator)
+	defer if err != nil {
+		strings.builder_destroy(&b)
+	}
+
+	opt := opt
+	write_to_builder(&b, value, &opt) or_return
+
+	if len(b.buf) != 0 {
+		data = b.buf[:]
+	}
+
+	return data, nil
+}
+
+write_to_builder :: proc(b: ^strings.Builder, value: Value, opt: ^Marshal_Options) -> Marshal_Error {
+	return write_to_writer(strings.to_writer(b), value, opt)
+}
+
+write_to_writer :: proc(w: io.Writer, value: Value, opt: ^Marshal_Options) -> (err: Marshal_Error) {
+	switch v in value {
+		case Null:
+			io.write_string(w, "null") or_return
+
+		case Integer:
+			io.write_i64(w, v) or_return
+
+		case Float:
+			io.write_f64(w, v) or_return
+
+		case Boolean:
+			io.write_string(w, v ? "true" : "false") or_return
+
+		case String:
+			io.write_quoted_string(w, v, '"', nil, true) or_return
+
+		case Array:
+			opt_write_start(w, opt, '[') or_return
+			for item, i in v {
+				opt_write_iteration(w, opt, i) or_return
+				write_to_writer(w, item, opt) or_return
+			}
+			opt_write_end(w, opt, ']') or_return
+
+		case Object:
+			opt_write_start(w, opt, '{') or_return
+
+			if opt.sort_objects_by_key {
+				entries, _ := slice.map_entries(v, context.temp_allocator)
+				slice.sort_by(entries, proc(i, j: slice.Map_Entry(string, Value)) -> bool { return i.key < j.key })
+
+				i := 0
+				for e in entries {
+					opt_write_iteration(w, opt, i) or_return
+					opt_write_key(w, opt, e.key) or_return
+					write_to_writer(w, e.value, opt) or_return
+					i += 1
+				}
+			} else {
+				i := 0
+				for key, value in v {
+					opt_write_iteration(w, opt, i) or_return
+					opt_write_key(w, opt, key) or_return
+					write_to_writer(w, value, opt) or_return
+					i += 1
+				}
+			}
+
+			opt_write_end(w, opt, '}') or_return
 	}
 
 	return
