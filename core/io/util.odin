@@ -94,39 +94,46 @@ write_f64 :: proc(w: Writer, val: f64, n_written: ^int = nil) -> (n: int, err: E
 		s = s[1:]
 	}
 
-	use_trimmed_len := false
-	has_trailing_zeroes := true
-	trimmed_len := len(s)
+	trimmed_string := trim_decimal_string(string(s))
+	return write_string(w, trimmed_string, n_written)
+}	
 
-	// Trim off any trailing zeroes after the decimal point. Makes sure we
-	// don't output unnecessary zeroes.
-	loop_trim: for ti := len(s) - 1; ti >= 0 ; ti -= 1 {
-		c := s[ti]
-		switch c {
-			case '.':
-				use_trimmed_len = true
+/*
+Given a string such as 0.123000, trim off the trailing zeroes. Note: 0.0000 will be trimmed to just 0.
 
-				if has_trailing_zeroes {
-					trimmed_len -= 1
-				}
+**Inputs**
+- s: String representing a decimal number
 
-				break loop_trim
+**Returns**
+- A slice of the string with any trailing zeroes removed.
+*/
+@(private="file")
+trim_decimal_string :: proc "contextless" (s: string) -> string {
+	if len(s) == 0 || s[len(s)-1] != '0' {
+		return s
+	}
 
+	// We have at least one trailing zero. Search backwards and find the rest.
+	trailing_start_idx := len(s)-1
+	trailing_loop: for i := len(s) - 2; i >= 0 ; i -= 1 {
+		switch s[i] {
 			case '0':
-				if has_trailing_zeroes {
-					trimmed_len -= 1
+				if trailing_start_idx == i + 1 {
+					trailing_start_idx = i
 				}
 
-			case:
-				has_trailing_zeroes = false
+			case '.':
+				if trailing_start_idx == i + 1 {
+					// Removes point completely for numbers like 0.000
+					trailing_start_idx = i
+				}
+
+				return s[:trailing_start_idx]
 		}
 	}
 
-
-	return write_string(w, string(s[:use_trimmed_len ? trimmed_len : len(s)]), n_written)
-}	
-
-
+	return s
+}
 
 
 @(private="file")

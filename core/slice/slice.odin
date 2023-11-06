@@ -275,7 +275,7 @@ concatenate :: proc(a: []$T/[]$E, allocator := context.allocator) -> (res: T, er
 // copies a slice into a new slice
 @(require_results)
 clone :: proc(a: $T/[]$E, allocator := context.allocator, loc := #caller_location) -> ([]E, runtime.Allocator_Error) #optional_allocator_error {
-	d, err := make([]E, len(a), allocator)
+	d, err := make([]E, len(a), allocator, loc)
 	copy(d[:], a)
 	return d, err
 }
@@ -283,7 +283,7 @@ clone :: proc(a: $T/[]$E, allocator := context.allocator, loc := #caller_locatio
 
 // copies slice into a new dynamic array
 clone_to_dynamic :: proc(a: $T/[]$E, allocator := context.allocator, loc := #caller_location) -> ([dynamic]E, runtime.Allocator_Error) #optional_allocator_error {
-	d, err := make([dynamic]E, len(a), allocator)
+	d, err := make([dynamic]E, len(a), allocator, loc)
 	copy(d[:], a)
 	return d, err
 }
