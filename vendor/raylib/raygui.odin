@@ -23,9 +23,7 @@ when ODIN_OS == .Windows {
 } else when ODIN_OS == .Darwin {
 	when ODIN_ARCH == .arm64 {
 		when RAYGUI_SHARED {
-			foreign import lib {
-				"macos-arm64/libraygui.dylib",
-			}
+			// #panic("Cannot link libraygui.450.dylib: not in the vendor collection")
 		} else {
 			foreign import lib {
 				"macos-arm64/libraygui.a",
@@ -36,9 +34,7 @@ when ODIN_OS == .Windows {
 		}
 	} else {
 		when RAYGUI_SHARED {
-			foreign import lib {
-				"macos/libraygui.dylib",
-			}
+			// #panic("Cannot link libraygui.450.dylib: not in the vendor collection")
 		} else {
 			foreign import lib {
 				"macos/libraygui.a",
@@ -74,18 +70,6 @@ GuiTextAlignment :: enum c.int {
 	TEXT_ALIGN_LEFT = 0,
 	TEXT_ALIGN_CENTER,
 	TEXT_ALIGN_RIGHT,
-}
-
-GuiTextAlignmentVertical :: enum c.int {
-	TEXT_ALIGN_TOP = 0,
-	TEXT_ALIGN_MIDDLE,
-	TEXT_ALIGN_BOTTOM,
-}
-
-GuiTextWrapMode :: enum c.int {
-	TEXT_WRAP_NONE = 0,
-	TEXT_WRAP_CHAR,
-	TEXT_WRAP_WORD,
 }
 
 // Gui controls
@@ -300,7 +284,6 @@ foreign lib {
 	GuiLabelButton      :: proc(bounds: Rectangle, text: cstring) -> bool ---                                // Label button control, show true when clicked
 	GuiToggle           :: proc(bounds: Rectangle, text: cstring, active: ^bool) -> c.int ---                 // Toggle Button control, returns true when active
 	GuiToggleGroup      :: proc(bounds: Rectangle, text: cstring, active: ^c.int) -> c.int ---                // Toggle Group control, returns active toggle index
-	GuiToggleSlider     :: proc(bounds: Rectangle, text: cstring, active: ^c.int) -> c.int ---
 	GuiCheckBox         :: proc(bounds: Rectangle, text: cstring, checked: ^bool) -> bool ---                // Check Box control, returns true when active
 	GuiComboBox         :: proc(bounds: Rectangle, text: cstring, active: ^c.int) -> c.int ---                // Combo Box control, returns selected item index
 	
