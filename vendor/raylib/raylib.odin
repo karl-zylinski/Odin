@@ -1189,10 +1189,12 @@ foreign lib {
 	IsMouseButtonPressed  :: proc(button: MouseButton) -> bool ---    // Detect if a mouse button has been pressed once
 	IsMouseButtonDown     :: proc(button: MouseButton) -> bool ---    // Detect if a mouse button is being pressed
 	IsMouseButtonReleased :: proc(button: MouseButton) -> bool ---    // Detect if a mouse button has been released once
-	// IsMouseButtonUp    :: proc(button: MouseButton) -> bool ---       Detect if a mouse button is NOT being pressed
-	IsMouseButtonUp       :: proc(button: MouseButton) -> bool {      // TODO: remove this when Raylib fixes this bug
-		return !IsMouseButtonDown(button)
+
+	when VERSION != "5.0" {
+		#panic("IsMouseButtonUp was broken in Raylib 5.0 but should be fixed in Raylib > 5.0. Remove this panic and the when block around it and also remove the workaround version of IsMouseButtonUp just after the end of the 'foreign lib {' block.")
+		IsMouseButtonUp       :: proc(button: MouseButton) -> bool ---
 	}
+	
 	GetMouseX             :: proc() -> c.int ---                      // Returns mouse position X
 	GetMouseY             :: proc() -> c.int ---                      // Returns mouse position Y
 	GetMousePosition      :: proc() -> Vector2 ---                    // Returns mouse position XY
@@ -1709,7 +1711,14 @@ foreign lib {
 	DetachAudioMixedProcessor :: proc(processor: AudioCallback) --- // Detach audio stream processor from the entire audio pipeline
 }
 
-
+// Workaround for broken IsMouseButtonUp in Raylib 5.0.
+when VERSION == "5.0" {
+	IsMouseButtonUp :: proc(button: MouseButton) -> bool {
+		return !IsMouseButtonDown(button)
+	}
+} else {
+	#panic("Remove this this when block and everything inside it for Raylib > 5.0. It's just here to fix a bug in Raylib 5.0. See IsMouseButtonUp inside 'foreign lib {' block.")
+}
 
 // Text formatting with variables (sprintf style)
 TextFormat :: proc(text: cstring, args: ..any) -> cstring { 
