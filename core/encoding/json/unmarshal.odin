@@ -85,6 +85,11 @@ assign_bool :: proc(val: any, b: bool) -> bool {
 @(private)
 assign_int :: proc(val: any, i: $T) -> bool {
 	v := reflect.any_core(val)
+
+	if ti, is_bitset := type_info_of(val.id).variant.(reflect.Type_Info_Bit_Set); is_bitset {
+		v = any { val.data, reflect.type_info_core(ti.elem).id }
+	}
+
 	switch &dst in v {
 	case i8:      dst = i8     (i)
 	case i16:     dst = i16    (i)
