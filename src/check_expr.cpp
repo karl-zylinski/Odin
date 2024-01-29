@@ -2988,6 +2988,13 @@ gb_internal bool check_is_castable_to(CheckerContext *c, Operand *operand, Type 
 	}
 	// proc <-> proc
 	if (is_type_proc(src) && is_type_proc(dst)) {
+		if (is_type_polymorphic(dst)) {
+			if (is_type_polymorphic(src) &&
+			    operand->mode == Addressing_Variable) {
+				return true;
+			}
+			return false;
+		}
 		return true;
 	}
 
@@ -3067,7 +3074,6 @@ gb_internal void check_cast(CheckerContext *c, Operand *x, Type *type) {
 
 	bool is_const_expr = x->mode == Addressing_Constant;
 	bool can_convert = check_cast_internal(c, x, type);
-
 	if (!can_convert) {
 		TEMPORARY_ALLOCATOR_GUARD();
 		gbString expr_str  = expr_to_string(x->expr, temporary_allocator());

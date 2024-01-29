@@ -1085,7 +1085,7 @@ gb_internal void init_universal(void) {
 
 	add_global_constant("ODIN_COMPILE_TIMESTAMP", t_untyped_integer, exact_value_i64(odin_compile_timestamp()));
 
-	add_global_bool_constant("__ODIN_LLVM_F16_SUPPORTED", lb_use_new_pass_system());
+	add_global_bool_constant("__ODIN_LLVM_F16_SUPPORTED", lb_use_new_pass_system() && !is_arch_wasm());
 
 	{
 		GlobalEnumValue values[3] = {
@@ -2517,18 +2517,22 @@ gb_internal void generate_minimum_dependency_set(Checker *c, Entity *start) {
 
 		// Odin internal procedures
 		str_lit("__init_context"),
-		str_lit("cstring_to_string"),
+		// str_lit("cstring_to_string"),
 		str_lit("_cleanup_runtime"),
 
 		// Pseudo-CRT required procedures
 		str_lit("memset"),
-		str_lit("memcpy"),
-		str_lit("memmove"),
 
 		// Utility procedures
 		str_lit("memory_equal"),
 		str_lit("memory_compare"),
 		str_lit("memory_compare_zero"),
+	);
+
+	// Only required if no CRT is present
+	FORCE_ADD_RUNTIME_ENTITIES(build_context.no_crt,
+		str_lit("memcpy"),
+		str_lit("memmove"),
 	);
 
 	FORCE_ADD_RUNTIME_ENTITIES(!build_context.tilde_backend,
