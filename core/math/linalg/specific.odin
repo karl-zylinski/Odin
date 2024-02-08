@@ -1,6 +1,6 @@
 package linalg
 
-import "core:builtin"
+import "base:builtin"
 import "core:math"
 
 F16_EPSILON :: 1e-3
@@ -1271,6 +1271,43 @@ matrix2_adjoint :: proc{
 
 
 @(require_results)
+matrix2_rotate_f16 :: proc "contextless" (angle_radians: f16) -> Matrix2f16 {
+	c := math.cos(angle_radians)
+	s := math.sin(angle_radians)
+
+	return Matrix2f16{
+		c, -s,
+		s,  c,
+	}
+}
+@(require_results)
+matrix2_rotate_f32 :: proc "contextless" (angle_radians: f32) -> Matrix2f32 {
+	c := math.cos(angle_radians)
+	s := math.sin(angle_radians)
+
+	return Matrix2f32{
+		c, -s,
+		s,  c,
+	}
+}
+@(require_results)
+matrix2_rotate_f64 :: proc "contextless" (angle_radians: f64) -> Matrix2f64 {
+	c := math.cos(angle_radians)
+	s := math.sin(angle_radians)
+
+	return Matrix2f64{
+		c, -s,
+		s,  c,
+	}
+}
+matrix2_rotate :: proc{
+	matrix2_rotate_f16,
+	matrix2_rotate_f32,
+	matrix2_rotate_f64,
+}
+
+
+@(require_results)
 matrix3_from_quaternion_f16 :: proc "contextless" (q: Quaternionf16) -> (m: Matrix3f16) {
 	qxx := q.x * q.x
 	qyy := q.y * q.y
@@ -1447,16 +1484,16 @@ matrix3_adjoint :: proc{
 
 
 @(require_results)
-matrix3_inverse_transpose_f16 :: proc "contextless" (m: Matrix3f16) -> (inverse_transpose: Matrix3f16) {
-	return builtin.inverse_transpose(m)
+matrix3_inverse_transpose_f16 :: proc "contextless" (m: Matrix3f16) -> (p: Matrix3f16) {
+	return inverse_transpose(m)
 }
 @(require_results)
-matrix3_inverse_transpose_f32 :: proc "contextless" (m: Matrix3f32) -> (inverse_transpose: Matrix3f32) {
-	return builtin.inverse_transpose(m)
+matrix3_inverse_transpose_f32 :: proc "contextless" (m: Matrix3f32) -> (p: Matrix3f32) {
+	return inverse_transpose(m)
 }
 @(require_results)
-matrix3_inverse_transpose_f64 :: proc "contextless" (m: Matrix3f64) -> (inverse_transpose: Matrix3f64) {
-	return builtin.inverse_transpose(m)
+matrix3_inverse_transpose_f64 :: proc "contextless" (m: Matrix3f64) -> (p: Matrix3f64) {
+	return inverse_transpose(m)
 }
 matrix3_inverse_transpose :: proc{
 	matrix3_inverse_transpose_f16,

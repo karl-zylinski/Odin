@@ -230,6 +230,10 @@ gb_internal Ast *clone_ast(Ast *node, AstFile *f) {
 	case Ast_OrReturnExpr:
 		n->OrReturnExpr.expr = clone_ast(n->OrReturnExpr.expr, f);
 		break;
+	case Ast_OrBranchExpr:
+		n->OrBranchExpr.label = clone_ast(n->OrBranchExpr.label, f);
+		n->OrBranchExpr.expr  = clone_ast(n->OrBranchExpr.expr, f);
+		break;
 	case Ast_TypeAssertion:
 		n->TypeAssertion.expr = clone_ast(n->TypeAssertion.expr, f);
 		n->TypeAssertion.type = clone_ast(n->TypeAssertion.type, f);
@@ -5460,6 +5464,11 @@ gb_internal bool determine_path_from_string(BlockingMutex *file_mutex, Ast *node
 
 
 	if (collection_name.len > 0) {
+		// NOTE(bill): `base:runtime` == `core:runtime`
+		if (collection_name == "core" && string_starts_with(file_str, str_lit("runtime"))) {
+			collection_name = str_lit("base");
+		}
+
 		if (collection_name == "system") {
 			if (node->kind != Ast_ForeignImportDecl) {
 				syntax_error(node, "The library collection 'system' is restrict for 'foreign_library'");
@@ -5489,13 +5498,12 @@ gb_internal bool determine_path_from_string(BlockingMutex *file_mutex, Ast *node
 #endif
 	}
 
-
 	if (is_package_name_reserved(file_str)) {
 		*path = file_str;
-		if (collection_name == "core") {
+		if (collection_name == "core" || collection_name == "base") {
 			return true;
 		} else {
-			syntax_error(node, "The package '%.*s' must be imported with the core library collection: 'core:%.*s'", LIT(file_str), LIT(file_str));
+			syntax_error(node, "The package '%.*s' must be imported with the 'base' library collection: 'base:%.*s'", LIT(file_str), LIT(file_str));
 			return false;
 		}
 	}
@@ -5511,7 +5519,8 @@ gb_internal bool determine_path_from_string(BlockingMutex *file_mutex, Ast *node
 	if (has_windows_drive) {
 		*path = file_str;
 	} else {
-		String fullpath = string_trim_whitespace(get_fullpath_relative(permanent_allocator(), base_dir, file_str));
+		bool ok = false;
+		String fullpath = string_trim_whitespace(get_fullpath_relative(permanent_allocator(), base_dir, file_str, &ok));
 		*path = fullpath;
 	}
 	return true;
@@ -6133,7 +6142,11 @@ gb_internal ParseFileError parse_packages(Parser *p, String init_filename) {
 	{ // Add these packages serially and then process them parallel
 		TokenPos init_pos = {};
 		{
-			String s = get_fullpath_core(permanent_allocator(), str_lit("runtime"));
+			bool ok = false;
+			String s = get_fullpath_base_collection(permanent_allocator(), str_lit("runtime"), &ok);
+			if (!ok) {
+				compiler_error("Unable to find The 'base:runtime' package. Is the ODIN_ROOT set up correctly?");
+			}
 			try_add_import_path(p, s, s, init_pos, Package_Runtime);
 		}
 
@@ -6141,7 +6154,11 @@ gb_internal ParseFileError parse_packages(Parser *p, String init_filename) {
 		p->init_fullpath = init_fullpath;
 
 		if (build_context.command_kind == Command_test) {
-			String s = get_fullpath_core(permanent_allocator(), str_lit("testing"));
+			bool ok = false;
+			String s = get_fullpath_core_collection(permanent_allocator(), str_lit("testing"), &ok);
+			if (!ok) {
+				compiler_error("Unable to find The 'core:testing' package. Is the ODIN_ROOT set up correctly?");
+			}
 			try_add_import_path(p, s, s, init_pos, Package_Normal);
 		}
 		
