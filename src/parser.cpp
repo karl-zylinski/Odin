@@ -1343,10 +1343,11 @@ gb_internal Ast *ast_package_decl(AstFile *f, Token token, Token name, CommentGr
 	return result;
 }
 
-gb_internal Ast *ast_import_decl(AstFile *f, Token token, Token relpath, Token import_name,
+gb_internal Ast *ast_import_decl(AstFile *f, Token token, bool is_using, Token relpath, Token import_name,
                      CommentGroup *docs, CommentGroup *comment) {
 	Ast *result = alloc_ast_node(f, Ast_ImportDecl);
 	result->ImportDecl.token       = token;
+	result->ImportDecl.is_using    = is_using;
 	result->ImportDecl.relpath     = relpath;
 	result->ImportDecl.import_name = import_name;
 	result->ImportDecl.docs        = docs;
@@ -5020,7 +5021,7 @@ gb_internal Ast *parse_import_decl(AstFile *f, ImportDeclKind kind) {
 		syntax_error(import_name, "Cannot use 'import' within a procedure. This must be done at the file scope");
 		s = ast_bad_decl(f, import_name, file_path);
 	} else {
-		s = ast_import_decl(f, token, file_path, import_name, docs, f->line_comment);
+		s = ast_import_decl(f, token, kind == ImportDecl_Using, file_path, import_name, docs, f->line_comment);
 		array_add(&f->imports, s);
 	}
 
@@ -5029,7 +5030,7 @@ gb_internal Ast *parse_import_decl(AstFile *f, ImportDeclKind kind) {
 	}
 
 	if (kind != ImportDecl_Standard) {
-		syntax_error(import_name, "'using import' is not allowed, please use the import name explicitly");
+	//	syntax_error(import_name, "'using import' is not allowed, please use the import name explicitly");
 	}
 
 	expect_semicolon(f);

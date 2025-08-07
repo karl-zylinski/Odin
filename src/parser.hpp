@@ -635,6 +635,7 @@ AST_KIND(_DeclBegin,      "", bool) \
 	AST_KIND(ImportDecl, "import declaration", struct { \
 		AstPackage *package;    \
 		Token    token;         \
+		bool     is_using;      \
 		Token    relpath;       \
 		String   fullpath;      \
 		Token    import_name;   \

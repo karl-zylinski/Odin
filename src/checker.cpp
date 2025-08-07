@@ -4913,6 +4913,12 @@ gb_internal void add_import_dependency_node(Checker *c, Ast *decl, PtrMap<AstPac
 		import_graph_node_set_add(&n->succ, m);
 		import_graph_node_set_add(&m->pred, n);
 		ptr_set_add(&m->scope->imported, n->scope);
+
+		if (id->is_using) {
+			import_graph_node_set_add(&n->pred, m);
+			import_graph_node_set_add(&m->succ, n);
+			ptr_set_add(&m->scope->imported, n->scope);
+		}
 	case_end;
 
 	case_ast_node(ws, WhenStmt, decl);
@@ -5118,6 +5124,10 @@ gb_internal void check_add_import_decl(CheckerContext *ctx, Ast *decl) {
 		force_use = true;
 	}
 
+	if (id->is_using) {
+		force_use = true;
+	}
+
 
 	if (is_blank_ident(import_name) && !is_blank_ident(id->import_name.string)) {
 		String invalid_name = id->fullpath;
@@ -5141,6 +5151,23 @@ gb_internal void check_add_import_decl(CheckerContext *ctx, Ast *decl) {
 		add_entity(ctx, parent_scope, nullptr, e);
 		if (force_use) {
 			add_entity_use(ctx, nullptr, e);
+		}
+	}
+
+	if (id->is_using) {
+		for_array(elem_index, scope->elements) {
+			Entity *e = scope->elements.entries[elem_index].value;
+			if (e->scope == parent_scope) continue;
+
+			if (!is_entity_kind_exported(e->kind)) {
+				continue;
+			}
+			if (is_entity_exported(e)) {
+				Entity *found = scope_insert_with_name(parent_scope, e->token.string, e);
+				if (found != nullptr) {
+					error(id->token, "'using import %.*s' imports %.*s, but it already exists in this scope.", LIT(id->import_name.string), LIT(e->token.string));
+				}
+			}
 		}
 	}
 
