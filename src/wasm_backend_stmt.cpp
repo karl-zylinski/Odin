@@ -12,12 +12,24 @@ gb_internal void wb_emit_defers_down_to(wbProcedure *p, isize first) {
 	for (isize i = p->defers.count-1; i >= first; i--) {
 		wbDefer d = p->defers[i];
 		// Statements inside a deferred statement must not see the defers registered
-		// after it (nor itself), so temporarily hide them
+		// after it (nor itself), so temporarily hide them. Likewise they see the
+		// `context` that was current when the defer was registered.
 		isize saved_count = p->defers.count;
 		p->defers.count = i;
+		auto saved_contexts = array_make<wbContextData>(temporary_allocator(), 0, p->context_stack.count);
+		for (isize j = d.context_stack_count; j < p->context_stack.count; j++) {
+			array_add(&saved_contexts, p->context_stack[j]);
+		}
+		p->context_stack.count = d.context_stack_count;
+
 		wb_open_scope(p);
 		wb_build_stmt(p, d.stmt);
 		wb_close_scope(p);
+
+		p->context_stack.count = d.context_stack_count;
+		for (wbContextData const &cd : saved_contexts) {
+			array_add(&p->context_stack, cd);
+		}
 		p->defers.count = saved_count;
 	}
 }
@@ -26,6 +38,24 @@ gb_internal void wb_close_scope(wbProcedure *p) {
 	isize marker = array_pop(&p->scopes);
 	wb_emit_defers_down_to(p, marker);
 	p->defers.count = marker;
+	// `context` values created in this scope go out of scope
+	isize scope_index = p->scopes.count;
+	while (p->context_stack.count > 0 && p->context_stack[p->context_stack.count-1].scope_index >= scope_index) {
+		p->context_stack.count -= 1;
+	}
+}
+
+// True if the assignment target is `context` or a (nested) field of it
+gb_internal bool wb_lhs_is_context(Ast *lhs) {
+	lhs = unparen_expr(lhs);
+	while (lhs->kind == Ast_SelectorExpr) {
+		Ast *base = unparen_expr(lhs->SelectorExpr.expr);
+		if (is_type_pointer(type_of_expr(base))) {
+			return false;
+		}
+		lhs = base;
+	}
+	return lhs->kind == Ast_Implicit && lhs->Implicit.kind == Token_context;
 }
 
 gb_internal void wb_push_label(wbProcedure *p, Ast *label, u32 break_depth, u32 continue_depth, bool is_loop, bool is_switch = false, u32 fall_depth = 0) {
@@ -109,6 +139,13 @@ gb_internal void wb_build_assign_stmt(wbProcedure *p, AstAssignStmt *as, Ast *no
 				wb_build_expr(p, as->rhs[0]);
 				return;
 			}
+			if (wb_lhs_is_context(lhs)) {
+				// Writing to the context copies it first (see wb_context_for_write)
+				wbValue v = wb_value_fresh(p, wb_emit_conv(p, wb_build_expr(p, as->rhs[0]), type_of_expr(lhs)));
+				wb_context_for_write(p);
+				wb_addr_store(p, wb_build_addr(p, lhs), v);
+				return;
+			}
 			wbAddr addr = wb_build_addr(p, lhs);
 			wbValue v = wb_build_expr(p, as->rhs[0]);
 			wb_addr_store(p, addr, v);
@@ -120,6 +157,10 @@ gb_internal void wb_build_assign_stmt(wbProcedure *p, AstAssignStmt *as, Ast *no
 		for (Ast *lhs : as->lhs) {
 			lhs = unparen_expr(lhs);
 			wbAddr addr = {};
+			if (wb_lhs_is_context(lhs)) {
+				wb_unsupported(p, lhs, "assignment to context in a multiple assignment");
+				return;
+			}
 			if (!(lhs->kind == Ast_Ident && is_blank_ident(lhs))) {
 				addr = wb_build_addr(p, lhs);
 			}
@@ -153,6 +194,9 @@ gb_internal void wb_build_assign_stmt(wbProcedure *p, AstAssignStmt *as, Ast *no
 		return;
 	}
 	Type *type = type_of_expr(lhs);
+	if (wb_lhs_is_context(lhs)) {
+		wb_context_for_write(p);
+	}
 	wbAddr addr = wb_build_addr(p, lhs);
 	if (addr.kind == wbAddr_Invalid) {
 		return;
@@ -204,7 +248,14 @@ gb_internal void wb_build_return_stmt(wbProcedure *p, AstReturnStmt *rs, Ast *no
 			values[i] = wb_value_fresh(p, values[i]);
 		}
 	}
-	if (rs->results.count != 0 && p->result_addrs.count > 0) {
+	wb_emit_return_values(p, values, rs->results.count != 0);
+}
+
+// Returns the given (converted, fresh) values: runs the defers and leaves the procedure
+gb_internal void wb_emit_return_values(wbProcedure *p, Array<wbValue> const &values, bool store_named) {
+	Type *pt = base_type(p->type);
+	GB_ASSERT(values.count == pt->Proc.result_count);
+	if (store_named && p->result_addrs.count > 0) {
 		for_array(i, values) {
 			wb_addr_store(p, p->result_addrs[i], values[i]);
 		}
@@ -218,19 +269,18 @@ gb_internal void wb_build_return_stmt(wbProcedure *p, AstReturnStmt *rs, Ast *no
 			i64 offset = type_offset_of(pt->Proc.results, i, &ft);
 			wb_addr_store(p, wb_addr_memory(cast(u32)p->sret_local, cast(i32)offset, ft), values[i]);
 		}
-	} else {
+	} else if (values.count > 0) {
 		wb_push(p, values[0]);
 	}
 	wb_emit_epilogue(p);
 	wb_op(p, wbOp_return);
 }
 
-gb_internal void wb_build_branch_stmt(wbProcedure *p, AstBranchStmt *bs, Ast *node) {
-	TokenKind kind = bs->token.kind;
-
+// Emits a break/continue/fallthrough (also used by `or_break`/`or_continue`)
+gb_internal void wb_emit_branch(wbProcedure *p, TokenKind kind, Ast *label, Ast *node) {
 	Ast *target_label = nullptr;
-	if (bs->label != nullptr) {
-		Entity *e = entity_of_node(bs->label);
+	if (label != nullptr) {
+		Entity *e = entity_of_node(label);
 		GB_ASSERT(e != nullptr && e->kind == Entity_Label);
 		target_label = e->Label.node;
 	}
@@ -274,6 +324,10 @@ gb_internal void wb_build_branch_stmt(wbProcedure *p, AstBranchStmt *bs, Ast *no
 	wb_unsupported(p, node, "branch target");
 }
 
+gb_internal void wb_build_branch_stmt(wbProcedure *p, AstBranchStmt *bs, Ast *node) {
+	wb_emit_branch(p, bs->token.kind, bs->label, node);
+}
+
 gb_internal void wb_build_value_decl(wbProcedure *p, AstValueDecl *vd, Ast *node) {
 	if (!vd->is_mutable) {
 		return;
@@ -289,8 +343,10 @@ gb_internal void wb_build_value_decl(wbProcedure *p, AstValueDecl *vd, Ast *node
 	}
 
 	// Evaluate initializers before declaring the new variables
+	// (`x: T = ---` is simply zero initialized here)
+	bool is_uninit = vd->values.count == 1 && unparen_expr(vd->values[0])->kind == Ast_Uninit;
 	auto values = array_make<wbValue>(temporary_allocator(), 0, vd->names.count);
-	if (!is_static) {
+	if (!is_static && !is_uninit) {
 		wb_build_expr_list(p, vd->values, &values);
 	}
 	if (values.count != 0 && values.count != vd->names.count) {
@@ -453,7 +509,7 @@ gb_internal bool wb_range_val_is_ref(Ast *val) {
 }
 
 gb_internal void wb_build_range_interval(wbProcedure *p, AstRangeStmt *rs, Ast *node, Ast *val0, Ast *val1) {
-	ast_node(be, BinaryExpr, rs->expr);
+	ast_node(be, BinaryExpr, unparen_expr(rs->expr));
 	if (rs->reverse) {
 		wb_unsupported(p, node, "'#reverse' interval loop");
 		return;
@@ -535,7 +591,8 @@ gb_internal void wb_build_range_interval(wbProcedure *p, AstRangeStmt *rs, Ast *
 
 // Ranges over arrays, slices, strings (as bytes are not iterated: runes are) and dynamic arrays
 gb_internal void wb_build_range_indexed(wbProcedure *p, AstRangeStmt *rs, Ast *node, Ast *val0, Ast *val1) {
-	Type *expr_type = type_of_expr(rs->expr);
+	Ast *range_expr = unparen_expr(rs->expr);
+	Type *expr_type = type_of_expr(range_expr);
 	Type *bt = base_type(expr_type);
 	bool val0_ref = wb_range_val_is_ref(val0);
 
@@ -548,14 +605,14 @@ gb_internal void wb_build_range_indexed(wbProcedure *p, AstRangeStmt *rs, Ast *n
 	if (bt->kind == Type_Pointer) {
 		// ^[N]T etc. iterate the pointed-to value in place
 		Type *pointee = type_deref(expr_type);
-		wbValue ptr = wb_build_expr(p, rs->expr);
+		wbValue ptr = wb_build_expr(p, range_expr);
 		if (ptr.kind == wbValue_Invalid) return;
 		base = wb_addr_from_pointer(p, ptr, pointee);
 		bt = base_type(pointee);
 	} else if (val0_ref) {
-		base = wb_build_addr(p, rs->expr);
+		base = wb_build_addr(p, range_expr);
 	} else {
-		wbValue v = wb_build_expr(p, rs->expr);
+		wbValue v = wb_build_expr(p, range_expr);
 		if (v.kind == wbValue_Invalid) return;
 		v = wb_value_copy(p, v);
 		base = wb_value_to_addr(p, v);
@@ -706,6 +763,187 @@ gb_internal void wb_build_range_indexed(wbProcedure *p, AstRangeStmt *rs, Ast *n
 	wb_close(p); // break
 }
 
+// Range over a call returning (values..., ok: bool): the call is repeated until
+// the last result is false
+gb_internal void wb_build_range_tuple(wbProcedure *p, AstRangeStmt *rs, Ast *node, Type *tuple_type) {
+	GB_ASSERT(tuple_type->kind == Type_Tuple);
+	isize tuple_count = tuple_type->Tuple.variables.count;
+	GB_ASSERT(tuple_count >= 1);
+	GB_ASSERT(rs->vals.count <= tuple_count);
+
+	u32 break_depth = wb_open_block(p);
+	u32 loop_depth = wb_open_loop(p);
+
+	wbValue tuple = wb_build_expr(p, unparen_expr(rs->expr));
+	if (tuple.kind == wbValue_Invalid) {
+		wb_close(p);
+		wb_close(p);
+		return;
+	}
+	wbValue cond = wb_tuple_field(p, tuple, tuple_count-1);
+	wb_push(p, cond);
+	wb_op(p, wbOp_i32_eqz);
+	wb_br_if(p, break_depth);
+
+	wb_open_scope(p);
+	for_array(i, rs->vals) {
+		Ast *val = wb_strip_and_prefix(rs->vals[i]);
+		if (val != nullptr) {
+			wb_store_range_val(p, val, wb_tuple_field(p, tuple, i));
+		}
+	}
+
+	u32 continue_depth = wb_open_block(p);
+	wb_push_label(p, rs->label, break_depth, continue_depth, true);
+	wb_build_stmt(p, rs->body);
+	wb_pop_label(p);
+	wb_close(p); // continue
+	wb_close_scope(p);
+
+	wb_br(p, loop_depth);
+	wb_close(p); // loop
+	wb_close(p); // break
+}
+
+// Range over the elements of a bit_set, in increasing (or with #reverse
+// decreasing) order: repeatedly extract and clear the lowest (highest) set bit
+gb_internal void wb_build_range_bit_set(wbProcedure *p, AstRangeStmt *rs, Ast *node, Ast *val0) {
+	Ast *range_expr = unparen_expr(rs->expr);
+	Type *expr_type = type_of_expr(range_expr);
+	wbValue set = wb_build_expr(p, range_expr);
+	if (set.kind == wbValue_Invalid) {
+		return;
+	}
+	if (is_type_pointer(set.type)) {
+		set = wb_addr_load(p, wb_addr_from_pointer(p, set, type_deref(set.type)));
+		expr_type = type_deref(expr_type);
+	}
+	Type *bt = base_type(expr_type);
+	GB_ASSERT(bt->kind == Type_BitSet);
+	Type *elem = bt->BitSet.elem;
+	Type *mask_type = bit_set_to_int(bt);
+	i64 lower = bt->BitSet.lower;
+	bool wide = wb_is_int128(mask_type);
+	wbValType vt = wide ? wbValType_i64 : wb_valtype_of(mask_type);
+	i64 bits = 8*type_size_of(mask_type);
+
+	// remaining = set & all_set_mask
+	set.type = mask_type;
+	wbValue masked = wb_emit_arith(p, node, Token_And, set, wb_const(p, node, mask_type, exact_bit_set_all_set_mask(bt)), mask_type, mask_type);
+	if (masked.kind == wbValue_Invalid) {
+		return;
+	}
+	u32 lo = wb_add_local(p, vt);
+	u32 hi = 0;
+	if (wide) {
+		wbAddr a = wb_value_to_addr(p, masked);
+		hi = wb_add_local(p, vt);
+		wb_push(p, wb_emit_load(p, a.index, a.offset,     t_u64)); wb_local_set(p, lo);
+		wb_push(p, wb_emit_load(p, a.index, a.offset + 8, t_u64)); wb_local_set(p, hi);
+	} else {
+		wb_push(p, masked);
+		wb_local_set(p, lo);
+	}
+
+	u32 break_depth = wb_open_block(p);
+	u32 loop_depth = wb_open_loop(p);
+
+	// exit when nothing remains
+	wb_local_get(p, lo);
+	if (wide) {
+		wb_local_get(p, hi);
+		wb_op(p, wbOp_i64_or);
+	}
+	wb_op(p, vt == wbValType_i64 ? wbOp_i64_eqz : wbOp_i32_eqz);
+	wb_br_if(p, break_depth);
+
+	// index of the bit to visit, and its removal from the remaining set
+	u32 index = wb_add_local(p, vt);
+	if (wide) {
+		if (rs->reverse) {
+			// hi != 0 ? 127 - clz(hi) : 63 - clz(lo)
+			wb_i64_const(p, 127); wb_local_get(p, hi); wb_op(p, wbOp_i64_clz); wb_op(p, wbOp_i64_sub);
+			wb_i64_const(p, 63);  wb_local_get(p, lo); wb_op(p, wbOp_i64_clz); wb_op(p, wbOp_i64_sub);
+			wb_local_get(p, hi); wb_i64_const(p, 0); wb_op(p, wbOp_i64_ne);
+			wb_op(p, wbOp_select);
+			wb_local_set(p, index);
+			// clear bit `index` in whichever word holds it
+			wb_local_get(p, hi);
+			wb_i64_const(p, 1); wb_local_get(p, index); wb_i64_const(p, 64); wb_op(p, wbOp_i64_sub); wb_op(p, wbOp_i64_shl);
+			wb_i64_const(p, 0);
+			wb_local_get(p, hi); wb_i64_const(p, 0); wb_op(p, wbOp_i64_ne);
+			wb_op(p, wbOp_select);
+			wb_op(p, wbOp_i64_xor);
+			wb_local_get(p, lo);
+			wb_i64_const(p, 0);
+			wb_i64_const(p, 1); wb_local_get(p, index); wb_op(p, wbOp_i64_shl);
+			wb_local_get(p, hi); wb_i64_const(p, 0); wb_op(p, wbOp_i64_ne);
+			wb_op(p, wbOp_select);
+			wb_op(p, wbOp_i64_xor);
+			wb_local_set(p, lo);
+			wb_local_set(p, hi);
+		} else {
+			// lo != 0 ? ctz(lo) : 64 + ctz(hi)
+			wb_local_get(p, lo); wb_op(p, wbOp_i64_ctz);
+			wb_local_get(p, hi); wb_op(p, wbOp_i64_ctz); wb_i64_const(p, 64); wb_op(p, wbOp_i64_add);
+			wb_local_get(p, lo); wb_i64_const(p, 0); wb_op(p, wbOp_i64_ne);
+			wb_op(p, wbOp_select);
+			wb_local_set(p, index);
+			// hi' = lo != 0 ? hi : hi & (hi-1); lo' = lo & (lo-1)
+			wb_local_get(p, hi);
+			wb_local_get(p, hi); wb_local_get(p, hi); wb_i64_const(p, 1); wb_op(p, wbOp_i64_sub); wb_op(p, wbOp_i64_and);
+			wb_local_get(p, lo); wb_i64_const(p, 0); wb_op(p, wbOp_i64_ne);
+			wb_op(p, wbOp_select);
+			wb_local_set(p, hi);
+			wb_local_get(p, lo); wb_local_get(p, lo); wb_i64_const(p, 1); wb_op(p, wbOp_i64_sub); wb_op(p, wbOp_i64_and);
+			wb_local_set(p, lo);
+		}
+	} else if (vt == wbValType_i64) {
+		if (rs->reverse) {
+			wb_i64_const(p, bits-1); wb_local_get(p, lo); wb_op(p, wbOp_i64_clz); wb_op(p, wbOp_i64_sub);
+			wb_local_set(p, index);
+			wb_local_get(p, lo); wb_i64_const(p, 1); wb_local_get(p, index); wb_op(p, wbOp_i64_shl); wb_op(p, wbOp_i64_xor);
+		} else {
+			wb_local_get(p, lo); wb_op(p, wbOp_i64_ctz);
+			wb_local_set(p, index);
+			wb_local_get(p, lo); wb_local_get(p, lo); wb_i64_const(p, 1); wb_op(p, wbOp_i64_sub); wb_op(p, wbOp_i64_and);
+		}
+		wb_local_set(p, lo);
+	} else {
+		if (rs->reverse) {
+			wb_i32_const(p, 31); wb_local_get(p, lo); wb_op(p, wbOp_i32_clz); wb_op(p, wbOp_i32_sub);
+			wb_local_set(p, index);
+			wb_local_get(p, lo); wb_i32_const(p, 1); wb_local_get(p, index); wb_op(p, wbOp_i32_shl); wb_op(p, wbOp_i32_xor);
+		} else {
+			wb_local_get(p, lo); wb_op(p, wbOp_i32_ctz);
+			wb_local_set(p, index);
+			wb_local_get(p, lo); wb_local_get(p, lo); wb_i32_const(p, 1); wb_op(p, wbOp_i32_sub); wb_op(p, wbOp_i32_and);
+		}
+		wb_local_set(p, lo);
+	}
+
+	wb_open_scope(p);
+	if (val0 != nullptr) {
+		Type *it = vt == wbValType_i64 ? t_i64 : t_i32;
+		wb_local_get(p, index);
+		if (vt == wbValType_i64) { wb_i64_const(p, lower); wb_op(p, wbOp_i64_add); }
+		else                     { wb_i32_const(p, cast(i32)lower); wb_op(p, wbOp_i32_add); }
+		wbValue v = wb_pop_to_local(p, vt, it);
+		wb_store_range_val(p, val0, wb_emit_conv(p, v, elem));
+	}
+
+	u32 continue_depth = wb_open_block(p);
+	wb_push_label(p, rs->label, break_depth, continue_depth, true);
+	wb_build_stmt(p, rs->body);
+	wb_pop_label(p);
+	wb_close(p); // continue
+	wb_close_scope(p);
+
+	wb_br(p, loop_depth);
+	wb_close(p); // loop
+	wb_close(p); // break
+}
+
 gb_internal void wb_build_range_stmt(wbProcedure *p, AstRangeStmt *rs, Ast *node) {
 	wb_open_scope(p);
 	if (rs->init != nullptr) {
@@ -720,6 +958,8 @@ gb_internal void wb_build_range_stmt(wbProcedure *p, AstRangeStmt *rs, Ast *node
 		wb_build_range_interval(p, rs, node, val0, val1);
 	} else if (tv.mode == Addressing_Type) {
 		wb_unsupported(p, node, "range over a type");
+	} else if (tv.type != nullptr && base_type(tv.type)->kind == Type_Tuple) {
+		wb_build_range_tuple(p, rs, node, base_type(tv.type));
 	} else {
 		Type *bt = base_type(tv.type);
 		if (bt->kind == Type_Pointer) {
@@ -730,6 +970,12 @@ gb_internal void wb_build_range_stmt(wbProcedure *p, AstRangeStmt *rs, Ast *node
 		case Type_Slice:
 		case Type_DynamicArray:
 			wb_build_range_indexed(p, rs, node, val0, val1);
+			break;
+		case Type_BitSet:
+			wb_build_range_bit_set(p, rs, node, val0);
+			break;
+		case Type_Map:
+			wb_build_range_map(p, rs, node, val0, val1);
 			break;
 		case Type_Basic:
 			if (is_type_string(bt) && !is_type_cstring(bt)) {
@@ -768,12 +1014,13 @@ gb_internal void wb_build_switch_stmt(wbProcedure *p, AstSwitchStmt *ss, Ast *no
 		if (is_type_untyped(tag_type)) {
 			tag_type = default_type(tag_type);
 		}
-		if (!wb_is_scalar(tag_type)) {
-			wb_unsupported_type(p, ss->tag, tag_type);
-			wb_close_scope(p);
-			return;
+		tag = wb_emit_conv(p, wb_build_expr(p, ss->tag), tag_type);
+		if (wb_is_scalar(tag_type)) {
+			tag = wb_value_fresh(p, tag);
+		} else if (tag.kind != wbValue_Invalid) {
+			// aggregate (string, struct, ...): keep a private copy in a temp
+			tag = wb_value_copy(p, tag);
 		}
-		tag = wb_value_fresh(p, wb_emit_conv(p, wb_build_expr(p, ss->tag), tag_type));
 		if (tag.kind == wbValue_Invalid) {
 			wb_close_scope(p);
 			return;
@@ -810,8 +1057,8 @@ gb_internal void wb_build_switch_stmt(wbProcedure *p, AstSwitchStmt *ss, Ast *no
 				TokenKind hi_op = be->op.kind == Token_RangeHalf ? Token_Lt : Token_LtEq;
 				wbValue lo = wb_emit_conv(p, wb_build_expr(p, be->left),  tag_type);
 				wbValue hi = wb_emit_conv(p, wb_build_expr(p, be->right), tag_type);
-				wbValue c0 = wb_emit_arith(p, expr, Token_GtEq, tag, lo, tag_type, t_bool);
-				wbValue c1 = wb_emit_arith(p, expr, hi_op,      tag, hi, tag_type, t_bool);
+				wbValue c0 = wb_emit_compare(p, expr, Token_GtEq, tag, lo, tag_type, t_bool);
+				wbValue c1 = wb_emit_compare(p, expr, hi_op,      tag, hi, tag_type, t_bool);
 				if (c0.kind == wbValue_Invalid || c1.kind == wbValue_Invalid) {
 					continue;
 				}
@@ -821,7 +1068,7 @@ gb_internal void wb_build_switch_stmt(wbProcedure *p, AstSwitchStmt *ss, Ast *no
 				cond = wb_pop_to_local(p, wbValType_i32, t_bool);
 			} else {
 				wbValue v = wb_emit_conv(p, wb_build_expr(p, expr), tag_type);
-				cond = wb_emit_arith(p, expr, Token_CmpEq, tag, v, tag_type, t_bool);
+				cond = wb_emit_compare(p, expr, Token_CmpEq, tag, v, tag_type, t_bool);
 			}
 			if (cond.kind == wbValue_Invalid) {
 				continue;
@@ -848,7 +1095,145 @@ gb_internal void wb_build_switch_stmt(wbProcedure *p, AstSwitchStmt *ss, Ast *no
 	wb_close_scope(p);
 }
 
+// Binds the implicit variable of a type switch clause to the value at `data`
+// (by value: a copy is made so that later assignments to the parent do not
+// change it; by reference: the parent's storage is aliased)
+gb_internal void wb_bind_type_case(wbProcedure *p, Ast *clause, wbAddr data) {
+	Entity *e = implicit_entity_of_node(clause);
+	GB_ASSERT(e != nullptr);
+	if (data.kind != wbAddr_Memory) {
+		wb_unsupported(p, clause, "type switch on a value held in a register (internal error)");
+		return;
+	}
+	data.type = e->type;
+	if (e->flags & EntityFlag_Value) {
+		wbAddr var = wb_add_variable(p, e);
+		wb_addr_store(p, var, wb_addr_load(p, data));
+	} else {
+		map_set(&p->variables, e, data);
+	}
+}
+
+// switch v in u { case T: ... } (lb_build_type_switch_stmt)
+gb_internal void wb_build_type_switch_stmt(wbProcedure *p, AstTypeSwitchStmt *ss, Ast *node) {
+	wb_open_scope(p);
+
+	ast_node(as, AssignStmt, ss->tag);
+	GB_ASSERT(as->lhs.count == 1);
+	GB_ASSERT(as->rhs.count == 1);
+
+	wbValue parent = wb_build_expr(p, as->rhs[0]);
+	if (parent.kind == wbValue_Invalid) {
+		wb_close_scope(p);
+		return;
+	}
+	Type *parent_base_type = type_deref(parent.type);
+	TypeSwitchKind switch_kind = check_valid_type_switch_type(parent.type);
+	GB_ASSERT(switch_kind != TypeSwitch_Invalid);
+
+	// The parent's storage: the union/any itself, or what the pointer points to
+	wbAddr parent_addr = {};
+	if (is_type_pointer(parent.type)) {
+		parent_addr = wb_addr_from_pointer(p, wb_value_fresh(p, parent), parent_base_type);
+	} else {
+		parent_addr = wb_value_to_addr(p, parent);
+	}
+	if (parent_addr.kind != wbAddr_Memory) {
+		wb_unsupported(p, node, "type switch operand");
+		wb_close_scope(p);
+		return;
+	}
+	wbValue parent_value = wb_value_memory(parent_addr.index, parent_addr.offset, parent_base_type);
+
+	wbValue tag = {};
+	Type *tag_type = nullptr;
+	if (switch_kind == TypeSwitch_Union) {
+		tag = wb_value_fresh(p, wb_emit_union_tag(p, node, parent_value));
+		tag_type = tag.type;
+	} else {
+		tag = wb_addr_load(p, wb_addr_field(parent_addr, 1));
+		tag_type = t_typeid;
+	}
+
+	ast_node(body, BlockStmt, ss->body);
+	Slice<Ast *> const &clauses = body->stmts;
+	isize n = clauses.count;
+	isize default_index = -1;
+	for_array(i, clauses) {
+		ast_node(cc, CaseClause, clauses[i]);
+		if (cc->list.count == 0) {
+			default_index = i;
+		}
+	}
+
+	u32 exit_depth = wb_open_block(p);
+	auto body_depths = array_make<u32>(temporary_allocator(), n);
+	for (isize i = n-1; i >= 0; i--) {
+		body_depths[i] = wb_open_block(p);
+	}
+
+	// Dispatch
+	for_array(i, clauses) {
+		ast_node(cc, CaseClause, clauses[i]);
+		for (Ast *type_expr : cc->list) {
+			Type *case_type = type_of_expr(type_expr);
+			wbValue on_val = {};
+			if (switch_kind == TypeSwitch_Union) {
+				on_val = wb_const_union_tag(parent_base_type, case_type);
+			} else if (is_type_untyped_nil(case_type)) {
+				on_val = wb_value_const_int(t_typeid, 0);
+			} else {
+				on_val = wb_typeid(case_type);
+			}
+			wbValue cond = wb_emit_arith(p, type_expr, Token_CmpEq, tag, wb_emit_conv(p, on_val, tag_type), tag_type, t_bool);
+			if (cond.kind == wbValue_Invalid) {
+				continue;
+			}
+			wb_push(p, cond);
+			wb_br_if(p, body_depths[i]);
+		}
+	}
+	wb_br(p, default_index >= 0 ? body_depths[default_index] : exit_depth);
+
+	// Clause bodies
+	for_array(i, clauses) {
+		ast_node(cc, CaseClause, clauses[i]);
+		wb_close(p); // body_i
+		wb_push_label(p, ss->label, exit_depth, 0, false, true, exit_depth);
+		wb_open_scope(p);
+
+		bool saw_nil = false;
+		for (Ast *type_expr : cc->list) {
+			if (is_type_untyped_nil(type_of_expr(type_expr))) {
+				saw_nil = true;
+			}
+		}
+		if (cc->list.count == 1 && !saw_nil) {
+			// the variant's data
+			wbAddr data = {};
+			if (switch_kind == TypeSwitch_Union) {
+				data = parent_addr;
+			} else {
+				wbValue any_data = wb_addr_load(p, wb_addr_field(parent_addr, 0));
+				data = wb_addr_from_pointer(p, any_data, type_of_expr(cc->list[0]));
+			}
+			wb_bind_type_case(p, clauses[i], data);
+		} else {
+			// the whole parent
+			wb_bind_type_case(p, clauses[i], parent_addr);
+		}
+
+		wb_build_stmt_list(p, cc->stmts);
+		wb_close_scope(p);
+		wb_pop_label(p);
+		wb_br(p, exit_depth);
+	}
+	wb_close(p); // exit
+	wb_close_scope(p);
+}
+
 gb_internal void wb_build_stmt(wbProcedure *p, Ast *node) {
+	p->curr_stmt = node;
 	switch (node->kind) {
 	case Ast_EmptyStmt:
 		break;
@@ -893,14 +1278,23 @@ gb_internal void wb_build_stmt(wbProcedure *p, Ast *node) {
 		wb_build_switch_stmt(p, ss, node);
 	case_end;
 
+	case_ast_node(ss, TypeSwitchStmt, node);
+		wb_build_type_switch_stmt(p, ss, node);
+	case_end;
+
 	case_ast_node(bs, BranchStmt, node);
 		wb_build_branch_stmt(p, bs, node);
+	case_end;
+
+	case_ast_node(fb, ForeignBlockDecl, node);
+		// foreign procedures are generated when referenced
 	case_end;
 
 	case_ast_node(ds, DeferStmt, node);
 		wbDefer d = {};
 		d.stmt = ds->stmt;
 		d.scope_index = p->scopes.count;
+		d.context_stack_count = p->context_stack.count;
 		array_add(&p->defers, d);
 	case_end;
 

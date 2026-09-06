@@ -2117,6 +2117,9 @@ gb_internal bool parse_build_flags(Array<String> args) {
 			gb_printf_err("-backend:wasm only supports -build-mode:exe and -build-mode:dll\n");
 			bad_flags = true;
 		}
+		// Map accesses go through the runtime's `__dynamic_map_*` procedures
+		// rather than specialised generated ones
+		build_context.dynamic_map_calls = true;
 	}
 #if defined(ODIN_NO_LLVM)
 	if (build_context.backend != Backend_Wasm && (build_context.command_kind & Command__does_build)) {

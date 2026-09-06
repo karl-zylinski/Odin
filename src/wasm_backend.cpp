@@ -20,6 +20,16 @@ gb_internal wbProcedure *wb_procedure_for_entity(wbModule *m, Entity *e);
 gb_internal u32     wb_table_index(wbModule *m, wbProcedure *p);
 gb_internal void    wb_build_compound_lit(wbProcedure *p, Ast *expr, wbAddr dst);
 gb_internal void    wb_prescan_addressed(wbProcedure *p, Ast *node);
+gb_internal void    wb_emit_global_inits(wbProcedure *p);
+gb_internal void    wb_emit_call_no_args(wbProcedure *p, Entity *e);
+gb_internal wbAddr  wb_context_addr(wbProcedure *p);
+gb_internal wbAddr  wb_context_for_write(wbProcedure *p);
+gb_internal void    wb_push_context_ptr(wbProcedure *p, wbAddr ctx);
+gb_internal void    wb_build_hasher_body(wbProcedure *p);
+gb_internal void    wb_build_equal_body(wbProcedure *p);
+gb_internal wbValue wb_map_load(wbProcedure *p, wbAddr addr);
+gb_internal void    wb_map_set(wbProcedure *p, wbAddr addr, wbValue v);
+gb_internal wbValue wb_map_get_ptr(wbProcedure *p, wbAddr addr, Type *ptr_type);
 
 // Diagnostics
 
@@ -48,6 +58,47 @@ gb_internal void wb_unsupported_type(wbProcedure *p, Ast *node, Type *t) {
 
 // Returns the wasm value type used to represent a scalar Odin type, or
 // wbValType_Invalid if the type is an aggregate (lives in memory).
+gb_internal bool wb_is_f16(Type *t) {
+	t = core_type(t);
+	return is_type_float(t) && type_size_of(t) == 2;
+}
+
+// IEEE 754 binary32 -> binary16 (round to nearest even), for constants
+gb_internal u16 wb_f32_to_f16_bits(f32 value) {
+	u32 i = 0;
+	gb_memmove(&i, &value, 4);
+	u32 sign = (i >> 16) & 0x8000;
+	i32 exp  = cast(i32)((i >> 23) & 0xff) - 127 + 15;
+	u32 mant = i & 0x7fffff;
+	if (((i >> 23) & 0xff) == 0xff) {
+		// inf or nan
+		return cast(u16)(sign | 0x7c00 | (mant ? 0x200 | (mant >> 13) : 0));
+	}
+	if (exp >= 0x1f) {
+		return cast(u16)(sign | 0x7c00);
+	}
+	if (exp <= 0) {
+		if (exp < -10) {
+			return cast(u16)sign;
+		}
+		mant |= 0x800000;
+		u32 shift = cast(u32)(14 - exp);
+		u32 half = mant >> shift;
+		u32 rem  = mant & ((1u << shift) - 1);
+		u32 mid  = 1u << (shift - 1);
+		if (rem > mid || (rem == mid && (half & 1))) {
+			half++;
+		}
+		return cast(u16)(sign | half);
+	}
+	u32 half = sign | (cast(u32)exp << 10) | (mant >> 13);
+	u32 rem = mant & 0x1fff;
+	if (rem > 0x1000 || (rem == 0x1000 && (half & 1))) {
+		half++;
+	}
+	return cast(u16)half;
+}
+
 gb_internal wbValType wb_valtype_of(Type *t) {
 	if (t == nullptr) {
 		return wbValType_Invalid;
@@ -70,13 +121,17 @@ gb_internal wbValType wb_valtype_of(Type *t) {
 		}
 		if (t->Basic.flags & BasicFlag_Float) {
 			switch (type_size_of(t)) {
+			case 2: return wbValType_i32; // f16: raw bits, converted through the runtime's helpers
 			case 4: return wbValType_f32;
 			case 8: return wbValType_f64;
 			}
 			return wbValType_Invalid;
 		}
-		if (t->Basic.kind == Basic_rawptr || t->Basic.kind == Basic_uintptr || t->Basic.kind == Basic_cstring || t->Basic.kind == Basic_typeid) {
+		if (t->Basic.kind == Basic_rawptr || t->Basic.kind == Basic_uintptr || t->Basic.kind == Basic_cstring || t->Basic.kind == Basic_cstring16) {
 			return wbValType_i32;
+		}
+		if (t->Basic.kind == Basic_typeid) {
+			return wbValType_i64; // typeid is always 64 bits
 		}
 		return wbValType_Invalid;
 	case Type_Pointer:
@@ -165,6 +220,9 @@ gb_internal void wb_functype_of_proc(wbModule *m, Type *pt, wbFuncType *ft) {
 	}
 	if (pt->Proc.params != nullptr) {
 		for (Entity *e : pt->Proc.params->Tuple.variables) {
+			if (e->kind != Entity_Variable) {
+				continue; // polymorphic parameters ($T, constants) take no space
+			}
 			wbValType vt = wb_valtype_of(e->type);
 			if (vt == wbValType_Invalid) {
 				vt = wbValType_i32; // pointer to a copy
@@ -184,6 +242,135 @@ gb_internal u32 wb_type_index_of_proc(wbModule *m, Type *pt) {
 	wbFuncType ft = {};
 	wb_functype_of_proc(m, pt, &ft);
 	return wb_add_functype(m, ft);
+}
+
+// Foreign procedures use the ABI the LLVM backend produces for wasm (lbAbiWasm
+// in llvm_abi.cpp) so that imports match the JavaScript/WASI hosts: aggregates
+// that consist of basic fields are flattened into one wasm parameter per field,
+// anything else is passed as a pointer.
+
+// A scalar piece of an aggregate passed directly
+struct wbAbiLeaf {
+	i64   offset;
+	Type *type;
+};
+
+gb_internal bool wb_abi_is_basic(Type *t) {
+	if (!wb_is_scalar(t)) {
+		return false;
+	}
+	return type_size_of(t) <= 8;
+}
+
+// Appends the scalar leaves of `t` if it is passed directly, returns false if
+// it is passed indirectly (through a pointer). Zero sized types have no leaves.
+gb_internal bool wb_abi_flatten(Type *t, ProcCallingConvention cc, i64 base_offset, Array<wbAbiLeaf> *leaves) {
+	Type *bt = base_type(t);
+	i64 size = type_size_of(t);
+	if (size == 0) {
+		return true;
+	}
+	if (wb_abi_is_basic(t)) {
+		wbAbiLeaf leaf = {base_offset, t};
+		array_add(leaves, leaf);
+		return true;
+	}
+	if (cc == ProcCC_CDecl) {
+		// Basic C ABI: only single field structs are passed by value
+		if (bt->kind == Type_Struct && !bt->Struct.is_raw_union && bt->Struct.fields.count == 1) {
+			Type *ft = nullptr;
+			i64 offset = type_offset_of(bt, 0, &ft);
+			return wb_abi_flatten(ft, cc, base_offset+offset, leaves);
+		}
+		return false;
+	}
+	if (size > 32) {
+		return false;
+	}
+	switch (bt->kind) {
+	case Type_Array:
+		if (wb_abi_is_basic(bt->Array.elem)) {
+			i64 elem_size = type_size_of(bt->Array.elem);
+			for (i64 i = 0; i < bt->Array.count; i++) {
+				wbAbiLeaf leaf = {base_offset + i*elem_size, bt->Array.elem};
+				array_add(leaves, leaf);
+			}
+			return true;
+		}
+		return false;
+	case Type_Slice:
+	case Type_Basic: // string
+		if (bt->kind == Type_Basic && !is_type_string(bt)) {
+			return false;
+		}
+		{
+			wbAbiLeaf data = {base_offset, t_rawptr};
+			wbAbiLeaf len  = {base_offset + build_context.int_size, t_int};
+			array_add(leaves, data);
+			array_add(leaves, len);
+		}
+		return true;
+	case Type_Struct:
+		if (bt->Struct.is_raw_union) {
+			return false;
+		}
+		for_array(i, bt->Struct.fields) {
+			if (!wb_abi_is_basic(bt->Struct.fields[i]->type)) {
+				return false;
+			}
+		}
+		for_array(i, bt->Struct.fields) {
+			Type *ft = nullptr;
+			i64 offset = type_offset_of(bt, i, &ft);
+			wbAbiLeaf leaf = {base_offset+offset, ft};
+			array_add(leaves, leaf);
+		}
+		return true;
+	}
+	return false;
+}
+
+// Signature of a foreign procedure. Returns false if the type cannot be
+// expressed (aggregate results).
+gb_internal bool wb_functype_of_foreign(wbModule *m, Type *pt, wbFuncType *ft) {
+	pt = base_type(pt);
+	GB_ASSERT(pt->kind == Type_Proc);
+	array_init(&ft->params,  m->allocator);
+	array_init(&ft->results, m->allocator);
+	ProcCallingConvention cc = pt->Proc.calling_convention;
+
+	if (pt->Proc.params != nullptr) {
+		for (Entity *e : pt->Proc.params->Tuple.variables) {
+			if (e->kind != Entity_Variable) {
+				continue;
+			}
+			auto leaves = array_make<wbAbiLeaf>(temporary_allocator(), 0, 8);
+			if (wb_abi_flatten(e->type, cc, 0, &leaves)) {
+				for (wbAbiLeaf const &leaf : leaves) {
+					array_add(&ft->params, wb_valtype_of(leaf.type));
+				}
+			} else {
+				array_add(&ft->params, wbValType_i32);
+			}
+		}
+	}
+	if (cc == ProcCC_Odin) {
+		array_add(&ft->params, wbValType_i32); // context pointer
+	}
+	if (pt->Proc.result_count > 1) {
+		return false;
+	}
+	if (pt->Proc.result_count == 1) {
+		Type *rt = wb_result_type(pt);
+		if (type_size_of(rt) == 0) {
+			// nothing
+		} else if (wb_abi_is_basic(rt)) {
+			array_add(&ft->results, wb_valtype_of(rt));
+		} else {
+			return false;
+		}
+	}
+	return true;
 }
 
 // Procedures
@@ -212,6 +399,7 @@ gb_internal wbProcedure *wb_alloc_procedure(wbModule *m, String name) {
 	array_init(&p->call_relocs,  m->allocator);
 	array_init(&p->defers,       m->allocator);
 	array_init(&p->scopes,       m->allocator);
+	array_init(&p->context_stack, m->allocator);
 	map_init(&p->variables);
 	ptr_set_init(&p->addressed);
 	wb_buffer_init(&p->prologue, m->allocator, 16);
@@ -233,8 +421,26 @@ gb_internal wbProcedure *wb_procedure_for_entity(wbModule *m, Entity *e) {
 	p->is_export  = e->Procedure.is_export;
 	map_set(&m->procedure_map, e, p);
 
+	// The runtime declares the startup/cleanup procedures as foreign and the
+	// backend supplies them (lb_generate_startup_runtime and friends)
+	if (p->is_foreign && p->name == str_lit("__$startup_runtime")) {
+		p->is_foreign = false;
+		p->gen = wbProcGen_StartupRuntime;
+		m->startup_runtime = p;
+	} else if (p->is_foreign && p->name == str_lit("__$cleanup_runtime")) {
+		p->is_foreign = false;
+		p->gen = wbProcGen_CleanupRuntime;
+		m->cleanup_runtime = p;
+	}
+
 	wbFuncType ft = {};
-	wb_functype_of_proc(m, e->type, &ft);
+	if (p->is_foreign) {
+		if (!wb_functype_of_foreign(m, e->type, &ft)) {
+			wb_unsupported_type(p, nullptr, e->type);
+		}
+	} else {
+		wb_functype_of_proc(m, e->type, &ft);
+	}
 	p->type_index = wb_add_functype(m, ft);
 	for (wbValType vt : ft.results) {
 		array_add(&p->results, vt);
@@ -255,6 +461,9 @@ gb_internal wbProcedure *wb_procedure_for_entity(wbModule *m, Entity *e) {
 		p->import_module = module_name;
 		p->import_name   = import_name;
 		array_add(&m->imports, p);
+	} else if (p->gen != wbProcGen_Body) {
+		// generated last, when all global variables are known (see wb_generate_code)
+		array_add(&m->procedures, p);
 	} else {
 		DeclInfo *decl = e->decl_info;
 		GB_ASSERT(decl != nullptr && decl->proc_lit != nullptr);
@@ -315,6 +524,15 @@ gb_internal bool wb_const_procedure_index(wbModule *m, String const &prefix, Ast
 
 // Index of a procedure in the function table (used for procedure values)
 gb_internal u32 wb_table_index(wbModule *m, wbProcedure *p) {
+	if (p->is_foreign) {
+		// imports use a different calling convention than procedure values
+		if (!p->failed) {
+			gb_printf_err("wasm backend: taking the address of foreign procedure '%.*s' is not supported\n", LIT(p->name));
+			m->error_count += 1;
+			p->failed = true;
+		}
+		return 0;
+	}
 	if (p->table_index == 0) {
 		array_add(&m->table, p);
 		p->table_index = cast(u32)(m->table.count-1);
@@ -433,11 +651,11 @@ gb_internal void wb_emit_normalize(wbProcedure *p, Type *type) {
 		type = default_type(type);
 	}
 	Type *t = core_type(type);
-	if (!is_type_integer(t) && !is_type_boolean(t) && !is_type_rune(t) && !is_type_bit_set(t)) {
+	if (!is_type_integer(t) && !is_type_boolean(t) && !is_type_rune(t) && !is_type_bit_set(t) && !wb_is_f16(t)) {
 		return;
 	}
 	i64 size = type_size_of(t);
-	bool is_signed = wb_type_is_signed(t);
+	bool is_signed = wb_type_is_signed(t) && !wb_is_f16(t);
 	wbValType vt = wb_valtype_of(t);
 	if (vt == wbValType_i32) {
 		switch (size) {
@@ -533,6 +751,10 @@ gb_internal wbValue wb_emit_load(wbProcedure *p, u32 base, i32 offset, Type *typ
 	if (base == WB_NO_LOCAL) {
 		wb_i32_const(p, 0);
 		wb_emit_load_op(p, type, cast(u32)offset);
+	} else if (offset < 0) {
+		// memarg offsets are unsigned, so negative offsets must be folded into the address
+		wb_push_address(p, base, offset);
+		wb_emit_load_op(p, type, 0);
 	} else {
 		wb_local_get(p, base);
 		wb_emit_load_op(p, type, cast(u32)offset);
@@ -547,6 +769,9 @@ gb_internal void wb_emit_store(wbProcedure *p, u32 base, i32 offset, wbValue v, 
 	}
 	if (base == WB_NO_LOCAL) {
 		wb_i32_const(p, 0);
+	} else if (offset < 0) {
+		wb_push_address(p, base, offset);
+		offset = 0;
 	} else {
 		wb_local_get(p, base);
 	}
@@ -588,6 +813,8 @@ gb_internal wbValue wb_addr_load(wbProcedure *p, wbAddr addr) {
 			return wb_emit_load(p, addr.index, addr.offset, addr.type);
 		}
 		return wb_value_memory(addr.index, addr.offset, addr.type);
+	case wbAddr_Map:
+		return wb_map_load(p, addr);
 	default:
 		return wb_value_invalid();
 	}
@@ -612,6 +839,9 @@ gb_internal void wb_addr_store(wbProcedure *p, wbAddr addr, wbValue v) {
 		} else {
 			wb_emit_store(p, addr.index, addr.offset, v, addr.type);
 		}
+		break;
+	case wbAddr_Map:
+		wb_map_set(p, addr, v);
 		break;
 	default:
 		break;
@@ -642,6 +872,12 @@ gb_internal void wb_addr_zero(wbProcedure *p, wbAddr addr) {
 			wb_emit_zero(p, addr.index, addr.offset, type_size_of(addr.type));
 		}
 		break;
+	case wbAddr_Map: {
+		wbAddr zero = wb_add_temp(p, addr.type);
+		wb_addr_zero(p, zero);
+		wb_map_set(p, addr, wb_addr_load(p, zero));
+		break;
+	}
 	default:
 		break;
 	}
@@ -651,6 +887,10 @@ gb_internal void wb_addr_zero(wbProcedure *p, wbAddr addr) {
 gb_internal wbValue wb_addr_get_ptr(wbProcedure *p, wbAddr addr, Type *ptr_type = nullptr) {
 	if (ptr_type == nullptr) {
 		ptr_type = alloc_type_pointer(addr.type);
+	}
+	if (addr.kind == wbAddr_Map) {
+		// nil when the key is absent
+		return wb_map_get_ptr(p, addr, ptr_type);
 	}
 	if (addr.kind != wbAddr_Memory) {
 		if (addr.kind == wbAddr_Local) {
@@ -734,7 +974,44 @@ gb_internal u32 wb_intern_string_bytes(wbModule *m, String const &s) {
 	return addr;
 }
 
+gb_internal void wb_write_le(u8 *dst, u64 bits, i64 size) {
+	for (i64 i = 0; i < size; i++) {
+		dst[i] = cast(u8)(bits >> (8*i));
+	}
+}
+
 gb_internal void wb_write_const_data(wbModule *m, Type *type, ExactValue const &value, u8 *dst);
+
+// A NUL-terminated UTF-16 copy of a string in the data segment, deduplicated
+// by its UTF-8 source
+gb_internal u32 wb_intern_string16_bytes(wbModule *m, String const &s) {
+	u32 *found = string_map_get(&m->string16_bytes, s);
+	if (found) {
+		return *found;
+	}
+	String16 s16 = string_to_string16(temporary_allocator(), s);
+	u32 addr = wb_data_alloc(m, (s16.len+1)*2, 2);
+	u8 *bytes = gb_alloc_array(temporary_allocator(), u8, (s16.len+1)*2);
+	for (isize i = 0; i < s16.len; i++) {
+		wb_write_le(bytes + 2*i, s16.text[i], 2);
+	}
+	wb_data_write(m, addr, bytes, (s16.len+1)*2);
+	string_map_set(&m->string16_bytes, s, addr);
+	return addr;
+}
+
+gb_internal u32 wb_intern_string16_value(wbModule *m, String const &s) {
+	u32 *found = string_map_get(&m->string16_values, s);
+	if (found) {
+		return *found;
+	}
+	u32 addr = wb_data_alloc(m, type_size_of(t_string16), type_align_of(t_string16));
+	u8 *bytes = gb_alloc_array(temporary_allocator(), u8, type_size_of(t_string16));
+	wb_write_const_data(m, t_string16, exact_value_string(s), bytes);
+	wb_data_write(m, addr, bytes, type_size_of(t_string16));
+	string_map_set(&m->string16_values, s, addr);
+	return addr;
+}
 
 // A {data, len} `string` constant in the data segment, deduplicated
 gb_internal u32 wb_intern_string_value(wbModule *m, String const &s) {
@@ -750,10 +1027,41 @@ gb_internal u32 wb_intern_string_value(wbModule *m, String const &s) {
 	return addr;
 }
 
-gb_internal void wb_write_le(u8 *dst, u64 bits, i64 size) {
-	for (i64 i = 0; i < size; i++) {
-		dst[i] = cast(u8)(bits >> (8*i));
+
+// The low 64 bits of an integer constant, two's complement for negative values
+gb_internal u64 wb_big_int_bits(BigInt const *x) {
+	if (x->sign) {
+		return cast(u64)big_int_to_i64(x);
 	}
+	return big_int_to_u64(x);
+}
+
+// Writes an integer constant of `size` bytes (sign-extending 128-bit values)
+gb_internal void wb_write_le_int(u8 *dst, BigInt const *x, i64 size) {
+	if (size <= 8) {
+		wb_write_le(dst, wb_big_int_bits(x), size);
+		return;
+	}
+	// 128 bits: the magnitude's two words, negated in two's complement if needed
+	BigInt mag = {};
+	mp_init(&mag);
+	mp_abs(x, &mag);
+	u64 lo = mp_get_u64(&mag);
+	u64 hi = 0;
+	if (mp_count_bits(&mag) > 64) {
+		BigInt tmp = {};
+		mp_init(&tmp);
+		mp_div_2d(&mag, 64, &tmp, nullptr);
+		hi = mp_get_u64(&tmp);
+		mp_clear(&tmp);
+	}
+	mp_clear(&mag);
+	if (x->sign) {
+		lo = ~lo + 1;
+		hi = ~hi + (lo == 0 ? 1 : 0);
+	}
+	wb_write_le(dst, lo, 8);
+	wb_write_le(dst + 8, hi, size - 8);
 }
 
 // Serializes a constant of `type` into `dst` (which is zeroed and type_size_of(type) bytes)
@@ -764,22 +1072,66 @@ gb_internal void wb_write_const_data(wbModule *m, Type *type, ExactValue const &
 	Type *bt = base_type(type);
 	i64 size = type_size_of(type);
 
+	if (bt->kind == Type_SimdVector && value.kind != ExactValue_Compound && value.kind != ExactValue_Invalid) {
+		// a scalar constant of a vector type is splat across the lanes
+		Type *et = bt->SimdVector.elem;
+		i64 elem_size = type_size_of(et);
+		for (i64 i = 0; i < bt->SimdVector.count; i++) {
+			wb_write_const_data(m, et, value, dst + i*elem_size);
+		}
+		return;
+	}
+
 	switch (value.kind) {
 	case ExactValue_Invalid:
 		return; // nil / zero
+	case ExactValue_String16:
+		wb_write_const_data(m, type, exact_value_string(string16_to_string(permanent_allocator(), value.value_string16)), dst);
+		return;
 	case ExactValue_Bool:
 		dst[0] = value.value_bool ? 1 : 0;
 		return;
 	case ExactValue_Integer:
-		if (is_type_float(core_type(type))) {
+		if (is_type_float(core_type(type)) || is_type_complex(type) || is_type_quaternion(type)) {
 			ExactValue f = exact_value_to_float(value);
 			wb_write_const_data(m, type, f, dst);
 			return;
 		}
-		wb_write_le(dst, big_int_to_u64(&value.value_integer), gb_min(size, 8));
+		wb_write_le_int(dst, &value.value_integer, size);
 		return;
+	case ExactValue_Complex: {
+		// {real, imag} (quaternions: {imag, jmag, kmag, real})
+		Type *ft = base_complex_elem_type(type);
+		i64 fs = type_size_of(ft);
+		if (is_type_quaternion(type)) {
+			wb_write_const_data(m, ft, exact_value_float(value.value_complex->imag), dst + 0*fs);
+			wb_write_const_data(m, ft, exact_value_float(value.value_complex->real), dst + 3*fs);
+		} else {
+			wb_write_const_data(m, ft, exact_value_float(value.value_complex->real), dst + 0*fs);
+			wb_write_const_data(m, ft, exact_value_float(value.value_complex->imag), dst + 1*fs);
+		}
+		return;
+	}
+	case ExactValue_Quaternion: {
+		Type *ft = base_complex_elem_type(type);
+		i64 fs = type_size_of(ft);
+		wb_write_const_data(m, ft, exact_value_float(value.value_quaternion->imag), dst + 0*fs);
+		wb_write_const_data(m, ft, exact_value_float(value.value_quaternion->jmag), dst + 1*fs);
+		wb_write_const_data(m, ft, exact_value_float(value.value_quaternion->kmag), dst + 2*fs);
+		wb_write_const_data(m, ft, exact_value_float(value.value_quaternion->real), dst + 3*fs);
+		return;
+	}
 	case ExactValue_Float:
-		if (size == 4) {
+		if (is_type_complex(type) || is_type_quaternion(type)) {
+			// real scalar promoted to a complex/quaternion constant
+			Type *ft = base_complex_elem_type(type);
+			i64 fs = type_size_of(ft);
+			wb_write_const_data(m, ft, value, dst + (is_type_quaternion(type) ? 3 : 0)*fs);
+			return;
+		}
+		if (size == 2 && is_type_float(core_type(type))) {
+			wb_write_le(dst, wb_f32_to_f16_bits(cast(f32)value.value_float), 2);
+		} else if (size == 4) {
 			f32 f = cast(f32)value.value_float;
 			u32 bits = 0;
 			gb_memmove(&bits, &f, 4);
@@ -795,6 +1147,9 @@ gb_internal void wb_write_const_data(wbModule *m, Type *type, ExactValue const &
 	case ExactValue_Pointer:
 		wb_write_le(dst, cast(u64)value.value_pointer, size);
 		return;
+	case ExactValue_Typeid:
+		wb_write_le(dst, type_hash_canonical_type(default_type(value.value_typeid)), size);
+		return;
 	case ExactValue_Procedure: {
 		u32 index = 0;
 		if (wb_const_procedure_index(m, str_lit("global"), value.value_procedure, &index)) {
@@ -804,7 +1159,14 @@ gb_internal void wb_write_const_data(wbModule *m, Type *type, ExactValue const &
 	}
 	case ExactValue_String: {
 		String s = value.value_string;
-		if (is_type_cstring(type)) {
+		if (is_type_cstring16(type)) {
+			wb_write_le(dst, wb_intern_string16_bytes(m, s), size);
+		} else if (is_type_string16(type)) {
+			isize len16 = string_to_string16(temporary_allocator(), s).len;
+			u32 data = len16 > 0 ? wb_intern_string16_bytes(m, s) : 0;
+			wb_write_le(dst, data, build_context.ptr_size);
+			wb_write_le(dst + type_offset_of(bt, 1, nullptr), cast(u64)len16, build_context.int_size);
+		} else if (is_type_cstring(type)) {
 			wb_write_le(dst, wb_intern_string_bytes(m, s), size);
 		} else if (is_type_string(type)) {
 			u32 data = s.len > 0 ? wb_intern_string_bytes(m, s) : 0;
@@ -841,8 +1203,9 @@ gb_internal void wb_write_const_data(wbModule *m, Type *type, ExactValue const &
 			return;
 		}
 		case Type_Array:
-		case Type_EnumeratedArray: {
-			Type *et = bt->kind == Type_Array ? bt->Array.elem : bt->EnumeratedArray.elem;
+		case Type_EnumeratedArray:
+		case Type_SimdVector: {
+			Type *et = bt->kind == Type_Array ? bt->Array.elem : bt->kind == Type_SimdVector ? bt->SimdVector.elem : bt->EnumeratedArray.elem;
 			i64 elem_size = type_size_of(et);
 			i64 index = 0;
 			i64 min_value = bt->kind == Type_EnumeratedArray ? exact_value_to_i64(*bt->EnumeratedArray.min_value) : 0;
@@ -933,14 +1296,21 @@ gb_internal bool wb_can_serialize_const(Type *type, ExactValue const &value) {
 	case ExactValue_Integer:
 	case ExactValue_Float:
 	case ExactValue_Pointer:
-		return wb_is_scalar(type);
+	case ExactValue_Typeid:
+		return wb_is_scalar(type) || is_type_complex(bt) || is_type_quaternion(bt) || type_size_of(type) == 16 ||
+		       (bt->kind == Type_SimdVector && wb_is_scalar(bt->SimdVector.elem));
+	case ExactValue_Complex:
+		return is_type_complex(bt) || is_type_quaternion(bt);
+	case ExactValue_Quaternion:
+		return is_type_quaternion(bt);
 	case ExactValue_String:
-		return is_type_string(type) || is_type_cstring(type) || is_type_array(bt);
+	case ExactValue_String16:
+		return is_type_string(type) || is_type_cstring(type) || is_type_string16(type) || is_type_cstring16(type) || is_type_array(bt);
 	case ExactValue_Procedure:
 		return is_type_proc(bt);
 	case ExactValue_Compound:
 		switch (bt->kind) {
-		case Type_Struct: case Type_Array: case Type_EnumeratedArray: case Type_Slice:
+		case Type_Struct: case Type_Array: case Type_EnumeratedArray: case Type_Slice: case Type_SimdVector:
 			break;
 		default:
 			return false;
@@ -1009,13 +1379,21 @@ gb_internal u32 wb_global_addr(wbModule *m, Entity *e, Ast *init_expr = nullptr)
 
 // Constants
 
-gb_internal wbValue wb_const(wbProcedure *p, Ast *node, Type *type, ExactValue const &value) {
+gb_internal wbValue wb_const(wbProcedure *p, Ast *node, Type *type, ExactValue const &value_) {
 	if (is_type_untyped(type)) {
 		type = default_type(type);
+	}
+	ExactValue value = value_;
+	if (value.kind == ExactValue_String16) {
+		// UTF-16 constants are interned by their UTF-8 form
+		value = exact_value_string(string16_to_string(permanent_allocator(), value.value_string16));
 	}
 	wbValType vt = wb_valtype_of(type);
 	if (vt == wbValType_Invalid) {
 		// Aggregate constant: lives in the data segment
+		if (value.kind == ExactValue_String && is_type_string16(type)) {
+			return wb_value_memory(WB_NO_LOCAL, cast(i32)wb_intern_string16_value(p->module, value.value_string), type);
+		}
 		if (value.kind == ExactValue_String && is_type_string(type)) {
 			return wb_value_memory(WB_NO_LOCAL, cast(i32)wb_intern_string_value(p->module, value.value_string), type);
 		}
@@ -1046,15 +1424,17 @@ gb_internal wbValue wb_const(wbProcedure *p, Ast *node, Type *type, ExactValue c
 	case ExactValue_Integer:
 		if (vt == wbValType_f32 || vt == wbValType_f64) {
 			v.f = exact_value_to_f64(value);
-		} else if (is_type_unsigned(core_type(type))) {
-			v.i = cast(i64)big_int_to_u64(&value.value_integer);
+		} else if (wb_is_f16(type)) {
+			v.i = wb_f32_to_f16_bits(cast(f32)exact_value_to_f64(value));
 		} else {
-			v.i = big_int_to_i64(&value.value_integer);
+			v.i = cast(i64)wb_big_int_bits(&value.value_integer);
 		}
 		break;
 	case ExactValue_Float:
 		if (vt == wbValType_f32 || vt == wbValType_f64) {
 			v.f = value.value_float;
+		} else if (wb_is_f16(type)) {
+			v.i = wb_f32_to_f16_bits(cast(f32)value.value_float);
 		} else {
 			v.i = cast(i64)value.value_float;
 		}
@@ -1062,9 +1442,16 @@ gb_internal wbValue wb_const(wbProcedure *p, Ast *node, Type *type, ExactValue c
 	case ExactValue_Pointer:
 		v.i = value.value_pointer;
 		break;
+	case ExactValue_Typeid:
+		v.i = cast(i64)type_hash_canonical_type(default_type(value.value_typeid));
+		break;
 	case ExactValue_String:
 		if (is_type_cstring(type)) {
 			v.i = wb_intern_string_bytes(p->module, value.value_string);
+			break;
+		}
+		if (is_type_cstring16(type)) {
+			v.i = wb_intern_string16_bytes(p->module, value.value_string);
 			break;
 		}
 		wb_unsupported(p, node, "string constant of this type");
@@ -1101,7 +1488,59 @@ gb_internal wbValue wb_const(wbProcedure *p, Ast *node, Type *type, ExactValue c
 	return v;
 }
 
+// Context
+
+// The address of the current `context`. Odin calling convention procedures
+// start from the implicit parameter, others create a default context on first
+// use (as lb_find_or_generate_context_ptr does).
+gb_internal wbAddr wb_context_addr(wbProcedure *p) {
+	if (p->context_stack.count == 0) {
+		wbContextData cd = {};
+		if (p->context_local >= 0) {
+			cd.addr = wb_addr_memory(cast(u32)p->context_local, 0, t_context);
+			cd.scope_index = -1;
+			cd.uses = 1;
+		} else {
+			cd.addr = wb_add_temp(p, t_context);
+			cd.scope_index = p->scopes.count;
+			wb_addr_zero(p, cd.addr);
+			wb_push_address(p, cd.addr.index, cd.addr.offset);
+			wb_call(p, wb_lookup_runtime_procedure(p->module, "__init_context"));
+		}
+		array_add(&p->context_stack, cd);
+	}
+	wbContextData *cd = &p->context_stack[p->context_stack.count-1];
+	cd->uses += 1;
+	return cd->addr;
+}
+
+// The address to store into for an assignment to `context` (or a field of it).
+// The context is copied first unless the current one is unused and belongs to
+// the current scope, so that earlier uses (defers, calls) keep their value.
+gb_internal wbAddr wb_context_for_write(wbProcedure *p) {
+	wbAddr old = wb_context_addr(p);
+	wbContextData *cd = &p->context_stack[p->context_stack.count-1];
+	cd->uses -= 1;
+	if (cd->uses == 0 && cd->scope_index == p->scopes.count) {
+		return old;
+	}
+	wbContextData next = {};
+	next.addr = wb_add_temp(p, t_context);
+	next.scope_index = p->scopes.count;
+	wb_emit_copy(p, next.addr.index, next.addr.offset, old.index, old.offset, type_size_of(t_context));
+	array_add(&p->context_stack, next);
+	return next.addr;
+}
+
+// Pushes the context pointer argument for a call to an Odin calling convention procedure
+gb_internal void wb_push_context_ptr(wbProcedure *p, wbAddr ctx) {
+	wb_push_address(p, ctx.index, ctx.offset);
+}
+
 #include "wasm_backend_expr.cpp"
+#include "wasm_backend_rtti.cpp"
+#include "wasm_backend_simd.cpp"
+#include "wasm_backend_map.cpp"
 #include "wasm_backend_stmt.cpp"
 
 // Procedure bodies
@@ -1161,6 +1600,10 @@ gb_internal void wb_build_procedure(wbProcedure *p) {
 	auto param_locals = array_make<u32>(temporary_allocator(), 0, 8);
 	if (pt->Proc.params != nullptr) {
 		for (Entity *e : pt->Proc.params->Tuple.variables) {
+			if (e->kind != Entity_Variable) {
+				array_add(&param_locals, WB_NO_LOCAL);
+				continue;
+			}
 			wbValType vt = wb_valtype_of(e->type);
 			if (vt == wbValType_Invalid) {
 				vt = wbValType_i32;
@@ -1181,7 +1624,7 @@ gb_internal void wb_build_procedure(wbProcedure *p) {
 		for_array(i, pt->Proc.params->Tuple.variables) {
 			Entity *e = pt->Proc.params->Tuple.variables[i];
 			u32 idx = param_locals[i];
-			if (e->token.string.len == 0 || is_blank_ident(e->token.string)) {
+			if (idx == WB_NO_LOCAL || e->token.string.len == 0 || is_blank_ident(e->token.string)) {
 				continue;
 			}
 			if (wb_is_scalar(e->type)) {
@@ -1209,7 +1652,28 @@ gb_internal void wb_build_procedure(wbProcedure *p) {
 	}
 
 	wb_open_scope(p);
-	wb_build_stmt(p, p->body);
+	switch (p->gen) {
+	case wbProcGen_Body:
+		wb_build_stmt(p, p->body);
+		break;
+	case wbProcGen_StartupRuntime:
+		wb_emit_global_inits(p);
+		for (Entity *e : p->module->info->init_procedures) {
+			wb_emit_call_no_args(p, e);
+		}
+		break;
+	case wbProcGen_CleanupRuntime:
+		for (Entity *e : p->module->info->fini_procedures) {
+			wb_emit_call_no_args(p, e);
+		}
+		break;
+	case wbProcGen_Hasher:
+		wb_build_hasher_body(p);
+		break;
+	case wbProcGen_Equal:
+		wb_build_equal_body(p);
+		break;
+	}
 	wb_close_scope(p);
 
 	if (p->results.count > 0 || p->sret_local >= 0) {
@@ -1223,10 +1687,40 @@ gb_internal void wb_build_procedure(wbProcedure *p) {
 	wb_finish_procedure(p);
 }
 
-// Generates the start function that runs non-constant global initializers
-gb_internal void wb_generate_startup(wbModule *m) {
-	if (m->global_init_queue.count == 0) {
-		return;
+// Calls a procedure without parameters or results (@(init)/@(fini) procedures)
+gb_internal void wb_emit_call_no_args(wbProcedure *p, Entity *e) {
+	wbProcedure *callee = wb_procedure_for_entity(p->module, e);
+	if (wb_is_odin_cc(e->type)) {
+		wb_push_context_ptr(p, wb_context_addr(p));
+	}
+	wb_call(p, callee);
+}
+
+// Stores the pending non-constant global initializers, in declaration
+// dependency order (see wb_generate_code)
+gb_internal void wb_emit_global_inits(wbProcedure *p) {
+	wbModule *m = p->module;
+	for (; m->global_inits_emitted < m->global_init_queue.count; m->global_inits_emitted++) {
+		wbGlobalInit gi = m->global_init_queue[m->global_inits_emitted];
+		u32 addr = wb_global_addr(m, gi.entity);
+		if (is_type_tuple(type_of_expr(gi.init_expr))) {
+			wb_unsupported(p, gi.init_expr, "global variable initialized from multiple results");
+			continue;
+		}
+		wbValue v = wb_build_expr(p, gi.init_expr);
+		if (v.kind == wbValue_Invalid) {
+			continue;
+		}
+		v = wb_emit_conv(p, v, gi.entity->type);
+		wb_addr_store(p, wb_addr_memory(WB_NO_LOCAL, cast(i32)addr, gi.entity->type), v);
+	}
+}
+
+// Without an entry point nothing calls `__$startup_runtime`, so the global
+// initializers run from the wasm start function instead
+gb_internal wbProcedure *wb_startup_function(wbModule *m) {
+	if (m->startup != nullptr) {
+		return m->startup;
 	}
 	wbProcedure *p = wb_alloc_procedure(m, str_lit("__odin_wasm_startup"));
 	wbFuncType ft = {};
@@ -1237,18 +1731,8 @@ gb_internal void wb_generate_startup(wbModule *m) {
 	p->fp_local     = wb_add_local(p, wbValType_i32, str_lit("fp"));
 	array_add(&m->procedures, p);
 	m->startup = p;
-
 	wb_open_scope(p);
-	// Lowering an initializer may reference further globals, growing the queue
-	for (isize i = 0; i < m->global_init_queue.count; i++) {
-		Entity *e = m->global_init_queue[i].entity;
-		u32 addr = wb_global_addr(m, e);
-		wbValue v = wb_build_expr(p, m->global_init_queue[i].init_expr);
-		wb_addr_store(p, wb_addr_memory(WB_NO_LOCAL, cast(i32)addr, e->type), v);
-	}
-	wb_close_scope(p);
-	wb_emit_epilogue(p);
-	wb_finish_procedure(p);
+	return p;
 }
 
 // Module
@@ -1266,6 +1750,11 @@ gb_internal void wb_module_init(wbModule *m, CheckerInfo *info) {
 	map_init(&m->globals);
 	string_map_init(&m->string_bytes, 64);
 	string_map_init(&m->string_values, 64);
+	string_map_init(&m->string16_values, 16);
+	string_map_init(&m->string16_bytes, 16);
+	string_map_init(&m->gen_procs, 16);
+	string_map_init(&m->map_cell_infos, 16);
+	string_map_init(&m->map_infos, 16);
 	array_init(&m->data, heap_allocator(), 0, 4096);
 	array_init(&m->global_init_queue, m->allocator);
 
@@ -1303,9 +1792,30 @@ gb_internal bool wb_generate_code(CheckerInfo *info) {
 	wbModule module = {};
 	wbModule *m = &module;
 	wb_module_init(m, info);
+	wb_setup_type_info_data(m);
 
-	// Roots: exported procedures. Everything else is generated on demand
-	// when referenced, so unused code never has to be lowered.
+	// Global variables are allocated up front in initialization order so that
+	// their initializers run in the order the checker determined
+	for (DeclInfo *d : info->variable_init_order) {
+		Entity *e = d->entity;
+		if (e == nullptr || e->kind != Entity_Variable) {
+			continue;
+		}
+		if (e->min_dep_count.load(std::memory_order_relaxed) == 0) {
+			continue;
+		}
+		if (e->Variable.is_foreign || e->Variable.thread_local_model.len > 0) {
+			wbProcedure dummy = {};
+			dummy.module = m;
+			dummy.entity = e;
+			wb_unsupported(&dummy, nullptr, "foreign or thread local variable");
+			continue;
+		}
+		wb_global_addr(m, e);
+	}
+
+	// Roots: exported and @(require) procedures. Everything else is generated
+	// on demand when referenced, so unused code never has to be lowered.
 	for (Entity *e : info->entities) {
 		if (e->kind != Entity_Procedure) {
 			continue;
@@ -1313,8 +1823,19 @@ gb_internal bool wb_generate_code(CheckerInfo *info) {
 		if ((e->scope->flags & ScopeFlag_File) == 0) {
 			continue;
 		}
-		if (!e->Procedure.is_export || e->Procedure.is_foreign) {
+		if (e->Procedure.is_foreign) {
 			continue;
+		}
+		if (!e->Procedure.is_export) {
+			if ((e->flags & EntityFlag_Require) == 0) {
+				continue;
+			}
+			// The runtime's required procedures are the compiler-rt style helpers
+			// (__ashlti3, __truncsfhf2, memcpy, ...) that LLVM emits calls to;
+			// this backend never does, so they are only generated when used.
+			if (e->pkg == info->runtime_package) {
+				continue;
+			}
 		}
 		if (e->min_dep_count.load(std::memory_order_relaxed) == 0) {
 			continue;
@@ -1323,16 +1844,42 @@ gb_internal bool wb_generate_code(CheckerInfo *info) {
 	}
 
 	TIME_SECTION("wasm backend: procedures");
+	bool startup_runtime_built = false;
+	bool cleanup_runtime_built = false;
 	for (;;) {
 		while (m->work_queue.count > 0) {
 			wbProcedure *p = array_pop(&m->work_queue);
 			wb_build_procedure(p);
 		}
-		if (m->startup == nullptr && m->global_init_queue.count > 0) {
-			wb_generate_startup(m); // may discover more procedures
+		// The startup procedures are built after everything else so that all
+		// global initializers are known (lowering may still discover more
+		// procedures, hence the loop)
+		if (m->startup_runtime != nullptr && !startup_runtime_built) {
+			startup_runtime_built = true;
+			wb_build_procedure(m->startup_runtime);
+			continue;
+		}
+		if (m->cleanup_runtime != nullptr && !cleanup_runtime_built) {
+			cleanup_runtime_built = true;
+			wb_build_procedure(m->cleanup_runtime);
+			continue;
+		}
+		if (m->startup_runtime == nullptr && m->global_inits_emitted < m->global_init_queue.count) {
+			wb_emit_global_inits(wb_startup_function(m));
 			continue;
 		}
 		break;
+	}
+	if (m->startup != nullptr) {
+		wbProcedure *p = m->startup;
+		wb_close_scope(p);
+		wb_emit_epilogue(p);
+		wb_finish_procedure(p);
+	}
+	if (m->global_inits_emitted < m->global_init_queue.count) {
+		Entity *e = m->global_init_queue[m->global_inits_emitted].entity;
+		error(e->token, "wasm backend: global variable initializer discovered after the startup code was generated");
+		m->error_count++;
 	}
 
 	if (m->error_count > 0) {

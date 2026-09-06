@@ -1,7 +1,13 @@
 #!/usr/bin/env bash
 # Differential test for the direct wasm backend: build each test package with
-# both the LLVM backend and the wasm backend, invoke every exported procedure
-# with wasmtime and compare the results.
+# both the LLVM backend and the wasm backend and compare the results.
+#
+# Two kinds of test package:
+#   - with a `calls.txt`: built freestanding without an entry point; every
+#     line of calls.txt names an exported procedure (and arguments) that is
+#     invoked with wasmtime and whose result is compared
+#   - with a `main` procedure (no calls.txt): built for wasi and run; the
+#     standard output of both builds is compared
 #
 # Requires `wasmtime` in PATH (and `wasm-ld` for the LLVM reference build).
 #
@@ -17,6 +23,7 @@ ODIN=${ODIN:-../../odin}          # compiler under test (wasm backend)
 ODIN_REF=${ODIN_REF:-$ODIN}      # compiler used for the LLVM reference build
 OUT=${OUT:-./out}
 TARGET=${TARGET:-freestanding_wasm32}
+WASI_TARGET=${WASI_TARGET:-wasi_wasm32}
 mkdir -p "$OUT"
 
 failures=0
@@ -42,7 +49,31 @@ invoke() {
 
 for pkg in */; do
 	pkg=${pkg%/}
-	[ -f "$pkg/calls.txt" ] || continue
+	[ "$pkg" = "$(basename "$OUT")" ] && continue
+	ls "$pkg"/*.odin >/dev/null 2>&1 || continue
+
+	if [ ! -f "$pkg/calls.txt" ]; then
+		# stdout comparison of a wasi program
+		ref="$OUT/${pkg}_llvm.wasm"
+		new="$OUT/${pkg}_wasm.wasm"
+		if ! "$ODIN_REF" build "$pkg" -target:"$WASI_TARGET" -out:"$ref"; then
+			echo "FAIL $pkg: LLVM reference build failed"; failures=$((failures+1)); total=$((total+1)); continue
+		fi
+		if ! "$ODIN" build "$pkg" -target:"$WASI_TARGET" -backend:wasm -out:"$new"; then
+			echo "FAIL $pkg: wasm backend build failed"; failures=$((failures+1)); total=$((total+1)); continue
+		fi
+		expected=$(wasmtime run "$ref" 2>&1)
+		actual=$(wasmtime run "$new" 2>&1)
+		total=$((total+1))
+		if [ "$expected" != "$actual" ]; then
+			echo "FAIL $pkg: output differs"
+			diff <(echo "$expected") <(echo "$actual") | head -20
+			failures=$((failures+1))
+		elif [ -n "${VERBOSE:-}" ]; then
+			echo "$pkg => ok"
+		fi
+		continue
+	fi
 
 	ref="$OUT/${pkg}_llvm.wasm"
 	new="$OUT/${pkg}_wasm.wasm"

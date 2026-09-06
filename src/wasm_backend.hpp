@@ -305,14 +305,16 @@ enum wbAddrKind : u8 {
 	wbAddr_Invalid,
 	wbAddr_Local,  // scalar variable in wasm local `index`
 	wbAddr_Memory, // local[index] + offset (absolute if index == WB_NO_LOCAL)
+	wbAddr_Map,    // map element: local[index] points at the map, the key is at frame offset `offset`
 };
 
 // An addressable location
 struct wbAddr {
 	wbAddrKind kind;
-	Type *     type; // type of the stored value
+	Type *     type; // type of the stored value (for wbAddr_Map possibly the (value, ok) tuple)
 	u32        index;
 	i32        offset;
+	Type *     map_type; // wbAddr_Map only
 };
 
 struct wbLocal {
@@ -334,6 +336,23 @@ struct wbLabel {
 struct wbDefer {
 	Ast * stmt;
 	isize scope_index;
+	isize context_stack_count; // context_stack.count when the defer was registered
+};
+
+// A `context` value visible in the current procedure (see wb_context_addr)
+struct wbContextData {
+	wbAddr addr;        // memory address of a Context
+	isize  scope_index; // scope depth it was created at, -1 for the implicit parameter
+	isize  uses;        // reads since creation; a write after a read must copy
+};
+
+// What the body of a procedure is generated from
+enum wbProcGen : u8 {
+	wbProcGen_Body,           // an Ast_BlockStmt
+	wbProcGen_StartupRuntime, // `__$startup_runtime`: global initializers, then @(init) procedures
+	wbProcGen_CleanupRuntime, // `__$cleanup_runtime`: @(fini) procedures
+	wbProcGen_Hasher,         // `__$hasher$$T`: map key hasher for `gen_type` (see wb_hasher_proc_for_type)
+	wbProcGen_Equal,          // `__$equal$$T`: map key equality for `gen_type`
 };
 
 struct wbModule;
@@ -359,6 +378,9 @@ struct wbProcedure {
 	bool       is_foreign;
 	bool       is_export;
 	bool       failed;
+	wbProcGen  gen;
+	Type *     gen_type;    // the type a hasher/equal procedure is generated for
+	Ast *      curr_stmt;   // statement being lowered (for #caller_location of implicit runtime calls)
 	String     import_module;
 	String     import_name;
 
@@ -377,6 +399,7 @@ struct wbProcedure {
 
 	Array<wbDefer> defers;
 	Array<isize>   scopes; // defers.count when each open scope was entered
+	Array<wbContextData> context_stack;
 
 	wbBuffer   prologue;  // stack frame setup, generated after the body
 	wbBuffer   code;      // instruction bytes (without local declarations)
@@ -401,7 +424,10 @@ struct wbModule {
 	PtrMap<Entity *, wbProcedure *> procedure_map;
 	Array<wbProcedure *>  work_queue; // procedures whose bodies still need lowering
 	Array<wbProcedure *>  table;      // function table, index 0 is reserved for nil
-	wbProcedure *         startup;    // runs non-constant global initializers (wasm start function)
+	wbProcedure *         startup;    // runs non-constant global initializers (wasm start function, only without an entry point)
+	wbProcedure *         startup_runtime; // `__$startup_runtime`, generated when referenced
+	wbProcedure *         cleanup_runtime; // `__$cleanup_runtime`, generated when referenced
+	isize                 global_inits_emitted; // prefix of global_init_queue already lowered
 
 	u32 stack_size;
 	u32 memory_initial_pages;
@@ -413,7 +439,13 @@ struct wbModule {
 	PtrMap<Entity *, u32> globals;       // global variable -> absolute address
 	StringMap<u32>        string_bytes;  // interned NUL-terminated string data
 	StringMap<u32>        string_values; // interned `string` {data, len} constants
+	StringMap<u32>        string16_values; // interned `string16` {data, len} constants (keyed by UTF-8 source)
+	StringMap<u32>        string16_bytes;  // interned NUL-terminated UTF-16 string data (keyed by UTF-8 source)
+	StringMap<wbProcedure *> gen_procs;      // generated hasher/equal procedures by canonical name (wasm_backend_map.cpp)
+	StringMap<u32>        map_cell_infos;    // Map_Cell_Info constants by canonical type name
+	StringMap<u32>        map_infos;         // Map_Info constants by canonical map type name
 	Array<wbGlobalInit>   global_init_queue; // globals with non-constant initializers
+	Array<u32>            type_info_addrs;   // type info table entry -> absolute address (0 = empty slot)
 
 	i32 error_count;
 };
