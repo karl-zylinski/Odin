@@ -273,6 +273,7 @@ Thumbs.db
 # - Linux/MacOS
 odin
 !odin/
+odin-nollvm
 **/*.dSYM
 *.bin
 demo.bin

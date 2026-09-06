@@ -646,7 +646,11 @@ gb_internal void report_os_info() {
 }
 
 gb_internal void report_backend_info() {
+#if defined(ODIN_NO_LLVM)
+	gb_printf("\tBackend: wasm (built without LLVM)\n");
+#else
 	gb_printf("\tBackend: LLVM %s\n", LLVM_VERSION_STRING);
+#endif
 }
 
 // NOTE(Jeroen): `odin report` prints some system information for easier bug reporting.

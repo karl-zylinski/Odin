@@ -132,7 +132,11 @@ struct MicroarchFeatureList {
 	String features;
 };
 
-#if defined(GB_SYSTEM_WINDOWS)
+#if defined(ODIN_NO_LLVM)
+	// Built without LLVM (wasm backend only); pretend to be a recent LLVM for the
+	// few version dependent defaults below.
+	#define LLVM_VERSION_MAJOR 20
+#elif defined(GB_SYSTEM_WINDOWS)
 	#include <llvm-c/Config/llvm-config.h>
 #else
 	#include <llvm/Config/llvm-config.h>
@@ -196,6 +200,18 @@ struct QueryDataSetSettings {
 	QueryDataSetKind kind;
 	bool ok;
 	bool compact;
+};
+
+enum BackendKind : u8 {
+	Backend_LLVM, // LLVM code generation + external linker (default)
+	Backend_Wasm, // direct WebAssembly backend (wasm targets only, no linker)
+
+	Backend_COUNT,
+};
+
+String backend_names[Backend_COUNT] = {
+	str_lit("llvm"),
+	str_lit("wasm"),
 };
 
 enum BuildModeKind {
@@ -563,6 +579,7 @@ struct BuildContext {
 	IntegerDivisionByZeroKind integer_division_by_zero_behaviour;
 
 	LinkerChoice linker_choice;
+	BackendKind backend;
 
 	StringSet custom_attributes;
 

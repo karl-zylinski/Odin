@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# Differential test for the direct wasm backend: build each test package with
+# both the LLVM backend and the wasm backend, invoke every exported procedure
+# with wasmtime and compare the results.
+#
+# Requires `wasmtime` in PATH (and `wasm-ld` for the LLVM reference build).
+#
+# Environment (paths are relative to this directory):
+#   ODIN      compiler under test               (default ../../odin)
+#   ODIN_REF  compiler for the reference build  (default $ODIN; use an LLVM build
+#             when ODIN is a compiler built with build_odin_nollvm.sh)
+#   VERBOSE   print every result
+set -u
+
+cd "$(dirname "$0")"
+ODIN=${ODIN:-../../odin}          # compiler under test (wasm backend)
+ODIN_REF=${ODIN_REF:-$ODIN}      # compiler used for the LLVM reference build
+OUT=${OUT:-./out}
+TARGET=${TARGET:-freestanding_wasm32}
+mkdir -p "$OUT"
+
+failures=0
+total=0
+
+check() {
+	local name=$1; shift
+	local expected=$1; shift
+	local actual=$1; shift
+	total=$((total+1))
+	if [ -z "$expected" ]; then
+		echo "FAIL $name: reference produced no output"
+		failures=$((failures+1))
+	elif [ "$expected" != "$actual" ]; then
+		echo "FAIL $name: expected '$expected', got '$actual'"
+		failures=$((failures+1))
+	fi
+}
+
+invoke() {
+	wasmtime run --invoke "$2" "$1" "${@:3}" 2>/dev/null
+}
+
+for pkg in */; do
+	pkg=${pkg%/}
+	[ -f "$pkg/calls.txt" ] || continue
+
+	ref="$OUT/${pkg}_llvm.wasm"
+	new="$OUT/${pkg}_wasm.wasm"
+	if ! "$ODIN_REF" build "$pkg" -target:"$TARGET" -no-entry-point -out:"$ref"; then
+		echo "FAIL $pkg: LLVM reference build failed"; failures=$((failures+1)); continue
+	fi
+	if ! "$ODIN" build "$pkg" -target:"$TARGET" -no-entry-point -backend:wasm -out:"$new"; then
+		echo "FAIL $pkg: wasm backend build failed"; failures=$((failures+1)); continue
+	fi
+
+	while read -r line; do
+		[ -z "$line" ] && continue
+		case "$line" in \#*) continue;; esac
+		# shellcheck disable=SC2086
+		set -- $line
+		expected=$(invoke "$ref" "$@")
+		actual=$(invoke "$new" "$@")
+		[ -n "${VERBOSE:-}" ] && echo "$pkg/$line => $actual"
+		check "$pkg/$line" "$expected" "$actual"
+	done < "$pkg/calls.txt"
+done
+
+echo "$((total-failures))/$total passed"
+[ "$failures" -eq 0 ]

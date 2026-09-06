@@ -57,7 +57,12 @@ gb_internal void debugf(char const *fmt, ...) {
 
 gb_global Timings global_timings = {0};
 
-#if defined(GB_SYSTEM_WINDOWS)
+#if defined(ODIN_NO_LLVM)
+	#if !defined(GB_SYSTEM_WINDOWS)
+	#include <signal.h>
+	#include <sys/resource.h>
+	#endif
+#elif defined(GB_SYSTEM_WINDOWS)
 #include "llvm-c/Types.h"
 #else
 #include <llvm-c/Types.h>
@@ -79,7 +84,11 @@ gb_global Timings global_timings = {0};
 #include "linker.cpp"
 #include "bundle_command.cpp"
 
+#if !defined(ODIN_NO_LLVM)
 #include "llvm_backend.cpp"
+#endif
+#include "microarch.cpp"
+#include "wasm_backend.cpp"
 
 #include "bug_report.cpp"
 
@@ -422,6 +431,7 @@ enum BuildFlagKind {
 	BuildFlag_Collection,
 	BuildFlag_Define,
 	BuildFlag_BuildMode,
+	BuildFlag_Backend,
 	BuildFlag_KeepExecutable,
 	BuildFlag_Target,
 	BuildFlag_Subtarget,
@@ -683,6 +693,7 @@ gb_internal bool parse_build_flags(Array<String> args) {
 	add_flag(&build_flags, BuildFlag_Collection,              str_lit("collection"),                BuildFlagParam_String,  Command__does_check);
 	add_flag(&build_flags, BuildFlag_Define,                  str_lit("define"),                    BuildFlagParam_String,  Command__does_check, true);
 	add_flag(&build_flags, BuildFlag_BuildMode,               str_lit("build-mode"),                BuildFlagParam_String,  Command__does_build); // Commands_build is not used to allow for a better error message
+	add_flag(&build_flags, BuildFlag_Backend,                 str_lit("backend"),                   BuildFlagParam_String,  Command__does_build);
 	add_flag(&build_flags, BuildFlag_KeepExecutable,          str_lit("keep-executable"),           BuildFlagParam_None,    Command__does_build | Command_test);
 	add_flag(&build_flags, BuildFlag_Target,                  str_lit("target"),                    BuildFlagParam_String,  Command__does_check);
 	add_flag(&build_flags, BuildFlag_Subtarget,               str_lit("subtarget"),                 BuildFlagParam_String,  Command__does_check);
@@ -1331,6 +1342,28 @@ gb_internal bool parse_build_flags(Array<String> args) {
 								}
 							}
 							break;
+
+						case BuildFlag_Backend: {
+							GB_ASSERT(value.kind == ExactValue_String);
+							String str = value.value_string;
+							bool found = false;
+							for (isize i = 0; i < Backend_COUNT; i++) {
+								if (str == backend_names[i]) {
+									build_context.backend = cast(BackendKind)i;
+									found = true;
+									break;
+								}
+							}
+							if (!found) {
+								gb_printf_err("Unknown backend '%.*s'\n", LIT(str));
+								gb_printf_err("Valid backends:\n");
+								for (isize i = 0; i < Backend_COUNT; i++) {
+									gb_printf_err("\t%.*s\n", LIT(backend_names[i]));
+								}
+								bad_flags = true;
+							}
+							break;
+						}
 
 						case BuildFlag_BuildMode: {
 							GB_ASSERT(value.kind == ExactValue_String);
@@ -2066,6 +2099,32 @@ gb_internal bool parse_build_flags(Array<String> args) {
 		bad_flags = true;
 	}
 
+	if (build_context.backend == Backend_Wasm) {
+		bool target_is_wasm = false;
+		if (selected_target_metrics != nullptr) {
+			switch (selected_target_metrics->metrics->arch) {
+			case TargetArch_wasm32:
+			case TargetArch_wasm64p32:
+				target_is_wasm = true;
+				break;
+			}
+		}
+		if (!target_is_wasm) {
+			gb_printf_err("-backend:wasm requires a wasm target, e.g. -target:freestanding_wasm32\n");
+			bad_flags = true;
+		}
+		if (build_context.build_mode != BuildMode_Executable && build_context.build_mode != BuildMode_DynamicLibrary) {
+			gb_printf_err("-backend:wasm only supports -build-mode:exe and -build-mode:dll\n");
+			bad_flags = true;
+		}
+	}
+#if defined(ODIN_NO_LLVM)
+	if (build_context.backend != Backend_Wasm && (build_context.command_kind & Command__does_build)) {
+		gb_printf_err("This compiler was built without LLVM: only -backend:wasm is available\n");
+		bad_flags = true;
+	}
+#endif
+
 	if (build_context.did_you_mean_limit == 0) build_context.did_you_mean_limit = DEFAULT_DID_YOU_MEAN_LIMIT;
 
 	return !bad_flags;
@@ -2654,6 +2713,7 @@ gb_internal void export_linked_libraries(LinkerData *gen) {
 	}
 }
 
+#if !defined(ODIN_NO_LLVM)
 gb_internal void remove_temp_files(lbGenerator *gen) {
 	if (build_context.keep_temp_files) return;
 
@@ -2687,6 +2747,7 @@ gb_internal void remove_temp_files(lbGenerator *gen) {
 		}
 	}
 }
+#endif
 
 
 gb_internal int print_show_help(String const arg0, String command, String optional_flag = {}) {
@@ -2854,6 +2915,16 @@ gb_internal int print_show_help(String const arg0, String command, String option
 				print_usage_line(3, "-build-mode:asm         Builds as an assembly file.");
 				print_usage_line(3, "-build-mode:llvm-ir     Builds as an LLVM IR file.");
 				print_usage_line(3, "-build-mode:llvm        Builds as an LLVM IR file.");
+		}
+	}
+
+	if (build) {
+		if (print_flag("-backend:<name>")) {
+			print_usage_line(2, "Selects the code generation backend.");
+			print_usage_line(2, "Available options:");
+				print_usage_line(3, "-backend:llvm           LLVM code generation and an external linker (default).");
+				print_usage_line(3, "-backend:wasm           Direct WebAssembly backend, no LLVM or linker required.");
+				print_usage_line(3, "                        Experimental. Only supports the wasm targets.");
 		}
 	}
 
@@ -4471,7 +4542,17 @@ int main(int arg_count, char const **arg_ptr) {
 		failed_to_cache_parsing = true;
 	}
 
-	{
+	if (build_context.backend == Backend_Wasm) {
+		MAIN_TIME_SECTION("wasm code gen");
+		if (!wb_generate_code(&checker->info)) {
+			if (any_errors()) {
+				print_all_errors();
+			}
+			return 1;
+		}
+	}
+#if !defined(ODIN_NO_LLVM)
+	else {
 		lbGenerator *gen = permanent_alloc_item<lbGenerator>();
 		if (!lb_init_generator(gen, checker)) {
 			return 1;
@@ -4511,6 +4592,7 @@ int main(int arg_count, char const **arg_ptr) {
 
 		remove_temp_files(gen);
 	}
+#endif
 
 	if (any_errors()) {
 		print_all_errors();
