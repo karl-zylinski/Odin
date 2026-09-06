@@ -1,0 +1,65 @@
+# <exported procedure> <arguments...>
+struct_basics 1 2
+struct_basics -3 0.5
+nested_struct 3
+nested_struct 10
+array_sum 3
+array_sum -2
+array_by_reference 2
+slices 0
+slices 5
+slice_literal 4
+string_bytes 0
+string_bytes 7
+string_runes 0
+string_runes 1
+substring 0 5
+substring 7 13
+globals 1
+globals 2
+static_local 5
+static_local 6
+static_local 7
+switch_stmt 0
+switch_stmt 1
+switch_stmt 2
+switch_stmt 3
+switch_stmt 5
+switch_stmt 9
+switch_stmt 11
+switch_stmt -4
+switch_stmt 200
+labelled_break 10
+labelled_break 3
+defers 3
+defers 8
+multiple_results 17 5
+multiple_results 100 7
+indirect_calls 3 4
+indirect_calls 9 2
+pointers 4
+swap_and_multi_assign 1 2
+builtins 3 -8
+builtins -1 2
+named_args 4
+inclusive_range 10
+inclusive_range 0
+array_of_structs 3
+runtime_call 0
+runtime_call 1
+ternary_and_when 3
+ternary_and_when 8
+eval_order 3
+value_semantics 7
+defer_named_results 4
+tuple_assign 47 6
+reverse_ranges 2
+indirect_aggregate 5
+linked_list 3
+narrow_arithmetic 100 50
+narrow_arithmetic 300 -20
+wide_arithmetic 123456789012 -98765
+wide_arithmetic 21 7
+enum_switch 4
+nested_defers_and_loops 4
+recursive_aggregates 5

@@ -135,6 +135,39 @@ gb_internal void wb_patch_call_relocs(wbProcedure *p) {
 	}
 }
 
+// Memory instructions. The alignment immediate is only a hint in wasm, so
+// possibly unaligned accesses (packed structs) are still correct.
+gb_internal void wb_memarg(wbProcedure *p, wbOp op, u32 offset, u32 size) {
+	u32 align = 0;
+	while ((1u << align) < size && align < 3) {
+		align++;
+	}
+	wb_byte(&p->code, cast(u8)op);
+	wb_uleb(&p->code, align);
+	wb_uleb(&p->code, offset);
+}
+
+// dst, src, size on the stack (memmove semantics)
+gb_internal void wb_memory_copy(wbProcedure *p) {
+	wb_byte(&p->code, 0xfc);
+	wb_uleb(&p->code, 10);
+	wb_byte(&p->code, 0x00);
+	wb_byte(&p->code, 0x00);
+}
+
+// dst, byte value, size on the stack
+gb_internal void wb_memory_fill(wbProcedure *p) {
+	wb_byte(&p->code, 0xfc);
+	wb_uleb(&p->code, 11);
+	wb_byte(&p->code, 0x00);
+}
+
+gb_internal void wb_call_indirect(wbProcedure *p, u32 type_index) {
+	wb_byte(&p->code, wbOp_call_indirect);
+	wb_uleb(&p->code, type_index);
+	wb_byte(&p->code, 0x00); // table 0
+}
+
 // Structured control flow. `wb_open_*` returns the absolute depth of the new label.
 gb_internal u32 wb_open_block(wbProcedure *p, u8 block_type = 0x40) {
 	wb_byte(&p->code, wbOp_block);
@@ -208,6 +241,7 @@ gb_internal void wb_write_procedure_body(wbBuffer *b, wbProcedure *p) {
 	wb_bytes(&body, groups.data.data, groups.data.count);
 	array_free(&groups.data);
 
+	wb_bytes(&body, p->prologue.data.data, p->prologue.data.count);
 	wb_bytes(&body, p->code.data.data, p->code.data.count);
 	wb_byte(&body, wbOp_end);
 
@@ -311,6 +345,17 @@ gb_internal void wb_write_module(wbBuffer *out, wbModule *m) {
 		wb_section(out, wbSection_Function, &sec);
 	}
 
+	// Table section: the function table used for procedure values
+	if (m->table.count > 1) {
+		array_clear(&sec.data);
+		wb_uleb(&sec, 1);
+		wb_byte(&sec, wbValType_funcref);
+		wb_byte(&sec, 0x01); // limits: min and max
+		wb_uleb(&sec, cast(u64)m->table.count);
+		wb_uleb(&sec, cast(u64)m->table.count);
+		wb_section(out, wbSection_Table, &sec);
+	}
+
 	// Memory section: one memory, no maximum
 	{
 		array_clear(&sec.data);
@@ -355,6 +400,28 @@ gb_internal void wb_write_module(wbBuffer *out, wbModule *m) {
 		wb_section(out, wbSection_Export, &sec);
 	}
 
+	// Start section
+	if (m->startup != nullptr) {
+		array_clear(&sec.data);
+		wb_uleb(&sec, m->startup->func_index);
+		wb_section(out, wbSection_Start, &sec);
+	}
+
+	// Element section: fill the function table (index 0 stays null)
+	if (m->table.count > 1) {
+		array_clear(&sec.data);
+		wb_uleb(&sec, 1);
+		wb_byte(&sec, 0x00); // active segment, table 0, funcidx vector
+		wb_byte(&sec, wbOp_i32_const);
+		wb_sleb(&sec, 1);
+		wb_byte(&sec, wbOp_end);
+		wb_uleb(&sec, cast(u64)(m->table.count-1));
+		for (isize i = 1; i < m->table.count; i++) {
+			wb_uleb(&sec, m->table[i]->func_index);
+		}
+		wb_section(out, wbSection_Element, &sec);
+	}
+
 	// Code section
 	if (m->procedures.count > 0) {
 		array_clear(&sec.data);
@@ -363,6 +430,19 @@ gb_internal void wb_write_module(wbBuffer *out, wbModule *m) {
 			wb_write_procedure_body(&sec, p);
 		}
 		wb_section(out, wbSection_Code, &sec);
+	}
+
+	// Data section: globals and constants
+	if (m->data.count > 0) {
+		array_clear(&sec.data);
+		wb_uleb(&sec, 1);
+		wb_byte(&sec, 0x00); // active segment in memory 0
+		wb_byte(&sec, wbOp_i32_const);
+		wb_sleb(&sec, cast(i64)m->data_base);
+		wb_byte(&sec, wbOp_end);
+		wb_uleb(&sec, cast(u64)m->data.count);
+		wb_bytes(&sec, m->data.data, m->data.count);
+		wb_section(out, wbSection_Data, &sec);
 	}
 
 	wb_write_name_section(out, m);

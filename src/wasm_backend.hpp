@@ -15,7 +15,25 @@
 //   register"). Instruction sequences leave the wasm operand stack empty
 //   between statements, which makes structured control flow trivial as no
 //   values are ever live on the operand stack across a block boundary.
-//   Aggregates will live in linear memory (not yet implemented).
+//   Aggregates (structs, arrays, slices, strings, ...) live in linear memory
+//   and are referred to by address (wbValue_Memory). Scalar variables whose
+//   address is never taken live in wasm locals, everything else gets a slot
+//   in the procedure's stack frame (see "Memory layout" below).
+//
+// Memory layout:
+//   [0, stack_size)          shadow stack, grows down from `stack_size`.
+//                            `__stack_pointer` (global 0) holds the current top.
+//   [stack_size, data_end)   global variables and constant data (one data segment)
+//   [data_end, ...)          free for the runtime heap (memory.grow)
+//
+// Calling convention:
+//   Scalar parameters are passed directly, aggregate parameters as an i32
+//   pointer to a copy made by the caller. If the procedure has a single
+//   scalar result it is returned directly; otherwise the caller passes a
+//   pointer to result storage (laid out as the result tuple) as the first
+//   parameter. "odin" calling convention procedures take the context pointer
+//   as the last parameter. Procedure values are indices into the function
+//   table (0 is nil).
 //
 // Control flow:
 //   Odin has no `goto`, so all control flow is structured and maps directly
@@ -261,22 +279,40 @@ struct wbFuncType {
 	Array<wbValType> results;
 };
 
+#define WB_NO_LOCAL 0xffffffffu
+
 enum wbValueKind : u8 {
 	wbValue_Invalid,
-	wbValue_Local, // value lives in wasm local `index`
-	wbValue_Const, // scalar constant
+	wbValue_Local,  // scalar in wasm local `index`
+	wbValue_Const,  // scalar constant
+	wbValue_Memory, // aggregate at address local[index] + offset (absolute if index == WB_NO_LOCAL)
 };
 
-// A scalar value produced by an expression
+// The result of an expression
 struct wbValue {
 	wbValueKind kind;
-	wbValType   vt;
-	Type *      type; // Odin type
-	u32         index; // wasm local index (wbValue_Local)
+	wbValType   vt;    // wasm type (i32 for wbValue_Memory)
+	Type *      type;  // Odin type
+	u32         index; // wasm local index
+	i32         offset;
 	union {
 		i64 i;  // i32/i64 constant (wbValue_Const)
 		f64 f;  // f32/f64 constant (wbValue_Const)
 	};
+};
+
+enum wbAddrKind : u8 {
+	wbAddr_Invalid,
+	wbAddr_Local,  // scalar variable in wasm local `index`
+	wbAddr_Memory, // local[index] + offset (absolute if index == WB_NO_LOCAL)
+};
+
+// An addressable location
+struct wbAddr {
+	wbAddrKind kind;
+	Type *     type; // type of the stored value
+	u32        index;
+	i32        offset;
 };
 
 struct wbLocal {
@@ -284,12 +320,20 @@ struct wbLocal {
 	String    name; // for the `name` custom section, may be empty
 };
 
-// An open structured control flow label (block/loop/if) in a procedure body
+// An open control flow construct that `break`/`continue`/`fallthrough` may target
 struct wbLabel {
-	Ast * label;         // Ast_Label of the owning statement, nullptr if unlabelled
-	u32   break_depth;   // absolute label depth for `break`
-	u32   continue_depth;// absolute label depth for `continue` (loops only)
+	Ast * label;          // Ast_Label of the owning statement, nullptr if unlabelled
+	u32   break_depth;    // absolute label depth for `break`
+	u32   continue_depth; // absolute label depth for `continue` (loops only)
+	u32   fall_depth;     // absolute label depth for `fallthrough` (switch cases only)
 	bool  is_loop;
+	bool  is_switch;
+	isize scope_index;    // scope depth when the construct was entered (for defers)
+};
+
+struct wbDefer {
+	Ast * stmt;
+	isize scope_index;
 };
 
 struct wbModule;
@@ -304,12 +348,13 @@ struct wbCallReloc {
 
 struct wbProcedure {
 	wbModule * module;
-	Entity *   entity;
+	Entity *   entity;    // nullptr for generated procedures
 	String     name;      // link name
-	Type *     type;      // Type_Proc
-	Ast *      body;      // Ast_BlockStmt, nullptr for foreign procedures
+	Type *     type;      // Type_Proc, nullptr for generated procedures
+	Ast *      body;      // Ast_BlockStmt, nullptr for foreign/generated procedures
 	u32        type_index;
-	u32        func_index; // final function index (imports come first)
+	u32        func_index;  // final function index (imports come first)
+	u32        table_index; // index in the function table, 0 if not referenced as a value
 
 	bool       is_foreign;
 	bool       is_export;
@@ -317,18 +362,33 @@ struct wbProcedure {
 	String     import_module;
 	String     import_name;
 
-	u32        param_count;    // number of wasm params (including context pointer)
+	u32        param_count;    // number of wasm params (including sret and context pointers)
 	i32        context_local;  // local index of the context pointer, -1 if none
+	i32        sret_local;     // local index of the result pointer, -1 if none
+	u32        fp_local;       // frame pointer (lowest address of the frame)
+	u32        old_sp_local;   // stack pointer on entry
+	u32        frame_size;     // bytes of stack frame, known after lowering
 	Array<wbLocal> locals;     // all locals, params first
 	Array<wbValType> results;
-	PtrMap<Entity *, u32> entity_locals; // Odin variable -> wasm local
 
-	Array<u32> result_locals; // locals for named results (empty otherwise)
+	PtrMap<Entity *, wbAddr> variables; // Odin variable -> storage
+	PtrSet<Entity *> addressed;         // variables whose address is taken
+	Array<wbAddr> result_addrs;         // named results (empty otherwise)
 
+	Array<wbDefer> defers;
+	Array<isize>   scopes; // defers.count when each open scope was entered
+
+	wbBuffer   prologue;  // stack frame setup, generated after the body
 	wbBuffer   code;      // instruction bytes (without local declarations)
-	u32        depth;     // number of currently open labels
+	u32        depth;     // number of currently open wasm labels
 	Array<wbLabel> labels;
 	Array<wbCallReloc> call_relocs;
+};
+
+// A global variable whose initializer runs in the start function
+struct wbGlobalInit {
+	Entity *entity;
+	Ast *   init_expr;
 };
 
 struct wbModule {
@@ -340,10 +400,20 @@ struct wbModule {
 	Array<wbProcedure *>  procedures; // defined procedures, in function index order
 	PtrMap<Entity *, wbProcedure *> procedure_map;
 	Array<wbProcedure *>  work_queue; // procedures whose bodies still need lowering
+	Array<wbProcedure *>  table;      // function table, index 0 is reserved for nil
+	wbProcedure *         startup;    // runs non-constant global initializers (wasm start function)
 
 	u32 stack_size;
 	u32 memory_initial_pages;
 	u32 global_stack_pointer; // global index
+
+	// Global variables and constant data, one data segment at `data_base`
+	Array<u8> data;
+	u32       data_base;
+	PtrMap<Entity *, u32> globals;       // global variable -> absolute address
+	StringMap<u32>        string_bytes;  // interned NUL-terminated string data
+	StringMap<u32>        string_values; // interned `string` {data, len} constants
+	Array<wbGlobalInit>   global_init_queue; // globals with non-constant initializers
 
 	i32 error_count;
 };
