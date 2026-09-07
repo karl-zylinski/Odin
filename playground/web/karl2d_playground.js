@@ -7,19 +7,25 @@
 // file system as /odin/karl2d/examples/<dir>/ (the library is packed as
 // /odin/karl2d so the examples' `import k2 "../.."` keeps working) together
 // with Karl2D's web entry point in build/web/, which is the package built.
+//
+// All the files of the example are listed below the editor; the .odin ones can
+// be opened in the editor (some examples are made of several files). Edits are
+// kept per file in `edited` so that switching file or example never loses them.
 
-const sourceElement = document.getElementById("source");
+const editor = createEditor(document.getElementById("editor"));
 const exampleSelect = document.getElementById("example");
 const runButton = document.getElementById("run");
 const statusElement = document.getElementById("status");
 const consoleElement = document.getElementById("console");
-const rightElement = document.getElementById("right");
+const filesElement = document.getElementById("files");
 
 let examples = [];          // examples.json
 let exampleFiles = new Map(); // dir -> Map(path -> ArrayBuffer), fetched on demand
 let entrySource = null;     // Karl2D's web entry point
 let current = null;         // the selected example
-let edited = new Map();     // dir -> edited main source, so switching examples keeps changes
+let currentPath = null;     // the file of it that is open in the editor
+let edited = new Map();     // dir + "/" + path -> edited source
+let thumbnailUrls = [];     // object URLs of the file list, revoked when it is rebuilt
 let compilerReady = false;
 let compiling = false;
 let gameFrame = document.getElementById("game");
@@ -42,6 +48,7 @@ worker.onmessage = (e) => {
 			runProgram(msg.wasm);
 		} else {
 			updateStatus("Compilation failed");
+			markErrorLines();
 			testHook(false);
 		}
 	}
@@ -55,6 +62,23 @@ function updateButtons() {
 	const ready = compilerReady && current !== null && !compiling;
 	runButton.disabled = !ready;
 	exampleSelect.disabled = examples.length === 0;
+}
+
+// The compiler reports `path(line:column) Error: ...`; the lines of the file
+// that is open are marked in the editor.
+function markErrorLines() {
+	if (currentPath === null) {
+		return;
+	}
+	const lines = [];
+	const pattern = /([^\s()]+)\((\d+):\d+\)\s+(?:Syntax )?Error/g;
+	let match;
+	while ((match = pattern.exec(consoleElement.textContent)) !== null) {
+		if (match[1].endsWith("/" + currentPath) && lines.indexOf(+match[2]) === -1) {
+			lines.push(+match[2]);
+		}
+	}
+	editor.setErrorLines(lines);
 }
 
 async function fetchBinary(url) {
@@ -77,28 +101,134 @@ async function fetchExampleFiles(example) {
 	return files;
 }
 
+function fileKey(dir, path) {
+	return dir + "/" + path;
+}
+
+function isSource(path) {
+	return path.endsWith(".odin");
+}
+
+// Keeps what is in the editor, so that opening another file or example and
+// coming back shows the edits again.
+function saveEditor() {
+	if (current !== null && currentPath !== null) {
+		edited.set(fileKey(current.dir, currentPath), editor.getValue());
+	}
+}
+
+function openFile(path) {
+	saveEditor();
+	const files = exampleFiles.get(current.dir);
+	const key = fileKey(current.dir, path);
+	currentPath = path;
+	editor.setValue(edited.has(key) ? edited.get(key) : new TextDecoder().decode(files.get(path)));
+	updateFileList();
+}
+
+const IMAGE_TYPES = {png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif", bmp: "image/bmp", webp: "image/webp"};
+
+function fileExtension(path) {
+	const name = path.slice(path.lastIndexOf("/") + 1);
+	const dot = name.lastIndexOf(".");
+	return dot <= 0 ? "" : name.slice(dot + 1).toLowerCase();
+}
+
+function formatSize(bytes) {
+	if (bytes < 1024) {
+		return bytes + " B";
+	}
+	if (bytes < 1024 * 1024) {
+		return Math.round(bytes / 1024) + " kB";
+	}
+	return (bytes / (1024 * 1024)).toFixed(1) + " MB";
+}
+
+// Builds one entry of the file list. It only needs the bytes, so that files
+// dropped onto the page (which is what this list is meant for next: adding new
+// textures, sounds and fonts to an example) can be added the same way.
+function makeFileEntry(path, data) {
+	const extension = fileExtension(path);
+	const size = formatSize(data.byteLength);
+	const entry = document.createElement("div");
+	entry.className = "file" + (isSource(path) ? " source" : "") + (path === currentPath ? " open" : "");
+	entry.title = path + "\n" + size;
+
+	const thumb = document.createElement("div");
+	thumb.className = "file-thumb";
+	if (IMAGE_TYPES[extension]) {
+		const url = URL.createObjectURL(new Blob([data], {type: IMAGE_TYPES[extension]}));
+		thumbnailUrls.push(url);
+		const image = document.createElement("img");
+		image.src = url;
+		image.alt = path;
+		thumb.appendChild(image);
+	} else {
+		// Everything the browser cannot show (tga, wav, ttf, json, ...) gets the
+		// extension and the size instead of a thumbnail
+		const label = document.createElement("div");
+		label.innerHTML = '<span class="file-ext"></span><span class="file-size"></span>';
+		label.querySelector(".file-ext").textContent = extension === "" ? "FILE" : extension.toUpperCase();
+		label.querySelector(".file-size").textContent = size;
+		thumb.appendChild(label);
+	}
+	entry.appendChild(thumb);
+
+	const name = document.createElement("span");
+	name.className = "file-name";
+	name.textContent = path.slice(path.lastIndexOf("/") + 1);
+	entry.appendChild(name);
+
+	if (isSource(path)) {
+		entry.addEventListener("click", () => openFile(path));
+	}
+	return entry;
+}
+
+// The main file first, then the other sources, then everything else
+function sortedFiles(example) {
+	const rank = (path) => path === example.main ? 0 : (isSource(path) ? 1 : 2);
+	return example.files.slice().sort((a, b) => rank(a) - rank(b) || a.localeCompare(b));
+}
+
+function updateFileList() {
+	for (const url of thumbnailUrls) {
+		URL.revokeObjectURL(url);
+	}
+	thumbnailUrls = [];
+	filesElement.textContent = "";
+	if (current === null || !exampleFiles.has(current.dir)) {
+		return;
+	}
+	const files = exampleFiles.get(current.dir);
+	for (const path of sortedFiles(current)) {
+		filesElement.appendChild(makeFileEntry(path, files.get(path)));
+	}
+}
+
 async function selectExample(dir) {
 	const example = examples.find((ex) => ex.dir === dir);
 	if (!example) {
 		return;
 	}
-	if (current !== null) {
-		edited.set(current.dir, sourceElement.value);
-	}
+	saveEditor();
 	current = example;
+	currentPath = null;
 	exampleSelect.value = dir;
-	if (edited.has(dir)) {
-		sourceElement.value = edited.get(dir);
-	} else {
-		sourceElement.value = "";
+	editor.setValue("");
+	updateFileList();
+	if (!exampleFiles.has(dir)) {
 		updateStatus("Loading " + dir + "...");
-		try {
-			const files = await fetchExampleFiles(example);
-			sourceElement.value = new TextDecoder().decode(files.get(example.main));
-			updateStatus(compilerReady ? "Ready" : "Loading compiler...");
-		} catch (e) {
-			updateStatus("" + e);
+	}
+	try {
+		await fetchExampleFiles(example);
+		if (current !== example) {
+			return; // another example was picked while this one was loading
 		}
+		openFile(example.main);
+		updateStatus(compilerReady ? "Ready" : "Loading compiler...");
+	} catch (e) {
+		updateStatus("" + e);
 	}
 	updateButtons();
 	history.replaceState(null, "", "?example=" + encodeURIComponent(dir));
@@ -109,6 +239,8 @@ async function compileAndRun() {
 		return;
 	}
 	compiling = true;
+	saveEditor();
+	editor.setErrorLines([]);
 	updateButtons();
 	updateStatus("Compiling...");
 	consoleElement.textContent = "";
@@ -119,7 +251,9 @@ async function compileAndRun() {
 	const root = "odin/karl2d/examples/" + example.dir + "/";
 	const list = [];
 	for (const [path, data] of files) {
-		list.push({path: root + path, data: path === example.main ? sourceElement.value : data});
+		// Every edited source is sent as text, the rest as the bytes fetched
+		const key = fileKey(example.dir, path);
+		list.push({path: root + path, data: edited.has(key) ? edited.get(key) : data});
 	}
 	list.push({path: root + "build/web/entry.odin", data: entrySource});
 	worker.postMessage({
@@ -174,15 +308,6 @@ document.addEventListener("keydown", (e) => {
 	if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
 		e.preventDefault();
 		compileAndRun();
-	}
-});
-
-sourceElement.addEventListener("keydown", (e) => {
-	if (e.key === "Tab") {
-		e.preventDefault();
-		const start = sourceElement.selectionStart;
-		const end = sourceElement.selectionEnd;
-		sourceElement.setRangeText("\t", start, end, "end");
 	}
 });
 
@@ -246,10 +371,10 @@ if (testParams.has("test")) {
 		fetch("/log", {method: "POST", body: "WORKER ERROR " + e.message});
 	};
 	const waitForReady = setInterval(() => {
-		if (compilerReady && current !== null && sourceElement.value !== "") {
+		if (compilerReady && current !== null && editor.getValue() !== "") {
 			clearInterval(waitForReady);
 			if (testParams.has("src")) {
-				sourceElement.value = testParams.get("src");
+				editor.setValue(testParams.get("src"));
 			}
 			compileAndRun();
 		}

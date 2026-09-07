@@ -22,7 +22,7 @@ Set `ODIN_WASM=path/to/odin.wasm` to reuse an already built compiler module inst
 - `examples/`: the web capable Karl2D examples, one directory each, listed in `examples.json`. They are fetched when selected, so only the assets of the chosen example are downloaded.
 - `web_entry.odin`: Karl2D's web entry point (`build_web/web_entry_templates/web_entry_template.odin`), compiled together with the example.
 - `odin.js`, `audio_backend_web_audio.js`, `audio_backend_web_audio_processor.js`: the JS runtimes.
-- `index.html`, `karl2d_playground.js`, `game.html`, `compiler_worker.js`, `wasi.js`: the page. `generic.html` + `playground.js` is a plain Odin playground (one source file, no Karl2D) on top of the same compiler worker.
+- `index.html`, `karl2d_playground.js`, `editor.js`, `game.html`, `compiler_worker.js`, `wasi.js`: the page. `editor.js` is the code editor (a transparent textarea over a syntax highlighted `<pre>`, no dependencies). `generic.html` + `playground.js` is a plain Odin playground (one source file, no Karl2D) on top of the same compiler worker.
 
 ## How it works
 
