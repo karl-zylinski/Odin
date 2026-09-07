@@ -20,6 +20,7 @@ gb_internal u32  wb_add_local(wbProcedure *p, wbValType vt, String name);
 gb_internal void wb_emit_epilogue(wbProcedure *p);
 gb_internal void wb_finish_procedure(wbProcedure *p);
 gb_internal wbProcedure *wb_alloc_procedure(wbModule *m, String name);
+gb_internal u8 const *wb_const_data_bytes(wbModule *m, u32 addr, u32 size);
 
 #define WB_OPT_MAX_PRODUCER 64
 #define WB_OPT_MAX_PASSES   16
@@ -112,6 +113,9 @@ struct wbOpt {
 	// of the same address (load CSE), -1 if none
 	Array<i32>   cse_local;
 };
+
+gb_internal i32 wb_opt_br_target(wbOpt *o, i32 k);
+gb_internal bool wb_opt_range_untouched(wbOpt *o, i32 a, i32 b);
 
 gb_internal isize wb_opt_find_slot(wbOpt *o, i64 offset) {
 	// slots are allocated in increasing order
@@ -1125,12 +1129,10 @@ gb_internal wbInstr wb_opt_copy_instr(wbOpt *o, i32 k) {
 	wbInstr c = wb_opt_scratch_begin(o, in.kind, cast(wbOp)in.op, in.pops, in.pushes);
 	c.imm = in.imm;
 	c.flags |= in.flags & ~wbInstrFlag_Scratch;
-	switch (in.kind) {
-	case wbInstr_Local: wb_uleb(&o->scratch, in.imm); break;
-	case wbInstr_Const: wb_sleb(&o->scratch, cast(i32)in.imm); break;
-	case wbInstr_Br: case wbInstr_BrIf: wb_uleb(&o->scratch, in.imm); break;
-	case wbInstr_Block: case wbInstr_Loop: case wbInstr_If: wb_byte(&o->scratch, cast(u8)in.imm); break;
-	default: GB_ASSERT(in.length == 1); break;
+	if (in.kind == wbInstr_Local) {
+		wb_uleb(&o->scratch, in.imm); // may have been created without bytes
+	} else if (in.length > 1) {
+		wb_bytes(&o->scratch, wb_opt_instr_bytes(o, in) + 1, in.length - 1);
 	}
 	wb_opt_scratch_end(o, &c);
 	return c;
@@ -1170,8 +1172,13 @@ gb_internal bool wb_opt_propagate_copies(wbOpt *o) {
 		if (b < p->param_count || b == p->fp_local || b == p->old_sp_local) continue;
 		if (o->sets[b] != 1 || o->tees[b] != 0 || o->gets[b] == 0) continue;
 		bool frame_addr = wb_opt_is_frame_address_local(o, cast(i32)k);
+		// a constant: reads become the constant (which the peephole rules
+		// and the wasm compiler fold)
+		bool constant = !frame_addr && o->set_producer[k] == cast(i32)(k-1) && get.kind == wbInstr_Const;
 		u32 a = p->fp_local;
-		if (!frame_addr) {
+		if (constant) {
+			// nothing: the value is the same wherever it is read
+		} else if (!frame_addr) {
 			if (get.kind != wbInstr_Local || get.op != wbOp_local_get) continue;
 			a = get.imm;
 			if (a == b) continue;
@@ -1192,8 +1199,10 @@ gb_internal bool wb_opt_propagate_copies(wbOpt *o) {
 				if (o->blocks[blk].is_loop && o->blocks[blk].end > limit) limit = o->blocks[blk].end;
 				blk = o->blocks[blk].parent;
 			}
-			if (!ok || wb_opt_local_written_between(o, a, cast(i32)k, limit+1)) { all = false; continue; }
-			if (frame_addr) {
+			if (!ok || (!constant && wb_opt_local_written_between(o, a, cast(i32)k, limit+1))) { all = false; continue; }
+			if (constant) {
+				wb_opt_replace(o, j, wb_opt_copy_instr(o, cast(i32)k-1));
+			} else if (frame_addr) {
 				for (i32 i = o->set_producer[k]; i < cast(i32)k; i++) {
 					wb_opt_replace(o, j, wb_opt_copy_instr(o, i));
 				}
@@ -1279,6 +1288,51 @@ gb_internal bool wb_opt_local_feeds_itself(wbOpt *o, u32 l) {
 	return true;
 }
 
+// A store to a local that is stored again before being read (the zeroing
+// of a compound literal's fields before they are assigned)
+gb_internal void wb_opt_remove_overwritten_sets(wbOpt *o) {
+	wbProcedure *p = o->p;
+	for (isize l = p->param_count; l < o->writes.count; l++) {
+		if (l == p->fp_local || l == p->old_sp_local || o->writes[l].count < 2) continue;
+		Array<i32> const &writes = o->writes[l];
+		Array<i32> const &reads  = o->reads[l];
+		isize r = 0;
+		for (isize w = 0; w+1 < writes.count; w++) {
+			i32 k = writes[w], k2 = writes[w+1];
+			if (o->deleted[k] || o->deleted[k2] || o->replaced[k]) continue;
+			if (o->in[k].op != wbOp_local_set || o->block_of[k] != o->block_of[k2]) continue;
+			while (r < reads.count && reads[r] < k) r++;
+			if (r < reads.count && reads[r] < k2) continue;
+			// nothing between may leave for a place the first value is
+			// visible: branches only go to blocks that begin in between
+			bool ok = true;
+			for (i32 i = k+1; i < k2 && ok; i++) {
+				if (o->deleted[i]) continue;
+				wbInstr const &in = o->in[i];
+				if (in.kind == wbInstr_Br || in.kind == wbInstr_BrIf || (in.kind == wbInstr_Other && in.op == wbOp_br_table)) {
+					i32 t = wb_opt_br_target(o, i);
+					if (t < 0 || o->blocks[t].start <= k) ok = false;
+				}
+			}
+			if (!ok) continue;
+			i32 s = o->set_producer[k];
+			if (s >= 0 && cast(i32)k - s <= WB_OPT_MAX_PRODUCER && wb_opt_range_untouched(o, s, k+1)) {
+				bool pure = true;
+				for (i32 i = s; i < k; i++) {
+					if (!o->deleted[i] && !wb_opt_is_pure(o->in[i])) { pure = false; break; }
+				}
+				if (!pure) continue;
+				wb_opt_delete_range(o, s, k+1);
+			} else {
+				wbInstr d = wb_opt_scratch_begin(o, wbInstr_Other, wbOp_drop, 1, 0);
+				wb_opt_scratch_end(o, &d);
+				wb_opt_replace(o, k, d);
+			}
+			o->changed = true;
+		}
+	}
+}
+
 // Stores to locals nobody reads
 gb_internal void wb_opt_remove_dead_sets(wbOpt *o) {
 	wbProcedure *p = o->p;
@@ -1287,7 +1341,7 @@ gb_internal void wb_opt_remove_dead_sets(wbOpt *o) {
 		dead[l] = o->gets[l] == 0 || wb_opt_local_feeds_itself(o, cast(u32)l);
 	}
 	for (isize k = 0; k < o->n; k++) {
-		if (o->deleted[k]) continue;
+		if (o->deleted[k] || o->replaced[k]) continue;
 		wbInstr const &in = o->in[k];
 		if (in.kind != wbInstr_Local || in.op == wbOp_local_get) continue;
 		u32 l = in.imm;
@@ -1332,6 +1386,25 @@ gb_internal wbInstr wb_opt_i32_const(wbOpt *o, u32 value) {
 	wbInstr in = wb_opt_scratch_begin(o, wbInstr_Const, wbOp_i32_const, 0, 1);
 	in.imm = value;
 	wb_sleb(&o->scratch, cast(i32)value);
+	wb_opt_scratch_end(o, &in);
+	return in;
+}
+// A constant of any value type from its bit pattern
+gb_internal wbInstr wb_opt_const_bits(wbOpt *o, wbValType vt, u64 bits) {
+	wbOp op = wbOp_i32_const;
+	switch (vt) {
+	case wbValType_i64: op = wbOp_i64_const; break;
+	case wbValType_f32: op = wbOp_f32_const; break;
+	case wbValType_f64: op = wbOp_f64_const; break;
+	default: break;
+	}
+	wbInstr in = wb_opt_scratch_begin(o, wbInstr_Const, op, 0, 1);
+	switch (vt) {
+	case wbValType_i64: wb_sleb(&o->scratch, cast(i64)bits); break;
+	case wbValType_f32: for (int i = 0; i < 4; i++) wb_byte(&o->scratch, cast(u8)(bits >> (8*i))); break;
+	case wbValType_f64: for (int i = 0; i < 8; i++) wb_byte(&o->scratch, cast(u8)(bits >> (8*i))); break;
+	default: in.imm = cast(u32)bits; wb_sleb(&o->scratch, cast(i32)cast(u32)bits); break;
+	}
 	wb_opt_scratch_end(o, &in);
 	return in;
 }
@@ -1726,6 +1799,22 @@ gb_internal i32 wb_opt_cse_find_load(wbOpt *o, i32 k2, i32 *hi_out) {
 gb_internal bool wb_opt_is_op(wbOpt *o, i32 k, wbInstrKind kind, wbOp op) {
 	return wb_opt_live(o, k) && o->in[k].kind == kind && o->in[k].op == op;
 }
+// The bit pattern of any constant instruction
+gb_internal bool wb_opt_const_bits_of(wbOpt *o, i32 k, u64 *bits) {
+	if (!wb_opt_live(o, k) || o->in[k].kind != wbInstr_Const) return false;
+	wbInstr const &in = o->in[k];
+	if (in.op == wbOp_f32_const || in.op == wbOp_f64_const) {
+		u8 const *b = wb_opt_instr_bytes(o, in);
+		u64 v = 0;
+		for (isize i = 1; i < in.length; i++) v |= cast(u64)b[i] << (8*(i-1));
+		*bits = v;
+		return true;
+	}
+	i64 v = 0;
+	if (!wb_opt_const_int(o, in, &v)) return false;
+	*bits = in.op == wbOp_i32_const ? cast(u64)cast(u32)v : cast(u64)v;
+	return true;
+}
 gb_internal bool wb_opt_is_i32_const(wbOpt *o, i32 k, u32 *value) {
 	if (!wb_opt_is_op(o, k, wbInstr_Const, wbOp_i32_const)) return false;
 	*value = o->in[k].imm;
@@ -1830,6 +1919,24 @@ gb_internal void wb_opt_peephole(wbOpt *o) {
 			wb_opt_replace(o, k, wb_opt_i32_const(o, c));
 			o->changed = true;
 			continue;
+		}
+
+		// A load from constant data: the value itself
+		if (in.kind == wbInstr_Load && o->producer[k] == k-1 && wb_opt_is_i32_const(o, k-1, &c)) {
+			u8 const *bytes = wb_const_data_bytes(o->p->module, c + in.imm, in.width);
+			if (bytes) {
+				u64 bits = 0;
+				for (u32 i = 0; i < in.width; i++) bits |= cast(u64)bytes[i] << (8*i);
+				if (wb_opt_access_ext(in.op) == 1 && in.width < 8 && (bits >> (8*in.width - 1)) & 1) {
+					bits |= ~cast(u64)0 << (8*in.width);
+				}
+				wbValType vt = wb_opt_access_valtype(in.op);
+				if (vt == wbValType_i32) bits &= 0xffffffff;
+				o->deleted[k-1] = true;
+				wb_opt_replace(o, k, wb_opt_const_bits(o, vt, bits));
+				o->changed = true;
+				continue;
+			}
 		}
 
 		// A load of the same address as an earlier one, with nothing in between
@@ -2184,6 +2291,59 @@ gb_internal void wb_opt_peephole(wbOpt *o) {
 				if (known >= 0) {
 					wb_opt_delete_range(o, pq, q);
 					wb_opt_replace(o, q, wb_opt_i32_const(o, cast(u32)known));
+					o->changed = true;
+					continue;
+				}
+			}
+		}
+
+		// Float arithmetic with an identity constant (the ones and zeros of
+		// a constant matrix): `x * 1`, `x / 1`, `x - 0`, `x + -0` are x, and
+		// `x * -1` is `-x` (all exact); the negation of a constant is folded
+		if (in.kind == wbInstr_Other && in.op >= wbOp_f32_neg && in.op <= wbOp_f64_div && o->producer[k] >= 0) {
+			bool f64 = in.op >= wbOp_f64_neg;
+			u64 bits = 0;
+			u64 one = f64 ? 0x3ff0000000000000ull : 0x3f800000ull;
+			u64 neg_one = one | (f64 ? 0x8000000000000000ull : 0x80000000ull);
+			u64 neg_zero = f64 ? 0x8000000000000000ull : 0x80000000ull;
+			u8 op = in.op - (f64 ? wbOp_f64_neg : wbOp_f32_neg) + wbOp_f32_neg;
+			if (op == wbOp_f32_neg && wb_opt_const_bits_of(o, k-1, &bits)) {
+				o->deleted[k-1] = true;
+				wb_opt_replace(o, k, wb_opt_const_bits(o, f64 ? wbValType_f64 : wbValType_f32, bits ^ neg_zero));
+				o->changed = true;
+				continue;
+			}
+			if (in.pops == 2 && wb_opt_const_bits_of(o, k-1, &bits) && o->op0_end[k] == k-1) {
+				bool identity = (op == wbOp_f32_mul && bits == one) || (op == wbOp_f32_div && bits == one) ||
+				                (op == wbOp_f32_sub && bits == 0) || (op == wbOp_f32_add && bits == neg_zero);
+				if (identity) {
+					o->deleted[k-1] = true;
+					o->deleted[k] = true;
+					o->changed = true;
+					continue;
+				}
+				if ((op == wbOp_f32_mul || op == wbOp_f32_div) && bits == neg_one) {
+					o->deleted[k-1] = true;
+					wbInstr n = wb_opt_scratch_begin(o, wbInstr_Other, f64 ? wbOp_f64_neg : wbOp_f32_neg, 1, 1);
+					wb_opt_scratch_end(o, &n);
+					wb_opt_replace(o, k, n);
+					o->changed = true;
+					continue;
+				}
+			}
+			if (in.pops == 2 && (op == wbOp_f32_mul || op == wbOp_f32_add) && o->op0_start[k] >= 0 && o->op0_end[k] == o->op0_start[k]+1 &&
+			    wb_opt_const_bits_of(o, o->op0_start[k], &bits) && wb_opt_range_untouched(o, o->op0_end[k], k)) {
+				if ((op == wbOp_f32_mul && bits == one) || (op == wbOp_f32_add && bits == neg_zero)) {
+					o->deleted[o->op0_start[k]] = true;
+					o->deleted[k] = true;
+					o->changed = true;
+					continue;
+				}
+				if (op == wbOp_f32_mul && bits == neg_one) {
+					o->deleted[o->op0_start[k]] = true;
+					wbInstr n = wb_opt_scratch_begin(o, wbInstr_Other, f64 ? wbOp_f64_neg : wbOp_f32_neg, 1, 1);
+					wb_opt_scratch_end(o, &n);
+					wb_opt_replace(o, k, n);
 					o->changed = true;
 					continue;
 				}
@@ -2552,6 +2712,7 @@ gb_internal bool wb_opt_pass(wbProcedure *p, bool final_pass) {
 	} else {
 		wb_opt_promote_slots(o);
 		wb_opt_move_producers(o);
+		wb_opt_remove_overwritten_sets(o);
 		wb_opt_remove_dead_sets(o);
 		if (p->merge_copies) {
 			wb_opt_merge_copies(o);
@@ -2735,6 +2896,7 @@ gb_internal void wb_optimize_procedure(wbProcedure *p) {
 gb_internal void wb_link_mark_object_refs(wbModule *m);
 
 #define WB_INLINE_MAX_INSTRS       48   // callee size, in instructions
+#define WB_INLINE_MAX_IN_LOOP      96   // for calls inside a loop of the caller
 #define WB_INLINE_MAX_FORCED       512  // for #force_inline
 #define WB_INLINE_MAX_SINGLE       512  // callee with a single call site (nothing else can reach it)
 #define WB_INLINE_MAX_GROWTH       4096 // instructions added per caller
@@ -2744,7 +2906,7 @@ gb_internal bool wb_inline_is_cold(wbProcedure *c) {
 	return c->entity != nullptr && (c->entity->flags & EntityFlag_Cold) != 0;
 }
 
-gb_internal bool wb_inline_candidate(wbProcedure *caller, wbProcedure *c) {
+gb_internal bool wb_inline_candidate(wbProcedure *caller, wbProcedure *c, bool in_loop) {
 	if (c == caller || c->is_raw_body || c->failed || c->is_foreign || c->alias != nullptr) {
 		return false;
 	}
@@ -2771,7 +2933,7 @@ gb_internal bool wb_inline_candidate(wbProcedure *caller, wbProcedure *c) {
 	if (wb_inline_is_cold(c) || c->never_inline) {
 		return false;
 	}
-	isize limit = WB_INLINE_MAX_INSTRS;
+	isize limit = in_loop ? WB_INLINE_MAX_IN_LOOP : WB_INLINE_MAX_INSTRS;
 	if (c->call_sites == 1 && c->gen == wbProcGen_Body && !c->is_export && !c->object_ref && c->table_index == 0) {
 		// The body moves rather than gets duplicated
 		limit = WB_INLINE_MAX_SINGLE;
@@ -2874,14 +3036,23 @@ gb_internal bool wb_inline_calls(wbProcedure *p) {
 	isize growth = 0;
 	bool any = false, need_frame = p->frame_size > 0;
 	auto inline_at = array_make<bool>(temporary_allocator(), p->instrs.count);
+	auto is_loop = array_make<bool>(temporary_allocator(), 0, 32); // the open blocks
 	for_array(k, p->instrs) {
 		wbInstr const &in = p->instrs[k];
 		inline_at[k] = false;
+		switch (in.kind) {
+		case wbInstr_Block: case wbInstr_If: array_add(&is_loop, false); continue;
+		case wbInstr_Loop:                   array_add(&is_loop, true);  continue;
+		case wbInstr_End:                    if (is_loop.count > 0) array_pop(&is_loop); continue;
+		default: break;
+		}
 		if (in.kind != wbInstr_Call) {
 			continue;
 		}
+		bool in_loop = false;
+		for (bool l : is_loop) in_loop |= l;
 		wbProcedure *c = p->call_relocs[in.imm].target;
-		if (!wb_inline_candidate(p, c) || growth + c->instrs.count > WB_INLINE_MAX_GROWTH) {
+		if (!wb_inline_candidate(p, c, in_loop) || growth + c->instrs.count > WB_INLINE_MAX_GROWTH) {
 			continue;
 		}
 		inline_at[k] = true;
@@ -3042,6 +3213,30 @@ gb_internal u64 wb_spec_callback_mask(wbProcedure *c) {
 	return mask;
 }
 
+// Whether procedure `c` loads through its parameter `j`, directly or in a
+// procedure it passes the parameter on to
+gb_internal bool wb_spec_loads_through(wbProcedure *c, u32 j, int depth) {
+	if (depth > 3 || !wb_spec_candidate(c)) return false;
+	i32 starts[64];
+	for (isize k = 0; k < c->instrs.count; k++) {
+		wbInstr const &in = c->instrs[k];
+		if (in.kind == wbInstr_Local && in.op == wbOp_local_get && in.imm == j) {
+			if (k+1 < c->instrs.count && c->instrs[k+1].kind == wbInstr_Load) return true;
+		} else if (in.kind == wbInstr_Call) {
+			wbProcedure *t = c->call_relocs[in.imm].target;
+			if (t == nullptr || t == c || t->param_count > 64 || !wb_spec_arg_starts(c, k, cast(i32)t->param_count, starts)) continue;
+			for (u32 a = 0; a < t->param_count; a++) {
+				i32 s = starts[a];
+				i32 e = a+1 < t->param_count ? starts[a+1] : cast(i32)k;
+				if (e != s+1) continue;
+				wbInstr const &g = c->instrs[s];
+				if (g.kind == wbInstr_Local && g.op == wbOp_local_get && g.imm == j && wb_spec_loads_through(t, a, depth+1)) return true;
+			}
+		}
+	}
+	return false;
+}
+
 struct wbSpecCopy {
 	wbProcedure *proc;   // the original
 	wbProcedure *copy;
@@ -3132,7 +3327,7 @@ gb_internal void wb_specialize_procedures(wbModule *m) {
 			wbProcedure *c = p->call_relocs[in.imm].target;
 			if (c == nullptr || c == p || !wb_spec_candidate(c)) continue;
 			u64 cmask = wb_spec_callback_mask(c);
-			if ((cmask == 0 && !p->is_spec) || !wb_spec_arg_starts(p, k, cast(i32)c->param_count, starts)) continue;
+			if (!wb_spec_arg_starts(p, k, cast(i32)c->param_count, starts)) continue;
 			u64 bound = 0;
 			// A copy is made for a callback, or when a constant that was
 			// substituted into this copy is passed on: it may matter just as
@@ -3155,6 +3350,11 @@ gb_internal void wb_specialize_procedures(wbModule *m) {
 					}
 					if (written) continue;
 					if (a.flags & wbInstrFlag_SpecConst) worthwhile = true;
+					// A pointer to constant data (the info of a map) the
+					// callee loads through: the loads fold in the copy
+					if (!worthwhile && wb_const_data_bytes(m, a.imm, 1) != nullptr && wb_spec_loads_through(c, j, 0)) {
+						worthwhile = true;
+					}
 				}
 				bound |= cast(u64)1 << j;
 				values[j] = a.imm;

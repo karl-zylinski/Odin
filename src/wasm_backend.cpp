@@ -1884,7 +1884,30 @@ gb_internal u32 wb_const_data_addr(wbModule *m, Type *type, ExactValue const &va
 	wb_write_const_data(m, type, value, bytes);
 	u32 addr = wb_data_alloc(m, size, type_align_of(type));
 	wb_data_write(m, addr, bytes, size);
+	if (size > 0) {
+		array_add(&m->const_data, (cast(u64)addr << 32) | cast(u64)size);
+	}
 	return addr;
+}
+
+// The bytes of the data segment at `addr` when they are those of a constant
+// value (never written at runtime), so that loads of them can be folded
+gb_internal u8 const *wb_const_data_bytes(wbModule *m, u32 addr, u32 size) {
+	isize lo = 0, hi = m->const_data.count;
+	while (lo < hi) {
+		isize mid = (lo + hi) / 2;
+		u32 a = cast(u32)(m->const_data[mid] >> 32);
+		u32 n = cast(u32)m->const_data[mid];
+		if (addr < a) {
+			hi = mid;
+		} else if (addr >= a + n) {
+			lo = mid + 1;
+		} else {
+			if (addr + size > a + n) return nullptr;
+			return m->data.data + (addr - m->data_base);
+		}
+	}
+	return nullptr;
 }
 
 // Global variables
@@ -2517,6 +2540,7 @@ gb_internal void wb_module_init(wbModule *m, CheckerInfo *info) {
 	string_map_init(&m->map_cell_infos, 16);
 	string_map_init(&m->map_infos, 16);
 	array_init(&m->data, heap_allocator(), 0, 4096);
+	array_init(&m->const_data, heap_allocator(), 0, 256);
 	array_init(&m->global_init_queue, m->allocator);
 
 	// Same defaults as the wasm-ld invocation in linker.cpp: 1 MiB stack placed first

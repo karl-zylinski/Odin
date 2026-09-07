@@ -537,6 +537,7 @@ struct wbModule {
 	// Global variables and constant data, one data segment at `data_base`
 	Array<u8> data;
 	u32       data_base;
+	Array<u64> const_data; // (addr << 32 | size) of the constant values in `data`, in address order
 	PtrMap<Entity *, u32> globals;       // global variable -> absolute address
 	StringMap<wbProcedure *> libm_imports; // host math procedures (`env` module) backing `llvm.*` intrinsics
 	StringMap<u32>        string_bytes;  // interned NUL-terminated string data
