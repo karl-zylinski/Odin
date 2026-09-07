@@ -35,6 +35,13 @@ main :: proc() {
 	n = stbsp.snprintf(raw_data(buf[:]), len(buf), "%d %f %d %lld %d %u %lld %.1f", small, half, flag, big, u16(65535), u8(200), i64(99), f32(0.25))
 	fmt.println(n, string(buf[:n]))
 
+	// A foreign procedure as a procedure value
+	init := stbrp.init_target
+	init(&ctx, 64, 64, raw_data(nodes[:]), len(nodes))
+	rects[0] = {id = 9, w = 10, h = 10}
+	ok = stbrp.pack_rects(&ctx, raw_data(rects[:]), 1)
+	fmt.println("repacked:", ok, rects[0].id, rects[0].x, rects[0].y, rects[0].was_packed)
+
 	// No variadic arguments, and a call whose arguments contain calls
 	n = stbsp.snprintf(raw_data(buf[:]), len(buf), "plain")
 	fmt.println(n, string(buf[:n]))

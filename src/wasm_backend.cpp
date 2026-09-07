@@ -577,13 +577,19 @@ gb_internal bool wb_const_procedure_index(wbModule *m, String const &prefix, Ast
 // Index of a procedure in the function table (used for procedure values)
 gb_internal u32 wb_table_index(wbModule *m, wbProcedure *p) {
 	if (p->is_foreign) {
-		// imports use a different calling convention than procedure values
-		if (!p->failed) {
-			gb_printf_err("wasm backend: taking the address of foreign procedure '%.*s' is not supported\n", LIT(p->name));
-			m->error_count += 1;
-			p->failed = true;
+		// Foreign procedures use the C ABI while procedure values are called
+		// with the convention of wb_functype_of_proc; the two agree only when
+		// the signature has no aggregates. The wasm signatures are deduplicated
+		// so equal type indices mean equal signatures.
+		bool compatible = !p->is_llvm_intrinsic && p->entity != nullptr && p->type_index == wb_type_index_of_proc(m, p->entity->type);
+		if (!compatible) {
+			if (!p->failed) {
+				gb_printf_err("wasm backend: taking the address of foreign procedure '%.*s' is not supported\n", LIT(p->name));
+				m->error_count += 1;
+				p->failed = true;
+			}
+			return 0;
 		}
-		return 0;
 	}
 	if (p->table_index == 0) {
 		array_add(&m->table, p);
