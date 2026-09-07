@@ -1,7 +1,14 @@
 // Web worker that runs the Odin compiler (odin.wasm). The compiler is a
 // normal command line program, so every compile is a fresh instance with a
 // fresh linear memory: the module is compiled once, the file system with the
-// packed `base`, `core` and `vendor` sources is shared between runs.
+// packed ODIN_ROOT sources is shared between runs.
+//
+// Messages in:  {type: "compile", files: [{path, data}], dir, flags}
+//   `files` are written into the shared file system before compiling (paths
+//   without a leading slash, `data` is a string or an ArrayBuffer), `dir` is
+//   the package directory to build, `flags` extra compiler arguments.
+// Messages out: {type: "ready"}, {type: "output", stream, text},
+//               {type: "done", ok, ms, wasm?}
 
 importScripts("wasi.js");
 
@@ -19,19 +26,23 @@ async function setup() {
 	postMessage({type: "ready"});
 }
 
+// Files written by earlier compiles, removed before the next one
+let writtenPaths = [];
+
 function compile(msg) {
 	const fs = rootFs;
-	// Files from the previous compile in /src and /out are replaced
-	for (const path of Array.from(fs.files.keys())) {
-		if (path.startsWith("src/") || path.startsWith("out/")) {
-			fs.files.delete(path);
-		}
+	for (const path of writtenPaths) {
+		fs.files.delete(path);
 	}
-	fs.mkdirAll("src");
+	writtenPaths = [];
+	for (const file of msg.files) {
+		const data = typeof file.data === "string" ? new TextEncoder().encode(file.data) : new Uint8Array(file.data);
+		fs.writeFile(file.path, data);
+		writtenPaths.push(wasiNormalizePath(file.path));
+	}
 	fs.mkdirAll("out");
-	fs.writeFile("src/main.odin", new TextEncoder().encode(msg.source));
 
-	const args = ["odin", "build", "/src", "-out:/out/main.wasm", "-backend:wasm"].concat(msg.flags);
+	const args = ["odin", "build", msg.dir, "-out:/out/main.wasm", "-backend:wasm"].concat(msg.flags);
 	const env = ["ODIN_ROOT=/odin"];
 	const wasi = new Wasi(fs, args, env,
 		(text) => postMessage({type: "output", stream: "stdout", text: text}),
@@ -48,6 +59,7 @@ function compile(msg) {
 	}
 	const ms = performance.now() - started;
 	const output = fs.readFile("out/main.wasm");
+	fs.files.delete("out/main.wasm");
 	if (code !== 0 || !output) {
 		postMessage({type: "done", ok: false, ms: ms});
 		return;

@@ -62,7 +62,7 @@ function compileAndRun() {
 	programOutput.textContent = "";
 	canvas.style.display = "none";
 	const flags = flagsElement.value.split(/\s+/).filter((f) => f.length > 0);
-	worker.postMessage({type: "compile", source: sourceElement.value, flags: flags});
+	worker.postMessage({type: "compile", files: [{path: "src/main.odin", data: sourceElement.value}], dir: "/src", flags: flags});
 }
 
 async function runProgram(bytes) {

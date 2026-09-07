@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<!-- The page inside the playground's game iframe. It is a copy of Karl2D's
+     web build template (build_web/web_entry_templates/index_template.html)
+     that gets the wasm module from the playground page instead of fetching
+     it. A fresh iframe is created for every run so that nothing the previous
+     program left behind (event listeners, WebGL state, audio) lingers. -->
+<html lang="en" style="height: 100%;">
+	<head>
+		<meta charset="UTF-8">
+		<meta name="viewport" content="width=device-width, initial-scale=1">
+		<title>Karl2D Playground Game</title>
+		<link id="karl2d-favicon" rel="icon" href="">
+	</head>
+	<body id="body" style="height: 100%; padding: 0; margin: 0; overflow: hidden; background-color: black;">
+		<canvas id="webgl-canvas" style="touch-action: none;" oncontextmenu="return false;" onmousedown="event.target.focus()" onkeydown="event.preventDefault()"></canvas>
+
+		<script type="text/javascript" src="audio_backend_web_audio.js"></script>
+		<script type="text/javascript" src="odin.js"></script>
+		<script type="text/javascript">
+			// Keep keyboard commands from triggering outside of the iframe
+			document.getElementById("body").addEventListener("keydown", (ev) => ev.preventDefault());
+
+			function report(message) {
+				window.parent.postMessage({type: "game", text: message}, "*");
+			}
+
+			function crashed(error) {
+				report("Program crashed: " + error + "\n" + (error && error.stack ? error.stack + "\n" : ""));
+				window.parent.postMessage({type: "game-crashed"}, "*");
+			}
+
+			async function run(file) {
+				const wasmMemoryInterface = new odin.WasmMemoryInterface();
+				wasmMemoryInterface.setIntSize(4);
+
+				let imports = odin.setupDefaultImports(wasmMemoryInterface, null, wasmMemoryInterface.memory);
+				imports = { ...imports, ...karl2dAudioJsImports };
+				const write = imports.odin_env.write;
+				imports.odin_env.write = (fd, ptr, len) => {
+					report(wasmMemoryInterface.loadString(ptr, len));
+				};
+
+				const wasm = await WebAssembly.instantiate(file, imports);
+				const exports = wasm.instance.exports;
+				wasmMemoryInterface.setExports(exports);
+
+				if (exports.memory) {
+					wasmMemoryInterface.setMemory(exports.memory);
+					setKarl2dAudioWasmMemory(exports.memory);
+				}
+
+				if (exports._start) {
+					exports._start();
+				}
+
+				if (exports.step) {
+					const odin_ctx = exports.default_context_ptr();
+
+					let prevTimeStamp = undefined;
+					function step(currTimeStamp) {
+						if (prevTimeStamp == undefined) {
+							prevTimeStamp = currTimeStamp;
+						}
+
+						const dt = (currTimeStamp - prevTimeStamp)*0.001;
+						prevTimeStamp = currTimeStamp;
+
+						let keepGoing = false;
+						try {
+							keepGoing = exports.step(dt, odin_ctx);
+						} catch (e) {
+							crashed(e);
+							return;
+						}
+						if (!keepGoing) {
+							if (exports.shutdown) {
+								exports.shutdown(dt, odin_ctx);
+							}
+							if (exports._end) {
+								exports._end();
+							}
+							report("Program finished.\n");
+							return;
+						}
+
+						window.requestAnimationFrame(step);
+					}
+
+					window.requestAnimationFrame(step);
+				}
+				window.parent.postMessage({type: "game-started"}, "*");
+			}
+
+			window.addEventListener("message", (e) => {
+				if (e.data && e.data.type === "run") {
+					run(e.data.wasm).catch(crashed);
+				}
+			});
+			window.parent.postMessage({type: "game-ready"}, "*");
+		</script>
+	</body>
+</html>
