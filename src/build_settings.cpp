@@ -2099,6 +2099,10 @@ gb_internal void init_build_context(TargetMetrics *cross_target, Subtarget subta
 		// default to `-o:none` to improve the debug symbol generation by default
 		if (bc->ODIN_DEBUG) {
 			bc->optimization_level = -1; // -o:none
+		} else if (bc->backend == Backend_Wasm) {
+			// The wasm backend always runs its own (cheap) optimiser, so let
+			// the runtime pick its `ODIN_OPTIMIZATION_MODE >= .Speed` code paths
+			bc->optimization_level = 2; // -o:speed
 		} else {
 			bc->optimization_level = 0; // -o:minimal
 		}

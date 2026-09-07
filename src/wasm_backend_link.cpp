@@ -958,6 +958,30 @@ gb_internal wbObjFunction *wb_link_function_at(wbObject *obj, u32 offset) {
 // functions they hold the addresses of count as reached. Host imports that the
 // objects declare (fputc, ...) are only kept while a reached function calls
 // them, which is why a program that never prints does not need them.
+// Flags the generated procedures an object's undefined symbols may resolve to
+// (wb_link_resolve_imports), for the inliner: such a procedure is reachable
+// from outside the generated code
+gb_internal void wb_link_mark_object_refs(wbModule *m) {
+	if (m->objects.count == 0) {
+		return;
+	}
+	StringMap<wbProcedure *> defs = {};
+	string_map_init(&defs, 256);
+	wb_link_collect_definitions(m, &defs);
+	for (wbObject *obj : m->objects) {
+		for (wbObjSymbol const &sym : obj->symbols) {
+			if (sym.kind != wbSym_Function || (sym.flags & wbSymFlag_Undefined) == 0) {
+				continue;
+			}
+			wbProcedure **found = string_map_get(&defs, sym.name);
+			if (found != nullptr) {
+				(*found)->object_ref = true;
+			}
+		}
+	}
+	string_map_destroy(&defs);
+}
+
 gb_internal void wb_link_gc(wbModule *m) {
 	if (m->objects.count == 0) {
 		return;

@@ -221,7 +221,7 @@ gb_internal wbValue wb_soa_swizzle_load(wbProcedure *p, wbAddr addr) {
 	wbAddr tmp = wb_add_temp(p, addr.type);
 	for (u8 i = 0; i < addr.swizzle_count; i++) {
 		wbAddr src = wb_soa_field_elem_addr(p, soa, wb_value_const_int(t_int, addr.swizzle_indices[i]), addr.soa_index);
-		wb_emit_copy(p, tmp.index, tmp.offset + cast(i32)(i*elem_size), src.index, src.offset, elem_size);
+		wb_emit_copy(p, tmp.index, tmp.offset + cast(i32)(i*elem_size), src.index, src.offset, elem);
 	}
 	return wb_value_memory(tmp.index, tmp.offset, addr.type);
 }
@@ -233,7 +233,7 @@ gb_internal void wb_soa_swizzle_store(wbProcedure *p, wbAddr addr, wbValue v) {
 	v = wb_value_copy(p, v);
 	for (u8 i = 0; i < addr.swizzle_count; i++) {
 		wbAddr dst = wb_soa_field_elem_addr(p, soa, wb_value_const_int(t_int, addr.swizzle_indices[i]), addr.soa_index);
-		wb_emit_copy(p, dst.index, dst.offset, v.index, v.offset + cast(i32)(i*elem_size), elem_size);
+		wb_emit_copy(p, dst.index, dst.offset, v.index, v.offset + cast(i32)(i*elem_size), elem);
 	}
 }
 
@@ -371,6 +371,99 @@ gb_internal wbValue wb_build_soa_unzip(wbProcedure *p, Ast *expr) {
 		fill(result, 0);
 	}
 	return wb_value_memory(result.index, result.offset, result_type);
+}
+
+// `intrinsics.soa_copy_from_slice(array, offset, args)`: stores the elements of the
+// slice `args` into the #soa dynamic array starting at element `offset` (one loop per
+// component, as the LLVM backend does)
+gb_internal void wb_build_soa_copy_from_slice(wbProcedure *p, Ast *expr) {
+	ast_node(ce, CallExpr, expr);
+	wbValue ptr    = wb_build_expr(p, ce->args[0]);
+	wbValue offset = wb_emit_conv(p, wb_build_expr(p, ce->args[1]), t_int);
+	wbValue args   = wb_value_copy(p, wb_build_expr(p, ce->args[2]));
+	if (ptr.kind == wbValue_Invalid || offset.kind == wbValue_Invalid || args.kind != wbValue_Memory) {
+		return;
+	}
+	Type *array_type = base_type(type_deref(ptr.type));
+	GB_ASSERT(is_type_soa_dynamic_array(array_type));
+	Type *elem = array_type->Struct.soa_elem;
+	i64 elem_size = type_size_of(elem);
+	isize field_count = wb_soa_field_count(array_type);
+	if (field_count == 0) {
+		return;
+	}
+
+	ptr = wb_value_to_local(p, ptr);
+	offset = wb_value_to_local(p, offset);
+	wbAddr soa = wb_addr_memory(ptr.index, 0, array_type);
+	wbValue arg_ptr = wb_value_to_local(p, wb_emit_slice_data(p, args));
+	wbValue arg_len = wb_emit_slice_len(p, args);
+
+	// max_len = min(arg_len, len(array) - offset)
+	wbValue soa_len = wb_soa_len(p, soa);
+	wb_push(p, soa_len);
+	wb_push(p, offset);
+	wb_op(p, wbOp_i32_sub);
+	wbValue max_soa_len = wb_pop_to_local(p, wbValType_i32, t_int);
+	wb_push(p, arg_len);
+	wb_push(p, max_soa_len);
+	wb_push(p, arg_len);
+	wb_push(p, max_soa_len);
+	wb_op(p, wbOp_i32_lt_s);
+	wb_op(p, wbOp_select);
+	wbValue max_len = wb_pop_to_local(p, wbValType_i32, t_int);
+
+	for (isize i = 0; i < field_count; i++) {
+		Type *ft = nullptr;
+		i64 src_offset = wb_soa_elem_field_offset(elem, i, &ft);
+		i64 field_size = type_size_of(ft);
+		if (field_size == 0) {
+			continue;
+		}
+		Type *mpt = nullptr;
+		i64 dst_field_offset = type_offset_of(array_type, i, &mpt);
+		// dst = array.field + offset*size
+		wb_push(p, wb_emit_load(p, soa.index, soa.offset + cast(i32)dst_field_offset, mpt));
+		wb_push(p, offset);
+		wb_i32_const(p, cast(i32)field_size);
+		wb_op(p, wbOp_i32_mul);
+		wb_op(p, wbOp_i32_add);
+		wbValue dst = wb_pop_to_local(p, wbValType_i32, t_rawptr);
+		// src = &args[0].field
+		wbValue src = wb_emit_ptr_add(p, arg_ptr, src_offset);
+		if (src.index == arg_ptr.index) {
+			wb_push(p, src);
+			src = wb_pop_to_local(p, wbValType_i32, t_rawptr);
+		}
+
+		u32 j = wb_add_local(p, wbValType_i32);
+		wb_i32_const(p, 0);
+		wb_local_set(p, j);
+		u32 break_depth = wb_open_block(p);
+		u32 loop_depth  = wb_open_loop(p);
+		wb_local_get(p, j);
+		wb_push(p, max_len);
+		wb_op(p, wbOp_i32_ge_s);
+		wb_br_if(p, break_depth);
+
+		wb_emit_copy(p, dst.index, 0, src.index, 0, ft);
+
+		wb_push(p, dst);
+		wb_i32_const(p, cast(i32)field_size);
+		wb_op(p, wbOp_i32_add);
+		wb_local_set(p, dst.index);
+		wb_push(p, src);
+		wb_i32_const(p, cast(i32)elem_size);
+		wb_op(p, wbOp_i32_add);
+		wb_local_set(p, src.index);
+		wb_local_get(p, j);
+		wb_i32_const(p, 1);
+		wb_op(p, wbOp_i32_add);
+		wb_local_set(p, j);
+		wb_br(p, loop_depth);
+		wb_close(p);
+		wb_close(p);
+	}
 }
 
 // `for v, i in soa`: `v` denotes the element in place (`&v` is an #soa pointer)

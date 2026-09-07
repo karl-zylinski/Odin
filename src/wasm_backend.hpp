@@ -372,6 +372,8 @@ enum wbProcGen : u8 {
 	wbProcGen_CleanupRuntime, // `__$cleanup_runtime`: @(fini) procedures
 	wbProcGen_Hasher,         // `__$hasher$$T`: map key hasher for `gen_type` (see wb_hasher_proc_for_type)
 	wbProcGen_Equal,          // `__$equal$$T`: map key equality for `gen_type`
+	wbProcGen_MapGet,         // `__$map_get$$T`: specialised lookup for the map type `gen_type`
+	wbProcGen_MapSet,         // `__$map_set$$T`: specialised insertion for the map type `gen_type`
 	wbProcGen_TestMain,       // `_start` for `odin test`: runs the runtime startup, then testing.runner
 };
 
@@ -383,6 +385,58 @@ struct wbProcedure;
 struct wbCallReloc {
 	isize         offset; // offset of the 5-byte padded ULEB in `code`
 	wbProcedure * target;
+};
+
+// Every instruction of a procedure body is recorded with its operand stack
+// effect so that wb_optimize_procedure can rewrite the code (wasm_backend_opt.cpp)
+enum wbInstrKind : u8 {
+	wbInstr_Other,        // fixed stack effect, bytes copied verbatim
+	wbInstr_Local,        // local.get/set/tee, imm = local index (re-encoded)
+	wbInstr_GlobalGet,
+	wbInstr_GlobalSet,
+	wbInstr_Load,         // imm = memarg offset, width = bytes accessed
+	wbInstr_Store,
+	wbInstr_Const,        // imm = value bits of i32.const (others: unused)
+	wbInstr_Call,         // imm = index into call_relocs
+	wbInstr_CallIndirect,
+	wbInstr_MemCopy,
+	wbInstr_MemFill,
+	wbInstr_MemGrow,
+	wbInstr_Block,
+	wbInstr_Loop,
+	wbInstr_If,
+	wbInstr_Else,
+	wbInstr_End,
+	wbInstr_Br,
+	wbInstr_BrIf,
+	wbInstr_Return,
+	wbInstr_Unreachable,
+	wbInstr_EpilogueGet,  // local.get old_sp with a fixed 5 byte index (re-encoded)
+	wbInstr_EpilogueSet,  // global.set sp of the epilogue
+};
+
+enum wbInstrFlag : u8 {
+	wbInstrFlag_Scratch   = 1<<0, // bytes live in the optimizer's scratch buffer instead of `code`
+	wbInstrFlag_SpecConst = 1<<1, // a constant substituted for a parameter by wb_specialize_procedures
+	wbInstrFlag_Peeled    = 1<<2, // a loop whose first iteration has been peeled off
+};
+
+struct wbInstr {
+	u32 offset;  // byte offset of the instruction
+	u8  length;
+	u8  op;      // first opcode byte
+	u8  kind;    // wbInstrKind
+	u8  flags;
+	i8  pops;
+	i8  pushes;
+	u8  width;   // loads/stores: bytes accessed
+	u32 imm;
+};
+
+// A frame allocation (wb_alloc_slot), candidate for promotion to locals
+struct wbFrameSlot {
+	u32 offset;
+	u32 size;
 };
 
 struct wbProcedure {
@@ -403,6 +457,14 @@ struct wbProcedure {
 	wbProcedure *alias;      // foreign procedure resolved to a defined function by the linker
 	bool       link_created; // `env` import made by the linker for a symbol no object defines
 	bool       link_live;    // reachable from the program (wasm_backend_link.cpp, object functions and imports)
+	u32        inline_order; // index in wbModule::procedures (wb_inline_procedures)
+	bool       never_inline; // an error path the backend itself calls behind a check (bounds_check_error, ...)
+	bool       merge_copies; // inlining is done: leaf-wise copies that stay in memory may be widened
+	u32        call_sites;   // direct calls from generated code, counted before inlining
+	u64        spec_mask;    // parameters only called through, or passed on as such (wb_spec_callback_mask)
+	u8         spec_state;   // 0 unknown, 1 being computed, 2 known
+	bool       is_spec;      // a copy made by wb_specialize_procedures
+	bool       object_ref;   // named by an undefined symbol of a linked object
 	Array<wbProcedure *> link_refs; // object functions: the functions its relocations name
 	wbProcGen  gen;
 	Type *     gen_type;    // the type a hasher/equal procedure is generated for
@@ -417,6 +479,8 @@ struct wbProcedure {
 	u32        fp_local;       // frame pointer (lowest address of the frame)
 	u32        old_sp_local;   // stack pointer on entry
 	u32        frame_size;     // bytes of stack frame, known after lowering
+	bool       uses_alloca;    // the stack pointer moves during the body: the epilogue must restore it
+	Array<wbFrameSlot> slots;  // frame allocations
 	Array<wbLocal> locals;     // all locals, params first
 	Array<wbValType> results;
 
@@ -424,6 +488,9 @@ struct wbProcedure {
 	PtrMap<Ast *, wbValue> selector_values; // `x->f(..)` is `x.f(x, ..)`: x evaluated once (StateFlag_SelectorCallExpr)
 	PtrMap<Ast *, wbAddr>  selector_addrs;
 	PtrSet<Entity *> addressed;         // variables whose address is taken
+	PtrSet<Entity *> aliased;           // variables something else may point into (superset of addressed)
+	PtrSet<Ast *> unchecked;            // index expressions in range by their loop's bounds (wb_bce_analyze)
+	i32 bce_checked_depth;              // loops being emitted in their checked version (wb_build_range_interval)
 	Array<wbAddr> result_addrs;         // named results (empty otherwise)
 
 	Array<wbDefer> defers;
@@ -435,6 +502,7 @@ struct wbProcedure {
 	u32        depth;     // number of currently open wasm labels
 	Array<wbLabel> labels;
 	Array<wbCallReloc> call_relocs;
+	Array<wbInstr> instrs; // the instructions of `code`, in order
 };
 
 // A global variable whose initializer runs in the start function

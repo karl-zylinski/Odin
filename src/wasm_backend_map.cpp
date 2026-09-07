@@ -10,6 +10,7 @@ gb_internal void    wb_bind_range_ref(wbProcedure *p, Ast *val, wbAddr elem);
 gb_internal bool    wb_range_val_is_ref(Ast *val);
 gb_internal wbValue wb_tuple_field(wbProcedure *p, wbValue tuple, isize index);
 gb_internal void    wb_build_stmt(wbProcedure *p, Ast *node);
+gb_internal wbValue wb_map_key_hash(wbProcedure *p, wbAddr addr, wbValue key_ptr);
 
 gb_internal String wb_gen_name_from_type(char const *prefix, Type *type) {
 	gbString str = gb_string_make(permanent_allocator(), prefix);
@@ -411,6 +412,284 @@ gb_internal wbValue wb_map_info_value(wbModule *m, Type *map_type) {
 	return wb_value_const_int(t_map_info_ptr, wb_map_info_addr(m, map_type));
 }
 
+// Specialised map lookup/insertion procedures (lb_map_get_proc_for_type,
+// lb_map_set_proc_for_type): the runtime's generic `__dynamic_map_get/set`
+// index cells through Map_Info and compare keys through a procedure pointer;
+// these know the key and value types, so the probe loop is straight-line code
+// and the key comparison is inlined.
+
+gb_global Type *t_wb_map_set_proc = nullptr;
+
+// `proc "contextless" (m: rawptr, hash: uintptr, key: rawptr) -> rawptr`
+gb_internal wbProcedure *wb_map_get_proc_for_type(wbModule *m, Type *type) {
+	type = base_type(type);
+	GB_ASSERT(type->kind == Type_Map);
+	GB_ASSERT(t_map_get_proc != nullptr);
+	return wb_gen_proc_for_type(m, "__$map_get", type, t_map_get_proc, wbProcGen_MapGet);
+}
+
+// `proc (m: rawptr, hash: uintptr, key: rawptr, value: rawptr, loc: ^Source_Code_Location) -> rawptr`
+gb_internal wbProcedure *wb_map_set_proc_for_type(wbModule *m, Type *type) {
+	type = base_type(type);
+	GB_ASSERT(type->kind == Type_Map);
+	if (t_wb_map_set_proc == nullptr) {
+		Type *args[5] = {t_rawptr, t_uintptr, t_rawptr, t_rawptr, t_source_code_location_ptr};
+		t_wb_map_set_proc = alloc_type_proc_from_types(args, gb_count_of(args), t_rawptr, false, ProcCC_Odin);
+	}
+	return wb_gen_proc_for_type(m, "__$map_set", type, t_wb_map_set_proc, wbProcGen_MapSet);
+}
+
+// Pointer to element `index` of the cells starting at `cells` (lb_map_cell_index_static)
+gb_internal wbValue wb_map_cell_index_static(wbProcedure *p, Type *type, wbValue cells, wbValue index) {
+	i64 size = 0, len = 0;
+	i64 elem_size = type_size_of(type);
+	map_cell_size_and_len(type, &size, &len);
+
+	wb_push(p, cells);
+	if (size == len*elem_size) {
+		// no padding: plain array indexing
+		wb_push(p, index);
+		if (elem_size != 1) {
+			wb_i32_const(p, cast(i32)elem_size);
+			wb_op(p, wbOp_i32_mul);
+		}
+		wb_op(p, wbOp_i32_add);
+	} else {
+		// cells + size*(index/len) + elem_size*(index%len)
+		bool pow2 = is_power_of_two(len);
+		wb_push(p, index);
+		if (pow2) {
+			if (len > 1) { wb_i32_const(p, cast(i32)floor_log2(cast(u64)len)); wb_op(p, wbOp_i32_shr_u); }
+		} else {
+			wb_i32_const(p, cast(i32)len); wb_op(p, wbOp_i32_div_u);
+		}
+		wb_i32_const(p, cast(i32)size);
+		wb_op(p, wbOp_i32_mul);
+		wb_op(p, wbOp_i32_add);
+		wb_push(p, index);
+		if (pow2) { wb_i32_const(p, cast(i32)(len-1)); wb_op(p, wbOp_i32_and); }
+		else      { wb_i32_const(p, cast(i32)len);     wb_op(p, wbOp_i32_rem_u); }
+		if (elem_size != 1) {
+			wb_i32_const(p, cast(i32)elem_size);
+			wb_op(p, wbOp_i32_mul);
+		}
+		wb_op(p, wbOp_i32_add);
+	}
+	return wb_pop_to_local(p, wbValType_i32, t_rawptr);
+}
+
+// `ks, vs, hs := map_kvh_data_dynamic(m, info)` with the cell layout known statically
+gb_internal void wb_map_kvh_data_static(wbProcedure *p, Type *map_type, wbValue data, wbValue cap, wbValue *ks_, wbValue *vs_, wbValue *hs_) {
+	Type *bt = base_type(map_type);
+	wb_push(p, data);
+	wb_i32_const(p, ~cast(i32)(MAP_CACHE_LINE_SIZE-1));
+	wb_op(p, wbOp_i32_and);
+	wbValue ks = wb_pop_to_local(p, wbValType_i32, t_rawptr);
+	wbValue vs = wb_map_cell_index_static(p, bt->Map.key, ks, cap);
+	wbValue hs = wb_map_cell_index_static(p, bt->Map.value, vs, cap);
+	if (ks_) *ks_ = ks;
+	if (vs_) *vs_ = vs;
+	if (hs_) *hs_ = hs;
+}
+
+gb_internal void wb_emit_return_rawptr(wbProcedure *p, wbValue v) {
+	auto values = array_make<wbValue>(temporary_allocator(), 1);
+	values[0] = v;
+	wb_emit_return_values(p, values, false);
+}
+
+gb_internal void wb_build_map_get_body(wbProcedure *p) {
+	Type *type = base_type(p->gen_type);
+	Type *key_type   = type->Map.key;
+	Type *value_type = type->Map.value;
+	GB_ASSERT(wb_valtype_of(t_uintptr) == wbValType_i32);
+
+	u32 map_local = 0;
+	wbValue h       = wb_value_local(1, wbValType_i32, t_uintptr);
+	wbValue key_ptr = wb_value_local(2, wbValType_i32, t_rawptr);
+	wbValue nil_ptr = wb_value_const_int(t_rawptr, 0);
+
+	// if m.len == 0 { return nil }
+	Type *ft = nullptr;
+	i64 len_offset = type_offset_of(t_raw_map, 1, &ft);
+	wb_push(p, wb_emit_load(p, map_local, cast(i32)len_offset, ft));
+	wb_op(p, wbOp_i32_eqz);
+	wb_open_if(p);
+	wb_emit_return_rawptr(p, nil_ptr);
+	wb_close(p);
+
+	// a non-empty map has data, so cap = 1 << log2_cap
+	wbValue data = wb_emit_load(p, map_local, 0, t_uintptr);
+	wb_i32_const(p, 1);
+	wb_push(p, data);
+	wb_i32_const(p, MAP_CACHE_LINE_SIZE-1);
+	wb_op(p, wbOp_i32_and);
+	wb_op(p, wbOp_i32_shl);
+	wbValue cap = wb_pop_to_local(p, wbValType_i32, t_uintptr);
+	wb_push(p, cap);
+	wb_i32_const(p, 1);
+	wb_op(p, wbOp_i32_sub);
+	wbValue mask = wb_pop_to_local(p, wbValType_i32, t_uintptr);
+
+	// pos = map_desired_position(m, h) = h & mask
+	wb_push(p, h);
+	wb_push(p, mask);
+	wb_op(p, wbOp_i32_and);
+	wbValue desired = wb_pop_to_local(p, wbValType_i32, t_uintptr);
+	wb_push(p, desired);
+	wbValue pos = wb_pop_to_local(p, wbValType_i32, t_uintptr);
+	wb_i32_const(p, 0);
+	wbValue distance = wb_pop_to_local(p, wbValType_i32, t_uintptr);
+
+	wbValue ks, vs, hs;
+	wb_map_kvh_data_static(p, type, data, cap, &ks, &vs, &hs);
+
+	u32 nil_depth = wb_open_block(p);
+	u32 loop_depth = wb_open_loop(p);
+	{
+		// element_hash := hs[pos]
+		wb_push(p, hs);
+		wb_push(p, pos);
+		wb_i32_const(p, cast(i32)type_size_of(t_uintptr));
+		wb_op(p, wbOp_i32_mul);
+		wb_op(p, wbOp_i32_add);
+		wbValue hash_ptr = wb_pop_to_local(p, wbValType_i32, t_rawptr);
+		wbValue element_hash = wb_emit_load(p, hash_ptr.index, 0, t_uintptr);
+
+		// if map_hash_is_empty(element_hash) { return nil }
+		wb_push(p, element_hash);
+		wb_op(p, wbOp_i32_eqz);
+		wb_br_if(p, nil_depth);
+
+		// if distance > map_probe_distance(m, element_hash, pos) { return nil }
+		// probe distance = (pos + cap - (element_hash & mask)) & mask
+		wb_push(p, distance);
+		wb_push(p, pos);
+		wb_push(p, cap);
+		wb_op(p, wbOp_i32_add);
+		wb_push(p, element_hash);
+		wb_push(p, mask);
+		wb_op(p, wbOp_i32_and);
+		wb_op(p, wbOp_i32_sub);
+		wb_push(p, mask);
+		wb_op(p, wbOp_i32_and);
+		wb_op(p, wbOp_i32_gt_u);
+		wb_br_if(p, nil_depth);
+
+		// if element_hash == h && key == ks[pos] { return &vs[pos] }
+		wb_push(p, element_hash);
+		wb_push(p, h);
+		wb_op(p, wbOp_i32_eq);
+		wb_open_if(p);
+		{
+			wbValue element_key = wb_map_cell_index_static(p, key_type, ks, pos);
+			wbValue equal = wb_emit_equal_at(p, key_type, key_ptr, element_key);
+			if (equal.kind != wbValue_Invalid) {
+				wb_push(p, equal);
+				wb_open_if(p);
+				wb_emit_return_rawptr(p, wb_map_cell_index_static(p, value_type, vs, pos));
+				wb_close(p);
+			}
+		}
+		wb_close(p);
+
+		// pos = (pos + 1) & mask; distance += 1
+		wb_push(p, pos);
+		wb_i32_const(p, 1);
+		wb_op(p, wbOp_i32_add);
+		wb_push(p, mask);
+		wb_op(p, wbOp_i32_and);
+		wb_local_set(p, pos.index);
+		wb_push(p, distance);
+		wb_i32_const(p, 1);
+		wb_op(p, wbOp_i32_add);
+		wb_local_set(p, distance.index);
+		wb_br(p, loop_depth);
+	}
+	wb_close(p); // loop
+	wb_close(p); // nil
+	wb_emit_return_rawptr(p, nil_ptr);
+}
+
+gb_internal void wb_build_map_set_body(wbProcedure *p) {
+	Type *type = base_type(p->gen_type);
+	Type *value_type = type->Map.value;
+	wbModule *m = p->module;
+
+	wbValue map_ptr   = wb_value_local(0, wbValType_i32, t_raw_map_ptr);
+	wbValue hash      = wb_value_local(1, wbValType_i32, t_uintptr);
+	wbValue key_ptr   = wb_value_local(2, wbValType_i32, t_rawptr);
+	wbValue value_ptr = wb_value_local(3, wbValType_i32, t_rawptr);
+	u32 loc_local = 4;
+	wbValue nil_ptr = wb_value_const_int(t_rawptr, 0);
+	wbValue info = wb_map_info_value(m, type);
+
+	// found := __$map_get(m, hash, key); if found != nil { found^ = value^; return found }
+	wbValue found;
+	{
+		auto args = array_make<wbValue>(temporary_allocator(), 3);
+		args[0] = map_ptr;
+		args[1] = hash;
+		args[2] = key_ptr;
+		found = wb_emit_call(p, t_map_get_proc, wb_map_get_proc_for_type(m, type), wb_value_invalid(), args);
+	}
+	wb_push(p, found);
+	wb_open_if(p);
+	wb_emit_copy(p, found.index, 0, value_ptr.index, 0, value_type);
+	wb_emit_return_rawptr(p, found);
+	wb_close(p);
+
+	// err, has_grown := __dynamic_map_check_grow(m, info, loc)
+	{
+		auto args = array_make<wbValue>(temporary_allocator(), 3);
+		args[0] = map_ptr;
+		args[1] = info;
+		args[2] = wb_value_memory(loc_local, 0, t_source_code_location);
+		wbProcedure *callee = wb_lookup_runtime_procedure(m, "__dynamic_map_check_grow");
+		wbValue res = wb_emit_call(p, callee->type, callee, wb_value_invalid(), args);
+		wbValue err       = wb_tuple_field(p, res, 0);
+		wbValue has_grown = wb_tuple_field(p, res, 1);
+
+		wb_push(p, err);
+		wb_open_if(p);
+		wb_emit_return_rawptr(p, nil_ptr);
+		wb_close(p);
+
+		// the seed depends on the allocation, so rehash the key after growing
+		wb_push(p, has_grown);
+		wb_open_if(p);
+		{
+			wbAddr addr = {};
+			addr.kind     = wbAddr_Map;
+			addr.index    = map_ptr.index;
+			addr.map_type = type;
+			wb_push(p, wb_map_key_hash(p, addr, key_ptr));
+			wb_local_set(p, hash.index);
+		}
+		wb_close(p);
+	}
+
+	// result := map_insert_hash_dynamic(m, info, hash, key, value); m.len += 1
+	wbValue result;
+	{
+		auto args = array_make<wbValue>(temporary_allocator(), 5);
+		args[0] = map_ptr;
+		args[1] = info;
+		args[2] = hash;
+		args[3] = wb_emit_conv(p, key_ptr, t_uintptr);
+		args[4] = wb_emit_conv(p, value_ptr, t_uintptr);
+		result = wb_emit_runtime_call(p, "map_insert_hash_dynamic", args);
+	}
+	Type *ft = nullptr;
+	i64 len_offset = type_offset_of(t_raw_map, 1, &ft);
+	wb_push(p, wb_emit_load(p, map_ptr.index, cast(i32)len_offset, ft));
+	wb_i32_const(p, 1);
+	wb_op(p, wbOp_i32_add);
+	wbValue len = wb_pop_to_local(p, wbValType_i32, ft);
+	wb_emit_store(p, map_ptr.index, cast(i32)len_offset, len, ft);
+	wb_emit_return_rawptr(p, wb_emit_conv(p, result, t_rawptr));
+}
+
 // Element access
 
 // The address of `key` in `map` (a Raw_Map in memory); the key is copied to
@@ -466,12 +745,11 @@ gb_internal wbValue wb_map_get_ptr(wbProcedure *p, wbAddr addr, Type *ptr_type) 
 	wbValue key_ptr = wb_addr_get_ptr(p, wb_addr_memory(p->fp_local, addr.offset, bt->Map.key), t_rawptr);
 	wbValue hash = wb_map_key_hash(p, addr, key_ptr);
 
-	auto args = array_make<wbValue>(temporary_allocator(), 4);
+	auto args = array_make<wbValue>(temporary_allocator(), 3);
 	args[0] = map_ptr;
-	args[1] = wb_map_info_value(p->module, bt);
-	args[2] = hash;
-	args[3] = key_ptr;
-	wbValue ptr = wb_emit_runtime_call(p, "__dynamic_map_get", args);
+	args[1] = hash;
+	args[2] = key_ptr;
+	wbValue ptr = wb_emit_call(p, t_map_get_proc, wb_map_get_proc_for_type(p->module, bt), wb_value_invalid(), args);
 	if (ptr.kind != wbValue_Invalid) {
 		ptr.type = ptr_type != nullptr ? ptr_type : alloc_type_pointer(bt->Map.value);
 	}
@@ -518,14 +796,17 @@ gb_internal void wb_map_set(wbProcedure *p, wbAddr addr, wbValue v) {
 	String proc_name = p->entity != nullptr ? p->entity->token.string : p->name;
 	TokenPos pos = p->curr_stmt != nullptr ? ast_token(p->curr_stmt).pos : TokenPos{};
 
-	auto args = array_make<wbValue>(temporary_allocator(), 6);
+	wbValue loc = wb_source_code_location(p, proc_name, pos);
+	GB_ASSERT(loc.kind == wbValue_Memory && loc.index == WB_NO_LOCAL);
+
+	auto args = array_make<wbValue>(temporary_allocator(), 5);
 	args[0] = map_ptr;
-	args[1] = wb_map_info_value(p->module, bt);
-	args[2] = hash;
-	args[3] = key_ptr;
-	args[4] = value_ptr;
-	args[5] = wb_source_code_location(p, proc_name, pos);
-	wb_emit_runtime_call(p, "__dynamic_map_set", args);
+	args[1] = hash;
+	args[2] = key_ptr;
+	args[3] = value_ptr;
+	args[4] = wb_value_const_int(t_source_code_location_ptr, loc.offset);
+	wbProcedure *callee = wb_map_set_proc_for_type(p->module, bt);
+	wb_emit_call(p, callee->type, callee, wb_value_invalid(), args);
 }
 
 // Converts a map element address into the memory it refers to (nil pointer
@@ -585,18 +866,9 @@ gb_internal void wb_build_range_map(wbProcedure *p, AstRangeStmt *rs, Ast *node,
 	wbValue cap = wb_emit_map_cap(p, raw_map);
 
 	// ks, vs, hs, _, _ := map_kvh_data_dynamic(m, info)
-	auto args = array_make<wbValue>(temporary_allocator(), 2);
-	args[0] = raw_map;
-	args[1] = wb_map_info_value(p->module, bt);
-	wbValue kvh = wb_emit_runtime_call(p, "map_kvh_data_dynamic", args);
-	if (kvh.kind == wbValue_Invalid) {
-		return;
-	}
-	wbValue ks = wb_value_to_local(p, wb_tuple_field(p, kvh, 0));
-	wbValue vs = wb_value_to_local(p, wb_tuple_field(p, kvh, 1));
-	wbValue hs = wb_value_to_local(p, wb_tuple_field(p, kvh, 2));
-	wbValue ks_info = wb_value_const_int(t_map_cell_info_ptr, wb_map_cell_info_addr(p->module, key_type));
-	wbValue vs_info = wb_value_const_int(t_map_cell_info_ptr, wb_map_cell_info_addr(p->module, value_type));
+	wbValue data = wb_emit_load(p, map.index, map.offset, t_uintptr);
+	wbValue ks, vs, hs;
+	wb_map_kvh_data_static(p, bt, data, cap, &ks, &vs, &hs);
 
 	wb_i32_const(p, 0);
 	wbValue idx = wb_pop_to_local(p, wbValType_i32, t_uintptr);
@@ -625,10 +897,8 @@ gb_internal void wb_build_range_map(wbProcedure *p, AstRangeStmt *rs, Ast *node,
 		wb_br_if(p, continue_depth);
 
 		wb_open_scope(p);
-		auto cargs = array_make<wbValue>(temporary_allocator(), 3);
 		if (val0 != nullptr && !is_blank_ident(val0)) {
-			cargs[0] = ks; cargs[1] = ks_info; cargs[2] = idx;
-			wbValue key_ptr = wb_emit_runtime_call(p, "map_cell_index_dynamic", cargs);
+			wbValue key_ptr = wb_map_cell_index_static(p, key_type, ks, idx);
 			wbAddr key_addr = wb_addr_from_pointer(p, key_ptr, key_type);
 			if (wb_range_val_is_ref(val0)) {
 				wb_bind_range_ref(p, val0, key_addr);
@@ -637,8 +907,7 @@ gb_internal void wb_build_range_map(wbProcedure *p, AstRangeStmt *rs, Ast *node,
 			}
 		}
 		if (val1 != nullptr && !is_blank_ident(val1)) {
-			cargs[0] = vs; cargs[1] = vs_info; cargs[2] = idx;
-			wbValue val_ptr = wb_emit_runtime_call(p, "map_cell_index_dynamic", cargs);
+			wbValue val_ptr = wb_map_cell_index_static(p, value_type, vs, idx);
 			wbAddr val_addr = wb_addr_from_pointer(p, val_ptr, value_type);
 			if (wb_range_val_is_ref(val1)) {
 				wb_bind_range_ref(p, val1, val_addr);

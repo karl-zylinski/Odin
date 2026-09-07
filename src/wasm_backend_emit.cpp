@@ -27,6 +27,18 @@ gb_internal void wb_uleb(wbBuffer *b, u64 x) {
 	} while (x != 0);
 }
 
+// Padded to 5 bytes so the instruction has a fixed size (patched later)
+gb_internal void wb_uleb_fixed5(wbBuffer *b, u32 x) {
+	for (int i = 0; i < 5; i++) {
+		u8 byte = cast(u8)(x & 0x7f);
+		x >>= 7;
+		if (i != 4) {
+			byte |= 0x80;
+		}
+		wb_byte(b, byte);
+	}
+}
+
 gb_internal void wb_sleb(wbBuffer *b, i64 x) {
 	for (;;) {
 		u8 byte = cast(u8)(x & 0x7f);
@@ -76,53 +88,146 @@ gb_internal void wb_section(wbBuffer *out, wbSectionId id, wbBuffer const *conte
 
 // Instruction helpers
 
+// Instruction emitters. Every instruction is also recorded in `p->instrs` with
+// its operand stack effect, for wb_optimize_procedure (wasm_backend_opt.cpp).
+
+gb_internal wbInstr *wb_instr_begin(wbProcedure *p, u8 kind, u8 op, i8 pops, i8 pushes) {
+	wbInstr in = {};
+	in.offset = cast(u32)p->code.data.count;
+	in.op     = op;
+	in.kind   = kind;
+	in.pops   = pops;
+	in.pushes = pushes;
+	array_add(&p->instrs, in);
+	wb_byte(&p->code, op);
+	return &p->instrs[p->instrs.count-1];
+}
+gb_internal void wb_instr_end(wbProcedure *p, wbInstr *in) {
+	isize length = p->code.data.count - in->offset;
+	GB_ASSERT(length < 256);
+	in->length = cast(u8)length;
+}
+
+// Stack effect of the plain numeric/parametric opcodes
+gb_internal void wb_op_effect(wbOp op, i8 *pops, i8 *pushes) {
+	*pushes = 1;
+	if (op == wbOp_i32_eqz || op == wbOp_i64_eqz ||
+	    (op >= wbOp_i32_clz && op <= wbOp_i32_popcnt) ||
+	    (op >= wbOp_i64_clz && op <= wbOp_i64_popcnt) ||
+	    (op >= wbOp_f32_abs && op <= wbOp_f32_sqrt) ||
+	    (op >= wbOp_f64_abs && op <= wbOp_f64_sqrt) ||
+	    (op >= wbOp_i32_wrap_i64 && op <= wbOp_i64_extend32_s)) {
+		*pops = 1;
+	} else if (op >= wbOp_i32_eq && op <= wbOp_f64_copysign) {
+		*pops = 2;
+	} else if (op == wbOp_select) {
+		*pops = 3;
+	} else if (op == wbOp_drop) {
+		*pops = 1; *pushes = 0;
+	} else if (op == wbOp_nop) {
+		*pops = 0; *pushes = 0;
+	} else {
+		GB_PANIC("wb_op: unexpected opcode %d", op);
+	}
+}
+
 gb_internal void wb_op(wbProcedure *p, wbOp op) {
-	wb_byte(&p->code, cast(u8)op);
+	if (op == wbOp_unreachable) {
+		wbInstr *in = wb_instr_begin(p, wbInstr_Unreachable, op, 0, 0);
+		wb_instr_end(p, in);
+		return;
+	}
+	if (op == wbOp_return) {
+		wbInstr *in = wb_instr_begin(p, wbInstr_Return, op, cast(i8)p->module->types[p->type_index].results.count, 0);
+		wb_instr_end(p, in);
+		return;
+	}
+	i8 pops = 0, pushes = 0;
+	wb_op_effect(op, &pops, &pushes);
+	wbInstr *in = wb_instr_begin(p, wbInstr_Other, op, pops, pushes);
+	wb_instr_end(p, in);
 }
 
 gb_internal void wb_op_idx(wbProcedure *p, wbOp op, u32 idx) {
-	wb_byte(&p->code, cast(u8)op);
+	u8 kind = wbInstr_Other;
+	i8 pops = 0, pushes = 0;
+	switch (op) {
+	case wbOp_memory_grow: kind = wbInstr_MemGrow; pops = 1; pushes = 1; break;
+	case wbOp_memory_size: kind = wbInstr_Other;   pops = 0; pushes = 1; break;
+	default: GB_PANIC("wb_op_idx: unexpected opcode %d", op);
+	}
+	wbInstr *in = wb_instr_begin(p, kind, op, pops, pushes);
+	in->imm = idx;
 	wb_uleb(&p->code, idx);
+	wb_instr_end(p, in);
 }
 
 gb_internal void wb_i32_const(wbProcedure *p, i32 x) {
-	wb_byte(&p->code, wbOp_i32_const);
+	wbInstr *in = wb_instr_begin(p, wbInstr_Const, wbOp_i32_const, 0, 1);
+	in->imm = cast(u32)x;
 	wb_sleb(&p->code, x);
+	wb_instr_end(p, in);
 }
 
 gb_internal void wb_i64_const(wbProcedure *p, i64 x) {
-	wb_byte(&p->code, wbOp_i64_const);
+	wbInstr *in = wb_instr_begin(p, wbInstr_Const, wbOp_i64_const, 0, 1);
 	wb_sleb(&p->code, x);
+	wb_instr_end(p, in);
 }
 
 gb_internal void wb_f32_const(wbProcedure *p, f32 x) {
-	wb_byte(&p->code, wbOp_f32_const);
+	wbInstr *in = wb_instr_begin(p, wbInstr_Const, wbOp_f32_const, 0, 1);
 	wb_f32(&p->code, x);
+	wb_instr_end(p, in);
 }
 
 gb_internal void wb_f64_const(wbProcedure *p, f64 x) {
-	wb_byte(&p->code, wbOp_f64_const);
+	wbInstr *in = wb_instr_begin(p, wbInstr_Const, wbOp_f64_const, 0, 1);
 	wb_f64(&p->code, x);
+	wb_instr_end(p, in);
 }
 
-gb_internal void wb_local_get(wbProcedure *p, u32 idx) { wb_op_idx(p, wbOp_local_get, idx); }
-gb_internal void wb_local_set(wbProcedure *p, u32 idx) { wb_op_idx(p, wbOp_local_set, idx); }
-gb_internal void wb_local_tee(wbProcedure *p, u32 idx) { wb_op_idx(p, wbOp_local_tee, idx); }
-gb_internal void wb_global_get(wbProcedure *p, u32 idx) { wb_op_idx(p, wbOp_global_get, idx); }
-gb_internal void wb_global_set(wbProcedure *p, u32 idx) { wb_op_idx(p, wbOp_global_set, idx); }
+gb_internal void wb_local_op(wbProcedure *p, wbOp op, u32 idx) {
+	i8 pops = op == wbOp_local_get ? 0 : 1;
+	i8 pushes = op == wbOp_local_set ? 0 : 1;
+	wbInstr *in = wb_instr_begin(p, wbInstr_Local, op, pops, pushes);
+	in->imm = idx;
+	wb_uleb(&p->code, idx);
+	wb_instr_end(p, in);
+}
+gb_internal void wb_local_get(wbProcedure *p, u32 idx) { wb_local_op(p, wbOp_local_get, idx); }
+gb_internal void wb_local_set(wbProcedure *p, u32 idx) { wb_local_op(p, wbOp_local_set, idx); }
+gb_internal void wb_local_tee(wbProcedure *p, u32 idx) { wb_local_op(p, wbOp_local_tee, idx); }
+
+gb_internal void wb_global_get(wbProcedure *p, u32 idx) {
+	wbInstr *in = wb_instr_begin(p, wbInstr_GlobalGet, wbOp_global_get, 0, 1);
+	in->imm = idx;
+	wb_uleb(&p->code, idx);
+	wb_instr_end(p, in);
+}
+gb_internal void wb_global_set(wbProcedure *p, u32 idx) {
+	wbInstr *in = wb_instr_begin(p, wbInstr_GlobalSet, wbOp_global_set, 1, 0);
+	in->imm = idx;
+	wb_uleb(&p->code, idx);
+	wb_instr_end(p, in);
+}
+
 // `call` with a placeholder index, patched in `wb_patch_call_relocs`
 gb_internal void wb_call(wbProcedure *p, wbProcedure *target) {
-	wb_byte(&p->code, wbOp_call);
+	wbFuncType const &ft = p->module->types[target->type_index];
+	wbInstr *in = wb_instr_begin(p, wbInstr_Call, wbOp_call, cast(i8)ft.params.count, cast(i8)ft.results.count);
+	in->imm = cast(u32)p->call_relocs.count;
 	wbCallReloc r = {p->code.data.count, target};
 	array_add(&p->call_relocs, r);
-	for (int i = 0; i < 5; i++) {
-		wb_byte(&p->code, 0x80);
-	}
-	p->code.data[p->code.data.count-1] = 0x00;
+	wb_uleb_fixed5(&p->code, 0);
+	wb_instr_end(p, in);
 }
 
 gb_internal void wb_patch_call_relocs(wbProcedure *p) {
 	for (wbCallReloc const &r : p->call_relocs) {
+		if (r.offset < 0) {
+			continue; // the call was removed by the optimizer
+		}
 		u32 x = r.target->func_index;
 		for (int i = 0; i < 5; i++) {
 			u8 byte = cast(u8)(x & 0x7f);
@@ -137,78 +242,136 @@ gb_internal void wb_patch_call_relocs(wbProcedure *p) {
 
 // Memory instructions. The alignment immediate is only a hint in wasm, so
 // possibly unaligned accesses (packed structs) are still correct.
+gb_internal u8 wb_memarg_width(wbOp op) {
+	switch (op) {
+	case wbOp_i32_load8_s: case wbOp_i32_load8_u: case wbOp_i64_load8_s: case wbOp_i64_load8_u:
+	case wbOp_i32_store8: case wbOp_i64_store8:
+		return 1;
+	case wbOp_i32_load16_s: case wbOp_i32_load16_u: case wbOp_i64_load16_s: case wbOp_i64_load16_u:
+	case wbOp_i32_store16: case wbOp_i64_store16:
+		return 2;
+	case wbOp_i32_load: case wbOp_f32_load: case wbOp_i64_load32_s: case wbOp_i64_load32_u:
+	case wbOp_i32_store: case wbOp_f32_store: case wbOp_i64_store32:
+		return 4;
+	case wbOp_i64_load: case wbOp_f64_load: case wbOp_i64_store: case wbOp_f64_store:
+		return 8;
+	default:
+		GB_PANIC("unknown memory op %x", op);
+		return 0;
+	}
+}
+
+// `size` is the (possibly smaller than the access) alignment of the address
 gb_internal void wb_memarg(wbProcedure *p, wbOp op, u32 offset, u32 size) {
 	u32 align = 0;
 	while ((1u << align) < size && align < 3) {
 		align++;
 	}
-	wb_byte(&p->code, cast(u8)op);
+	bool is_store = op >= wbOp_i32_store;
+	wbInstr *in = wb_instr_begin(p, is_store ? wbInstr_Store : wbInstr_Load, op, is_store ? 2 : 1, is_store ? 0 : 1);
+	in->imm = offset;
+	in->width = wb_memarg_width(op);
 	wb_uleb(&p->code, align);
 	wb_uleb(&p->code, offset);
+	wb_instr_end(p, in);
 }
 
 // dst, src, size on the stack (memmove semantics)
 gb_internal void wb_memory_copy(wbProcedure *p) {
-	wb_byte(&p->code, 0xfc);
+	wbInstr *in = wb_instr_begin(p, wbInstr_MemCopy, 0xfc, 3, 0);
 	wb_uleb(&p->code, 10);
 	wb_byte(&p->code, 0x00);
 	wb_byte(&p->code, 0x00);
+	wb_instr_end(p, in);
 }
 
 // dst, byte value, size on the stack
 gb_internal void wb_memory_fill(wbProcedure *p) {
-	wb_byte(&p->code, 0xfc);
+	wbInstr *in = wb_instr_begin(p, wbInstr_MemFill, 0xfc, 3, 0);
 	wb_uleb(&p->code, 11);
 	wb_byte(&p->code, 0x00);
+	wb_instr_end(p, in);
 }
 
 // Saturating float to integer truncation (the plain `trunc` opcodes trap on
 // out of range values; Odin leaves the result of such conversions undefined)
 gb_internal void wb_trunc_sat(wbProcedure *p, bool to_i64, bool from_f64, bool is_signed) {
-	wb_byte(&p->code, 0xfc);
+	wbInstr *in = wb_instr_begin(p, wbInstr_Other, 0xfc, 1, 1);
 	wb_uleb(&p->code, (to_i64 ? 4 : 0) + (from_f64 ? 2 : 0) + (is_signed ? 0 : 1));
+	wb_instr_end(p, in);
 }
 
 gb_internal void wb_call_indirect(wbProcedure *p, u32 type_index) {
-	wb_byte(&p->code, wbOp_call_indirect);
+	wbFuncType const &ft = p->module->types[type_index];
+	wbInstr *in = wb_instr_begin(p, wbInstr_CallIndirect, wbOp_call_indirect, cast(i8)(ft.params.count + 1), cast(i8)ft.results.count);
+	in->imm = type_index;
 	wb_uleb(&p->code, type_index);
 	wb_byte(&p->code, 0x00); // table 0
+	wb_instr_end(p, in);
 }
 
 // Structured control flow. `wb_open_*` returns the absolute depth of the new label.
 gb_internal u32 wb_open_block(wbProcedure *p, u8 block_type = 0x40) {
-	wb_byte(&p->code, wbOp_block);
+	wbInstr *in = wb_instr_begin(p, wbInstr_Block, wbOp_block, 0, 0);
+	in->imm = block_type;
 	wb_byte(&p->code, block_type);
+	wb_instr_end(p, in);
 	return p->depth++;
 }
 gb_internal u32 wb_open_loop(wbProcedure *p, u8 block_type = 0x40) {
-	wb_byte(&p->code, wbOp_loop);
+	wbInstr *in = wb_instr_begin(p, wbInstr_Loop, wbOp_loop, 0, 0);
+	in->imm = block_type;
 	wb_byte(&p->code, block_type);
+	wb_instr_end(p, in);
 	return p->depth++;
 }
 gb_internal u32 wb_open_if(wbProcedure *p, u8 block_type = 0x40) {
-	wb_byte(&p->code, wbOp_if);
+	wbInstr *in = wb_instr_begin(p, wbInstr_If, wbOp_if, 1, 0);
+	in->imm = block_type;
 	wb_byte(&p->code, block_type);
+	wb_instr_end(p, in);
 	return p->depth++;
 }
 gb_internal void wb_else(wbProcedure *p) {
-	wb_byte(&p->code, wbOp_else);
+	wbInstr *in = wb_instr_begin(p, wbInstr_Else, wbOp_else, 0, 0);
+	wb_instr_end(p, in);
 }
 gb_internal void wb_close(wbProcedure *p) {
 	GB_ASSERT(p->depth > 0);
 	p->depth--;
-	wb_byte(&p->code, wbOp_end);
+	wbInstr *in = wb_instr_begin(p, wbInstr_End, wbOp_end, 0, 0);
+	wb_instr_end(p, in);
 }
 
 // Branch to the label with the given absolute depth
 gb_internal void wb_br(wbProcedure *p, u32 target_depth) {
 	GB_ASSERT(target_depth < p->depth);
-	wb_op_idx(p, wbOp_br, p->depth - 1 - target_depth);
+	wbInstr *in = wb_instr_begin(p, wbInstr_Br, wbOp_br, 0, 0);
+	in->imm = p->depth - 1 - target_depth;
+	wb_uleb(&p->code, in->imm);
+	wb_instr_end(p, in);
 }
 gb_internal void wb_br_if(wbProcedure *p, u32 target_depth) {
 	GB_ASSERT(target_depth < p->depth);
-	wb_op_idx(p, wbOp_br_if, p->depth - 1 - target_depth);
+	wbInstr *in = wb_instr_begin(p, wbInstr_BrIf, wbOp_br_if, 1, 0);
+	in->imm = p->depth - 1 - target_depth;
+	wb_uleb(&p->code, in->imm);
+	wb_instr_end(p, in);
 }
+
+// Both the prologue and the epilogue are dropped by the optimizer when the
+// procedure turns out not to need a frame
+gb_internal void wb_emit_epilogue(wbProcedure *p) {
+	wbInstr *in = wb_instr_begin(p, wbInstr_EpilogueGet, wbOp_local_get, 0, 1);
+	in->imm = p->old_sp_local;
+	wb_uleb_fixed5(&p->code, p->old_sp_local);
+	wb_instr_end(p, in);
+	in = wb_instr_begin(p, wbInstr_EpilogueSet, wbOp_global_set, 1, 0);
+	in->imm = p->module->global_stack_pointer;
+	wb_uleb(&p->code, in->imm);
+	wb_instr_end(p, in);
+}
+
 
 // Module writer
 

@@ -45,6 +45,74 @@ gb_internal bool wb_expr_has_call(Ast *expr) {
 	}
 }
 
+// True when the aggregate value of `expr` is known to live in storage nothing
+// else refers to (a temporary or constant data), so that it can be passed to
+// a callee by pointer without a copy
+gb_internal bool wb_expr_yields_fresh_memory(wbProcedure *p, Ast *expr) {
+	expr = unparen_expr(expr);
+	if (expr->tav.mode == Addressing_Constant) {
+		return true;
+	}
+	switch (expr->kind) {
+	case Ast_CompoundLit:
+		return true;
+	case Ast_Ident: {
+		// A local nothing points into: the callee cannot reach it other than
+		// through the parameter, which it never writes
+		Entity *e = entity_of_node(expr);
+		if (e == nullptr || e->kind != Entity_Variable || ptr_set_exists(&p->aliased, e)) {
+			return false;
+		}
+		wbAddr *addr = map_get(&p->variables, e);
+		return addr != nullptr && addr->kind == wbAddr_Memory && addr->index == p->fp_local;
+	}
+	case Ast_CallExpr: {
+		ast_node(ce, CallExpr, expr);
+		TypeAndValue proc_tv = type_and_value_of_expr(ce->proc);
+		if (proc_tv.mode != Addressing_Value) {
+			return false; // conversion or builtin: may return its operand
+		}
+		Entity *e = entity_of_node(ce->proc);
+		if (e != nullptr && e->kind == Entity_Procedure && wb_procedure_for_entity(p->module, e)->is_llvm_intrinsic) {
+			return false;
+		}
+		return true;
+	}
+	default:
+		return false;
+	}
+}
+
+// True when `v` lives inside a parameter of the current procedure.
+// Parameters are immutable and cannot have their address taken, so such
+// memory can be passed along to a callee by pointer without a copy.
+gb_internal bool wb_value_is_param_memory(wbProcedure *p, wbValue v) {
+	if (v.kind != wbValue_Memory || v.index == WB_NO_LOCAL || p->type == nullptr) {
+		return false;
+	}
+	Type *pt = base_type(p->type);
+	if (pt->Proc.params == nullptr) {
+		return false;
+	}
+	for (Entity *e : pt->Proc.params->Tuple.variables) {
+		if (e->kind != Entity_Variable) {
+			continue;
+		}
+		wbAddr *addr = map_get(&p->variables, e);
+		if (addr == nullptr || addr->kind != wbAddr_Memory || addr->index != v.index) {
+			continue;
+		}
+		if (addr->index != p->fp_local) {
+			return true; // the caller-owned copy the parameter was passed as
+		}
+		i64 size = type_size_of(e->type);
+		if (v.offset >= addr->offset && v.offset + type_size_of(v.type) <= addr->offset + size) {
+			return true; // reassembled from flattened parameter leaves
+		}
+	}
+	return false;
+}
+
 // Copies a value so that later side effects cannot change it
 gb_internal wbValue wb_value_fresh(wbProcedure *p, wbValue v) {
 	switch (v.kind) {
@@ -300,7 +368,12 @@ gb_internal void wb_emit_type_assertion_check(wbProcedure *p, wbValue ok, TokenP
 	if (wb_is_odin_cc(p->type) || p->context_stack.count > 0) {
 		name = "type_assertion_check2_with_context";
 	}
+	// if !ok { type_assertion_check2(...) }
+	wb_push(p, ok);
+	wb_op(p, wbOp_i32_eqz);
+	wb_open_if(p);
 	wb_emit_runtime_call(p, name, args);
+	wb_close(p);
 }
 
 // `u.(T)` / `u.(T), ok` for unions (lb_emit_union_cast)
@@ -336,7 +409,7 @@ gb_internal wbValue wb_emit_union_cast(wbProcedure *p, Ast *node, wbValue value,
 	wb_push(p, cond);
 	wb_open_if(p);
 	wbAddr slot = wb_addr_field(res, 0);
-	wb_emit_copy(p, slot.index, slot.offset, value_addr.index, value_addr.offset, type_size_of(dst));
+	wb_emit_copy(p, slot.index, slot.offset, value_addr.index, value_addr.offset, dst);
 	wb_addr_store(p, wb_addr_field(res, 1), wb_value_const_int(t_bool, 1));
 	wb_close(p);
 
@@ -375,7 +448,7 @@ gb_internal wbValue wb_emit_any_cast(wbProcedure *p, Ast *node, wbValue value, T
 	wb_open_if(p);
 	wbAddr slot = wb_addr_field(res, 0);
 	wbAddr src_addr = wb_addr_from_pointer(p, any_data, dst);
-	wb_emit_copy(p, slot.index, slot.offset, src_addr.index, src_addr.offset, type_size_of(dst));
+	wb_emit_copy(p, slot.index, slot.offset, src_addr.index, src_addr.offset, dst);
 	wb_addr_store(p, wb_addr_field(res, 1), wb_value_const_int(t_bool, 1));
 	wb_close(p);
 
@@ -1289,22 +1362,47 @@ gb_internal void wb_emit_slice_bounds_check(wbProcedure *p, Token token, wbValue
 		if (high.kind == wbValue_Const && len.kind == wbValue_Const && 0 <= high.i && high.i <= len.i) {
 			return;
 		}
+		high = wb_value_to_local(p, high);
+		if (len.kind != wbValue_Const) {
+			len = wb_value_to_local(p, len);
+		}
+		// if !(0 <= hi && hi <= len) { slice_expr_error_hi(...) }
+		wb_push(p, high);
+		wb_push(p, len);
+		wb_op(p, wbOp_i32_gt_u);
+		wb_open_if(p);
 		auto args = array_make<wbValue>(temporary_allocator(), 0, 5);
 		wb_set_file_line_col(p, &args, token.pos);
 		array_add(&args, high);
 		array_add(&args, len);
 		wb_emit_runtime_call(p, "slice_expr_error_hi", args);
+		wb_close(p);
 	} else {
 		if (low.kind == wbValue_Const && high.kind == wbValue_Const && len.kind == wbValue_Const &&
 		    0 <= low.i && low.i <= high.i && high.i <= len.i) {
 			return;
 		}
+		low  = wb_value_to_local(p, low);
+		high = wb_value_to_local(p, high);
+		if (len.kind != wbValue_Const) {
+			len = wb_value_to_local(p, len);
+		}
+		// if !(0 <= lo && lo <= hi && hi <= len) { slice_expr_error_lo_hi(...) }
+		wb_push(p, low);
+		wb_push(p, high);
+		wb_op(p, wbOp_i32_gt_u);
+		wb_push(p, high);
+		wb_push(p, len);
+		wb_op(p, wbOp_i32_gt_u);
+		wb_op(p, wbOp_i32_or);
+		wb_open_if(p);
 		auto args = array_make<wbValue>(temporary_allocator(), 0, 6);
 		wb_set_file_line_col(p, &args, token.pos);
 		array_add(&args, low);
 		array_add(&args, high);
 		array_add(&args, len);
 		wb_emit_runtime_call(p, "slice_expr_error_lo_hi", args);
+		wb_close(p);
 	}
 }
 
@@ -1320,11 +1418,19 @@ gb_internal void wb_emit_multi_pointer_slice_bounds_check(wbProcedure *p, Token 
 	if (low.kind == wbValue_Const && high.kind == wbValue_Const && low.i < high.i) {
 		return;
 	}
+	low  = wb_value_to_local(p, low);
+	high = wb_value_to_local(p, high);
+	// if lo > hi { multi_pointer_slice_expr_error(...) }
+	wb_push(p, low);
+	wb_push(p, high);
+	wb_op(p, wbOp_i32_gt_s);
+	wb_open_if(p);
 	auto args = array_make<wbValue>(temporary_allocator(), 0, 5);
 	wb_set_file_line_col(p, &args, token.pos);
 	array_add(&args, low);
 	array_add(&args, high);
 	wb_emit_runtime_call(p, "multi_pointer_slice_expr_error", args);
+	wb_close(p);
 }
 
 // m[row, column]
@@ -1391,6 +1497,14 @@ gb_internal wbAddr wb_build_addr_matrix_index(wbProcedure *p, Ast *expr) {
 	return wb_emit_elem_addr(p, base.index, base.offset, index, elem_type);
 }
 
+// `expr[index]` with `expr` known to be in range by the enclosing loop's bounds (wb_bce_analyze)
+gb_internal void wb_emit_index_bounds_check(wbProcedure *p, Ast *expr, wbValue index, wbValue len) {
+	if (ptr_set_exists(&p->unchecked, expr)) {
+		return;
+	}
+	wb_emit_bounds_check(p, ast_token(expr->IndexExpr.index), index, len);
+}
+
 gb_internal wbAddr wb_build_addr_index(wbProcedure *p, Ast *expr) {
 	ast_node(ie, IndexExpr, expr);
 	wbAddr invalid = {};
@@ -1448,7 +1562,7 @@ gb_internal wbAddr wb_build_addr_index(wbProcedure *p, Ast *expr) {
 	case Type_Map:
 		return wb_map_elem_addr(p, base, base.type, index, elem_type);
 	case Type_Array:
-		wb_emit_bounds_check(p, ast_token(ie->index), index, wb_value_const_int(t_int, bt->Array.count));
+		wb_emit_index_bounds_check(p, expr, index, wb_value_const_int(t_int, bt->Array.count));
 		return wb_emit_elem_addr(p, base.index, base.offset, index, elem_type);
 	case Type_EnumeratedArray: {
 		// index - min_value
@@ -1503,7 +1617,7 @@ gb_internal wbAddr wb_build_addr_index(wbProcedure *p, Ast *expr) {
 		if (data.kind == wbValue_Invalid) {
 			return invalid;
 		}
-		wb_emit_bounds_check(p, ast_token(ie->index), index, wb_emit_slice_len(p, s));
+		wb_emit_index_bounds_check(p, expr, index, wb_emit_slice_len(p, s));
 		return wb_emit_elem_addr(p, data.index, 0, index, elem_type);
 	}
 	default:
@@ -1683,7 +1797,57 @@ gb_internal void wb_build_compound_lit(wbProcedure *p, Ast *expr, wbAddr dst) {
 		return;
 	}
 
-	wb_addr_zero(p, dst);
+	// Only the parts of the destination that the literal leaves unset are zeroed:
+	// whole positional array literals need no zeroing, struct literals only zero
+	// the fields (and padding) they do not name.
+	bool zero_all = true;
+	if (cl->elems.count > 0 && dst.kind == wbAddr_Memory) {
+		if ((bt->kind == Type_Array || bt->kind == Type_EnumeratedArray || bt->kind == Type_SimdVector) && !is_type_soa_struct(bt)) {
+			i64 count = bt->kind == Type_Array ? bt->Array.count : bt->kind == Type_EnumeratedArray ? bt->EnumeratedArray.count : bt->SimdVector.count;
+			bool positional = cl->elems.count == count;
+			for (Ast *elem : cl->elems) {
+				if (elem->kind == Ast_FieldValue) {
+					positional = false;
+				}
+			}
+			zero_all = !positional;
+		} else if (bt->kind == Type_Struct && !is_type_soa_struct(bt) && !bt->Struct.is_raw_union) {
+			// bytes covered by the named/positional top level fields
+			auto covered = array_make<bool>(temporary_allocator(), bt->Struct.fields.count);
+			for_array(i, cl->elems) {
+				Ast *elem = cl->elems[i];
+				if (elem->kind == Ast_FieldValue) {
+					ast_node(fv, FieldValue, elem);
+					Selection sel = lookup_field(bt, fv->field->Ident.interned, false);
+					if (sel.index.count == 1) {
+						covered[sel.index[0]] = true;
+					}
+				} else {
+					covered[i] = true;
+				}
+			}
+			i64 size = type_size_of(bt);
+			i64 done = 0;
+			for_array(i, bt->Struct.fields) {
+				Type *ft = nullptr;
+				i64 offset = type_offset_of(bt, i, &ft);
+				if (!covered[i]) {
+					continue;
+				}
+				if (offset > done) {
+					wb_emit_zero(p, dst.index, dst.offset + cast(i32)done, offset - done);
+				}
+				done = gb_max(done, offset + type_size_of(ft));
+			}
+			if (size > done) {
+				wb_emit_zero(p, dst.index, dst.offset + cast(i32)done, size - done);
+			}
+			zero_all = false;
+		}
+	}
+	if (zero_all) {
+		wb_addr_zero(p, dst);
+	}
 	if (cl->elems.count == 0) {
 		return;
 	}
@@ -2349,9 +2513,20 @@ gb_internal wbValue wb_emit_arith_array(wbProcedure *p, Ast *node, TokenKind op,
 		elem  = bt->EnumeratedArray.elem;
 		count = bt->EnumeratedArray.count;
 	}
-	left  = wb_emit_conv(p, left,  type);
-	right = wb_emit_conv(p, right, type);
-	if (left.kind != wbValue_Memory || right.kind != wbValue_Memory) {
+	// A scalar operand is used directly for every element instead of being splatted
+	// into a temporary array first
+	wbValue left_scalar = {}, right_scalar = {};
+	if (count <= 8 && !is_type_array_like(left.type) && wb_is_scalar(left.type)) {
+		left_scalar = wb_value_to_local(p, wb_emit_conv(p, left, elem));
+	} else {
+		left = wb_emit_conv(p, left, type);
+	}
+	if (count <= 8 && !is_type_array_like(right.type) && wb_is_scalar(right.type)) {
+		right_scalar = wb_value_to_local(p, wb_emit_conv(p, right, elem));
+	} else {
+		right = wb_emit_conv(p, right, type);
+	}
+	if ((left_scalar.kind == wbValue_Invalid && left.kind != wbValue_Memory) || (right_scalar.kind == wbValue_Invalid && right.kind != wbValue_Memory)) {
 		return wb_value_invalid();
 	}
 	i64 elem_size = type_size_of(elem);
@@ -2360,8 +2535,8 @@ gb_internal wbValue wb_emit_arith_array(wbProcedure *p, Ast *node, TokenKind op,
 	if (count <= 8) {
 		for (i64 i = 0; i < count; i++) {
 			i32 off = cast(i32)(i * elem_size);
-			wbValue l = wb_addr_load(p, wb_addr_memory(left.index,  left.offset  + off, elem));
-			wbValue r = wb_addr_load(p, wb_addr_memory(right.index, right.offset + off, elem));
+			wbValue l = left_scalar.kind  != wbValue_Invalid ? left_scalar  : wb_addr_load(p, wb_addr_memory(left.index,  left.offset  + off, elem));
+			wbValue r = right_scalar.kind != wbValue_Invalid ? right_scalar : wb_addr_load(p, wb_addr_memory(right.index, right.offset + off, elem));
 			wbValue v = wb_emit_arith(p, node, op, l, r, elem, elem);
 			if (v.kind == wbValue_Invalid) {
 				return v;
@@ -2720,6 +2895,11 @@ gb_internal wbValue wb_emit_arith(wbProcedure *p, Ast *node, TokenKind op, wbVal
 	case Token_AndNot:
 		// a &~ b == a & ~b
 		wb_push(p, left);
+		if (right.kind == wbValue_Const) {
+			if (vt == wbValType_i64) { wb_i64_const(p, ~right.i); wb_op(p, wbOp_i64_and); }
+			else                     { wb_i32_const(p, ~cast(i32)right.i); wb_op(p, wbOp_i32_and); }
+			return wb_pop_to_local(p, rvt, result_type);
+		}
 		wb_push(p, right);
 		if (vt == wbValType_i64) {
 			wb_i64_const(p, -1); wb_op(p, wbOp_i64_xor); wb_op(p, wbOp_i64_and);
@@ -2737,12 +2917,26 @@ gb_internal wbValue wb_emit_arith(wbProcedure *p, Ast *node, TokenKind op, wbVal
 			return wb_value_invalid();
 		}
 		u32 res = wb_add_local(p, vt);
+		bool const_in_range = amount.kind == wbValue_Const && amount.i >= 0 && amount.i < bits;
+		if (amount.kind == wbValue_Const && !const_in_range && !(op == Token_Shr && is_signed)) {
+			return wb_value_const_int(result_type, 0);
+		}
 		wb_push(p, left);
-		wb_push(p, amount);
+		if (const_in_range) {
+			// in-range constant shift: no saturation needed
+			if (vt == wbValType_i64) wb_i64_const(p, amount.i); else wb_i32_const(p, cast(i32)amount.i);
+		} else {
+			wb_push(p, amount);
+		}
 		if (vt == wbValType_i64) {
 			if (op == Token_Shl) wb_op(p, wbOp_i64_shl); else wb_op(p, is_signed ? wbOp_i64_shr_s : wbOp_i64_shr_u);
 		} else {
 			if (op == Token_Shl) wb_op(p, wbOp_i32_shl); else wb_op(p, is_signed ? wbOp_i32_shr_s : wbOp_i32_shr_u);
+		}
+		if (const_in_range) {
+			wb_emit_normalize(p, result_type);
+			wb_local_set(p, res);
+			return wb_value_local(res, vt, result_type);
 		}
 		// select(shifted, saturated, amount < bits)
 		if (op == Token_Shr && is_signed) {
@@ -3484,6 +3678,7 @@ gb_internal wbValue wb_emit_from_platform_endian(wbProcedure *p, wbValue x, Type
 // `alloca`: memory below the frame, freed by the epilogue's stack pointer restore
 // sp = (sp - size) & -align
 gb_internal wbValue wb_emit_alloca(wbProcedure *p, wbValue size, i64 align, Type *type) {
+	p->uses_alloca = true;
 	wb_global_get(p, p->module->global_stack_pointer);
 	wb_push(p, size);
 	wb_op(p, wbOp_i32_sub);
@@ -3635,7 +3830,7 @@ gb_internal wbValue wb_build_builtin_call_internal(wbProcedure *p, Ast *expr, Bu
 		for (isize i = 1; i < args.count; i++) {
 			i64 index = exact_value_to_i64(args[i]->tav.value);
 			wb_emit_copy(p, res.index, res.offset + cast(i32)((i-1)*elem_size),
-			             src.index, src.offset + cast(i32)(index*elem_size), elem_size);
+			             src.index, src.offset + cast(i32)(index*elem_size), elem);
 		}
 		return wb_value_memory(res.index, res.offset, type);
 	}
@@ -3644,6 +3839,9 @@ gb_internal wbValue wb_build_builtin_call_internal(wbProcedure *p, Ast *expr, Bu
 		return wb_build_soa_zip(p, expr);
 	case BuiltinProc_soa_unzip:
 		return wb_build_soa_unzip(p, expr);
+	case BuiltinProc_soa_copy_from_slice:
+		wb_build_soa_copy_from_slice(p, expr);
+		return wb_value_invalid();
 	case BuiltinProc_type_equal_proc:
 		return wb_value_const_int(type, wb_table_index(p->module, wb_equal_proc_for_type(p->module, args[0]->tav.type)));
 	case BuiltinProc_type_hasher_proc:
@@ -3777,6 +3975,13 @@ gb_internal wbValue wb_build_builtin_call_internal(wbProcedure *p, Ast *expr, Bu
 		if (wb_expr_has_call(args[2])) src = wb_value_fresh(p, src);
 		wbValue len = wb_emit_conv(p, wb_build_expr(p, args[2]), t_int);
 		if (dst.kind == wbValue_Invalid || src.kind == wbValue_Invalid || len.kind == wbValue_Invalid) return wb_value_invalid();
+		if (id == BuiltinProc_mem_copy_non_overlapping && len.kind == wbValue_Const && len.i <= WB_INLINE_COPY_MAX) {
+			// memcpy semantics, so a small constant size can be expanded inline
+			dst = wb_value_to_local(p, dst);
+			src = wb_value_to_local(p, src);
+			wb_emit_copy(p, dst.index, 0, src.index, 0, len.i);
+			return wb_value_invalid();
+		}
 		wb_push(p, dst); wb_push(p, src); wb_push(p, len);
 		wb_memory_copy(p);
 		return wb_value_invalid();
@@ -3959,6 +4164,11 @@ gb_internal wbValue wb_build_builtin_call_internal(wbProcedure *p, Ast *expr, Bu
 		if (wb_expr_has_call(args[1])) dst = wb_value_fresh(p, dst);
 		wbValue len = wb_emit_conv(p, wb_build_expr(p, args[1]), t_int);
 		if (dst.kind == wbValue_Invalid || len.kind == wbValue_Invalid) return wb_value_invalid();
+		if (len.kind == wbValue_Const && len.i <= WB_INLINE_COPY_MAX) {
+			dst = wb_value_to_local(p, dst);
+			wb_emit_zero(p, dst.index, 0, len.i);
+			return wb_value_invalid();
+		}
 		wb_push(p, dst); wb_i32_const(p, 0); wb_push(p, len);
 		wb_memory_fill(p);
 		return wb_value_invalid();
@@ -4374,6 +4584,11 @@ gb_internal wbValue wb_emit_call(wbProcedure *p, Type *pt, wbProcedure *callee, 
 		wb_push(p, proc_value);
 		wb_call_indirect(p, wb_type_index_of_proc(p->module, pt));
 	}
+	if (pt->Proc.diverging) {
+		// never returns: what follows is unreachable, which the optimizer uses
+		wb_op(p, wbOp_unreachable);
+		return wb_value_invalid();
+	}
 
 	if (sret) {
 		if (pt->Proc.result_count == 1) {
@@ -4643,6 +4858,7 @@ gb_internal wbValue wb_build_call_expr_internal(wbProcedure *p, Ast *expr) {
 		}
 	}
 	auto values = array_make<wbValue>(temporary_allocator(), 0, positional.count+1);
+	auto values_fresh = array_make<bool>(temporary_allocator(), 0, positional.count+1);
 	for_array(i, positional) {
 		Type *arg_type = type_of_expr(positional[i]);
 		if (is_type_tuple(arg_type)) {
@@ -4662,6 +4878,7 @@ gb_internal wbValue wb_build_call_expr_internal(wbProcedure *p, Ast *expr) {
 					v = wb_emit_conv(p, v, param_type);
 				}
 				array_add(&values, later_call[i] ? wb_value_fresh(p, v) : v);
+				array_add(&values_fresh, later_call[i] || wb_expr_yields_fresh_memory(p, positional[i]));
 			}
 			continue;
 		}
@@ -4671,6 +4888,7 @@ gb_internal wbValue wb_build_call_expr_internal(wbProcedure *p, Ast *expr) {
 			Entity *param = pt->Proc.params->Tuple.variables[index];
 			if (param->kind != Entity_Variable) {
 				array_add(&values, wb_value_invalid()); // polymorphic parameter, takes no space
+				array_add(&values_fresh, false);
 				continue;
 			}
 			param_type = param->type;
@@ -4692,18 +4910,27 @@ gb_internal wbValue wb_build_call_expr_internal(wbProcedure *p, Ast *expr) {
 		if (v.kind == wbValue_Invalid) {
 			return v;
 		}
-		array_add(&values, later_call[i] ? wb_value_fresh(p, v) : v);
+		bool fresh_memory = wb_expr_yields_fresh_memory(p, positional[i]);
+		if (later_call[i] && !(v.kind == wbValue_Memory && fresh_memory)) {
+			v = wb_value_fresh(p, v); // a later argument's call cannot touch fresh memory
+		}
+		array_add(&values, v);
+		array_add(&values_fresh, later_call[i] || fresh_memory);
 	}
-	// Map onto parameters: positional, then named, then defaults
+	// Map onto parameters: positional, then named, then defaults. `fresh`
+	// marks the aggregates that need no copy before being passed by pointer.
 	auto args = array_make<wbValue>(temporary_allocator(), 0, param_count);
 	auto arg_set = array_make<bool>(temporary_allocator(), param_count);
+	auto fresh = array_make<bool>(temporary_allocator(), param_count);
 	array_resize(&args, param_count);
 	for (isize i = 0; i < param_count; i++) {
 		arg_set[i] = false;
+		fresh[i] = false;
 	}
 	for (isize i = 0; i < gb_min(values.count, variadic_index); i++) {
 		args[i] = values[i];
 		arg_set[i] = true;
+		fresh[i] = values_fresh[i];
 	}
 	if (variadic && c_vararg) {
 		if (vari_expand) {
@@ -4716,21 +4943,38 @@ gb_internal wbValue wb_build_call_expr_internal(wbProcedure *p, Ast *expr) {
 		}
 		args[variadic_index] = buffer;
 		arg_set[variadic_index] = true;
+		fresh[variadic_index] = true;
 	} else if (variadic) {
 		wbValue slice_value = {};
+		bool slice_fresh = true;
 		if (values.count <= variadic_index) {
 			ExactValue nil_value = {};
 			slice_value = wb_const(p, expr, slice_type, nil_value);
 		} else if (vari_expand) {
 			GB_ASSERT(values.count == variadic_index+1);
 			slice_value = values[variadic_index];
+			slice_fresh = values_fresh[variadic_index];
 		} else {
 			slice_value = wb_build_variadic_slice(p, slice_type, slice(slice_from_array(values), variadic_index, values.count));
 		}
 		args[variadic_index] = slice_value;
 		arg_set[variadic_index] = true;
+		fresh[variadic_index] = slice_fresh;
 	}
-	for (Ast *arg : ce->split_args->named) {
+	// Named arguments are evaluated after the positional ones, in order
+	Slice<Ast *> const &named = ce->split_args->named;
+	auto later_call_named = array_make<bool>(temporary_allocator(), named.count);
+	{
+		bool seen = false;
+		for (isize i = named.count-1; i >= 0; i--) {
+			later_call_named[i] = seen;
+			if (wb_expr_has_call(named[i]->FieldValue.value)) {
+				seen = true;
+			}
+		}
+	}
+	for_array(named_index, named) {
+		Ast *arg = named[named_index];
 		ast_node(fv, FieldValue, arg);
 		String name = fv->field->Ident.token.string;
 		isize index = lookup_procedure_parameter(pt, name);
@@ -4747,8 +4991,10 @@ gb_internal wbValue wb_build_call_expr_internal(wbProcedure *p, Ast *expr) {
 		if (v.kind == wbValue_Invalid) {
 			return v;
 		}
-		args[index] = wb_value_fresh(p, v);
+		bool later = later_call_named[named_index];
+		args[index] = later ? wb_value_fresh(p, v) : v;
 		arg_set[index] = true;
+		fresh[index] = later || wb_expr_yields_fresh_memory(p, fv->value);
 	}
 	for (isize i = 0; i < param_count; i++) {
 		if (arg_set[i]) {
@@ -4759,7 +5005,9 @@ gb_internal wbValue wb_build_call_expr_internal(wbProcedure *p, Ast *expr) {
 			continue; // polymorphic parameters take no space
 		}
 		if (has_parameter_value(param->Variable.param_value)) {
-			args[i] = wb_build_param_value(p, expr, param->type, param->Variable.param_value);
+			ParameterValue const &pv = param->Variable.param_value;
+			args[i] = wb_build_param_value(p, expr, param->type, pv);
+			fresh[i] = pv.kind != ParameterValue_Value || wb_expr_yields_fresh_memory(p, pv.ast_value);
 		} else {
 			wb_unsupported(p, expr, "missing argument");
 			return wb_value_invalid();
@@ -4770,7 +5018,10 @@ gb_internal wbValue wb_build_call_expr_internal(wbProcedure *p, Ast *expr) {
 		arg_set[i] = true;
 	}
 
-	// Aggregates are passed by pointer to a copy owned by the caller
+	// Aggregates are passed by pointer to a copy owned by the caller (the
+	// callee never writes to it: parameters are immutable and cannot have
+	// their address taken), unless the value already is a temporary or
+	// constant data
 	auto final_args = array_make<wbValue>(temporary_allocator(), 0, param_count);
 	for (isize i = 0; i < param_count; i++) {
 		if (pt->Proc.params->Tuple.variables[i]->kind != Entity_Variable) {
@@ -4778,7 +5029,7 @@ gb_internal wbValue wb_build_call_expr_internal(wbProcedure *p, Ast *expr) {
 		}
 		GB_ASSERT(arg_set[i]);
 		wbValue v = args[i];
-		if (v.kind == wbValue_Memory) {
+		if (v.kind == wbValue_Memory && !fresh[i] && !wb_value_is_param_memory(p, v)) {
 			v = wb_value_copy(p, v);
 		}
 		array_add(&final_args, v);

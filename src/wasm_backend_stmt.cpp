@@ -360,13 +360,27 @@ gb_internal void wb_build_value_decl(wbProcedure *p, AstValueDecl *vd, Ast *node
 	}
 
 	// Evaluate initializers before declaring the new variables
-	// (`x: T = ---` is simply zero initialized here)
+	// (`x: T = ---` leaves the variable's storage as it is)
 	bool has_uninit = false;
 	for (Ast *value : vd->values) {
 		if (unparen_expr(value)->kind == Ast_Uninit) {
 			has_uninit = true;
 		}
 	}
+	// `x := T{...}`: an aggregate literal is built straight into the variable's storage
+	if (!is_static && vd->names.count == 1 && vd->values.count == 1 && !is_blank_ident(vd->names[0])) {
+		Ast *value = unparen_expr(vd->values[0]);
+		Entity *e = entity_of_node(vd->names[0]);
+		if (value->kind == Ast_CompoundLit && e != nullptr && !wb_is_scalar(e->type) &&
+		    value->tav.value.kind == ExactValue_Invalid && are_types_identical(type_of_expr(value), e->type)) {
+			wbAddr addr = wb_add_variable(p, e);
+			if (addr.kind == wbAddr_Memory) {
+				wb_build_compound_lit(p, value, addr);
+				return;
+			}
+		}
+	}
+
 	auto values = array_make<wbValue>(temporary_allocator(), 0, vd->names.count);
 	if (!is_static && has_uninit && vd->values.count == vd->names.count) {
 		// `a, b: T = ---, f()`: each value is single valued
@@ -396,7 +410,7 @@ gb_internal void wb_build_value_decl(wbProcedure *p, AstValueDecl *vd, Ast *node
 		wbAddr addr = wb_add_variable(p, e);
 		if (values.count > 0 && values[i].kind != wbValue_Invalid) {
 			wb_addr_store(p, addr, values[i]);
-		} else {
+		} else if (!(has_uninit && vd->values.count == vd->names.count && unparen_expr(vd->values[i])->kind == Ast_Uninit)) {
 			// Zero initialize (the declaration may be re-executed inside a loop)
 			wb_addr_zero(p, addr);
 		}
@@ -421,6 +435,56 @@ gb_internal void wb_build_block_stmt(wbProcedure *p, AstBlockStmt *bs, Ast *node
 	}
 }
 
+// Whether a condition is built of `&&`, `||` and `!` (so that it is best
+// lowered to branches rather than to a value)
+gb_internal bool wb_cond_is_compound(Ast *cond) {
+	cond = unparen_expr(cond);
+	if (cond->tav.value.kind != ExactValue_Invalid) {
+		return false;
+	}
+	if (cond->kind == Ast_BinaryExpr) {
+		return cond->BinaryExpr.op.kind == Token_CmpAnd || cond->BinaryExpr.op.kind == Token_CmpOr;
+	}
+	if (cond->kind == Ast_UnaryExpr && cond->UnaryExpr.op.kind == Token_Not) {
+		return wb_cond_is_compound(cond->UnaryExpr.expr);
+	}
+	return false;
+}
+
+// Branches to `target` when the condition is `jump_if`, falls through
+// otherwise: `a && b` and `a || b` become a chain of tests, each jumping
+// straight to the target, rather than a value computed by short-circuiting
+gb_internal void wb_build_cond_br(wbProcedure *p, Ast *cond, bool jump_if, u32 target) {
+	cond = unparen_expr(cond);
+	if (cond->tav.value.kind == ExactValue_Invalid) {
+		if (cond->kind == Ast_BinaryExpr && (cond->BinaryExpr.op.kind == Token_CmpAnd || cond->BinaryExpr.op.kind == Token_CmpOr)) {
+			bool is_and = cond->BinaryExpr.op.kind == Token_CmpAnd;
+			if (is_and != jump_if) {
+				// `a && b` when false, `a || b` when true: either operand decides
+				wb_build_cond_br(p, cond->BinaryExpr.left, jump_if, target);
+				wb_build_cond_br(p, cond->BinaryExpr.right, jump_if, target);
+			} else {
+				// `a && b` when true: a false `a` skips `b` (and the jump)
+				u32 skip = wb_open_block(p);
+				wb_build_cond_br(p, cond->BinaryExpr.left, !jump_if, skip);
+				wb_build_cond_br(p, cond->BinaryExpr.right, jump_if, target);
+				wb_close(p);
+			}
+			return;
+		}
+		if (cond->kind == Ast_UnaryExpr && cond->UnaryExpr.op.kind == Token_Not) {
+			wb_build_cond_br(p, cond->UnaryExpr.expr, !jump_if, target);
+			return;
+		}
+	}
+	wbValue v = wb_emit_conv(p, wb_build_expr(p, cond), t_bool);
+	wb_push(p, v);
+	if (!jump_if) {
+		wb_op(p, wbOp_i32_eqz);
+	}
+	wb_br_if(p, target);
+}
+
 gb_internal void wb_build_if_stmt(wbProcedure *p, AstIfStmt *is, Ast *node) {
 	wb_open_scope(p);
 	if (is->init != nullptr) {
@@ -433,15 +497,39 @@ gb_internal void wb_build_if_stmt(wbProcedure *p, AstIfStmt *is, Ast *node) {
 		wb_push_label(p, is->label, outer, 0, false);
 	}
 
-	wbValue cond = wb_emit_conv(p, wb_build_expr(p, is->cond), t_bool);
-	wb_push(p, cond);
-	wb_open_if(p);
-	wb_build_stmt(p, is->body);
-	if (is->else_stmt != nullptr) {
-		wb_else(p);
-		wb_build_stmt(p, is->else_stmt);
+	if (wb_cond_is_compound(is->cond)) {
+		// block $else
+		//   block $then
+		//     if !cond br $then
+		//     body
+		//     br $else
+		//   end
+		//   else_body
+		// end
+		u32 else_depth = 0;
+		if (is->else_stmt != nullptr) {
+			else_depth = wb_open_block(p);
+		}
+		u32 then_depth = wb_open_block(p);
+		wb_build_cond_br(p, is->cond, false, then_depth);
+		wb_build_stmt(p, is->body);
+		if (is->else_stmt != nullptr) {
+			wb_br(p, else_depth);
+			wb_close(p);
+			wb_build_stmt(p, is->else_stmt);
+		}
+		wb_close(p);
+	} else {
+		wbValue cond = wb_emit_conv(p, wb_build_expr(p, is->cond), t_bool);
+		wb_push(p, cond);
+		wb_open_if(p);
+		wb_build_stmt(p, is->body);
+		if (is->else_stmt != nullptr) {
+			wb_else(p);
+			wb_build_stmt(p, is->else_stmt);
+		}
+		wb_close(p);
 	}
-	wb_close(p);
 
 	if (is->label != nullptr) {
 		wb_pop_label(p);
@@ -468,10 +556,7 @@ gb_internal void wb_build_for_stmt(wbProcedure *p, AstForStmt *fs, Ast *node) {
 	u32 break_depth = wb_open_block(p);
 	u32 loop_depth  = wb_open_loop(p);
 	if (fs->cond != nullptr) {
-		wbValue cond = wb_emit_conv(p, wb_build_expr(p, fs->cond), t_bool);
-		wb_push(p, cond);
-		wb_op(p, wbOp_i32_eqz);
-		wb_br_if(p, break_depth);
+		wb_build_cond_br(p, fs->cond, false, break_depth);
 	}
 	u32 continue_depth = wb_open_block(p);
 	wb_push_label(p, fs->label, break_depth, continue_depth, true);
@@ -535,39 +620,417 @@ gb_internal bool wb_range_val_is_ref(Ast *val) {
 	return e != nullptr && (e->flags & EntityFlag_Value) == 0;
 }
 
-gb_internal void wb_build_range_interval(wbProcedure *p, AstRangeStmt *rs, Ast *node, Ast *val0, Ast *val1) {
-	ast_node(be, BinaryExpr, unparen_expr(rs->expr));
-	if (rs->reverse) {
-		wb_unsupported(p, node, "'#reverse' interval loop");
+// Bounds-check elimination for `for i in lo..<hi` loops. `path[i]` needs no
+// check when `path` cannot change while the loop runs, `lo >= 0` and
+// `hi <= len(path)`. When the bounds do not say so themselves
+// (`for i in 0..<len(path)`), the loop is tested once beforehand and emitted
+// twice: without the checks when the test passes, with them otherwise.
+
+// Calls `f(node)` for `node` and, if it returns true, for its descendants
+template <typename F>
+gb_internal void wb_walk_ast(Ast *node, F &&f) {
+	if (node == nullptr || !f(node)) {
 		return;
+	}
+	switch (node->kind) {
+	case Ast_ParenExpr:        wb_walk_ast(node->ParenExpr.expr, f); break;
+	case Ast_UnaryExpr:        wb_walk_ast(node->UnaryExpr.expr, f); break;
+	case Ast_BinaryExpr:
+		wb_walk_ast(node->BinaryExpr.left, f);
+		wb_walk_ast(node->BinaryExpr.right, f);
+		break;
+	case Ast_SelectorExpr:     wb_walk_ast(node->SelectorExpr.expr, f); break;
+	case Ast_ImplicitSelectorExpr: break;
+	case Ast_SelectorCallExpr: wb_walk_ast(node->SelectorCallExpr.call, f); break;
+	case Ast_IndexExpr:
+		wb_walk_ast(node->IndexExpr.expr, f);
+		wb_walk_ast(node->IndexExpr.index, f);
+		break;
+	case Ast_MatrixIndexExpr:
+		wb_walk_ast(node->MatrixIndexExpr.expr, f);
+		wb_walk_ast(node->MatrixIndexExpr.row_index, f);
+		wb_walk_ast(node->MatrixIndexExpr.column_index, f);
+		break;
+	case Ast_SliceExpr:
+		wb_walk_ast(node->SliceExpr.expr, f);
+		wb_walk_ast(node->SliceExpr.low, f);
+		wb_walk_ast(node->SliceExpr.high, f);
+		break;
+	case Ast_DerefExpr:        wb_walk_ast(node->DerefExpr.expr, f); break;
+	case Ast_CallExpr:
+		wb_walk_ast(node->CallExpr.proc, f);
+		for (Ast *arg : node->CallExpr.args) wb_walk_ast(arg, f);
+		break;
+	case Ast_FieldValue:       wb_walk_ast(node->FieldValue.value, f); break;
+	case Ast_CompoundLit:
+		for (Ast *elem : node->CompoundLit.elems) wb_walk_ast(elem, f);
+		break;
+	case Ast_TypeCast:         wb_walk_ast(node->TypeCast.expr, f); break;
+	case Ast_AutoCast:         wb_walk_ast(node->AutoCast.expr, f); break;
+	case Ast_TernaryIfExpr:
+		wb_walk_ast(node->TernaryIfExpr.cond, f);
+		wb_walk_ast(node->TernaryIfExpr.x, f);
+		wb_walk_ast(node->TernaryIfExpr.y, f);
+		break;
+	case Ast_TernaryWhenExpr:
+		wb_walk_ast(node->TernaryWhenExpr.x, f);
+		wb_walk_ast(node->TernaryWhenExpr.y, f);
+		break;
+	case Ast_OrElseExpr:
+		wb_walk_ast(node->OrElseExpr.x, f);
+		wb_walk_ast(node->OrElseExpr.y, f);
+		break;
+	case Ast_OrReturnExpr:     wb_walk_ast(node->OrReturnExpr.expr, f); break;
+	case Ast_OrBranchExpr:     wb_walk_ast(node->OrBranchExpr.expr, f); break;
+	case Ast_TypeAssertion:    wb_walk_ast(node->TypeAssertion.expr, f); break;
+
+	case Ast_ExprStmt:         wb_walk_ast(node->ExprStmt.expr, f); break;
+	case Ast_AssignStmt:
+		for (Ast *e : node->AssignStmt.lhs) wb_walk_ast(e, f);
+		for (Ast *e : node->AssignStmt.rhs) wb_walk_ast(e, f);
+		break;
+	case Ast_BlockStmt:
+		for (Ast *s : node->BlockStmt.stmts) wb_walk_ast(s, f);
+		break;
+	case Ast_IfStmt:
+		wb_walk_ast(node->IfStmt.init, f);
+		wb_walk_ast(node->IfStmt.cond, f);
+		wb_walk_ast(node->IfStmt.body, f);
+		wb_walk_ast(node->IfStmt.else_stmt, f);
+		break;
+	case Ast_WhenStmt:
+		wb_walk_ast(node->WhenStmt.body, f);
+		wb_walk_ast(node->WhenStmt.else_stmt, f);
+		break;
+	case Ast_ReturnStmt:
+		for (Ast *e : node->ReturnStmt.results) wb_walk_ast(e, f);
+		break;
+	case Ast_ForStmt:
+		wb_walk_ast(node->ForStmt.init, f);
+		wb_walk_ast(node->ForStmt.cond, f);
+		wb_walk_ast(node->ForStmt.post, f);
+		wb_walk_ast(node->ForStmt.body, f);
+		break;
+	case Ast_RangeStmt:
+		wb_walk_ast(node->RangeStmt.init, f);
+		wb_walk_ast(node->RangeStmt.expr, f);
+		wb_walk_ast(node->RangeStmt.body, f);
+		break;
+	case Ast_UnrollRangeStmt:
+		wb_walk_ast(node->UnrollRangeStmt.init, f);
+		wb_walk_ast(node->UnrollRangeStmt.expr, f);
+		wb_walk_ast(node->UnrollRangeStmt.body, f);
+		break;
+	case Ast_SwitchStmt:
+		wb_walk_ast(node->SwitchStmt.init, f);
+		wb_walk_ast(node->SwitchStmt.tag, f);
+		wb_walk_ast(node->SwitchStmt.body, f);
+		break;
+	case Ast_TypeSwitchStmt:
+		wb_walk_ast(node->TypeSwitchStmt.tag, f);
+		wb_walk_ast(node->TypeSwitchStmt.body, f);
+		break;
+	case Ast_CaseClause:
+		for (Ast *e : node->CaseClause.list) wb_walk_ast(e, f);
+		for (Ast *s : node->CaseClause.stmts) wb_walk_ast(s, f);
+		break;
+	case Ast_DeferStmt:        wb_walk_ast(node->DeferStmt.stmt, f); break;
+	case Ast_ValueDecl:
+		for (Ast *e : node->ValueDecl.values) wb_walk_ast(e, f);
+		break;
+	default:
+		break;
+	}
+}
+
+// The variable whose storage `expr` names, when nothing else can name it: a
+// local no pointer refers into, or a field (of a field ...) of one
+gb_internal Entity *wb_bce_path_root(wbProcedure *p, Ast *expr) {
+	for (;;) {
+		expr = unparen_expr(expr);
+		switch (expr->kind) {
+		case Ast_Ident: {
+			Entity *e = entity_of_node(expr);
+			if (e == nullptr || e->kind != Entity_Variable || (e->flags & (EntityFlag_Using|EntityFlag_Static)) != 0) {
+				return nullptr;
+			}
+			if (map_get(&p->variables, e) == nullptr || ptr_set_exists(&p->aliased, e)) {
+				return nullptr;
+			}
+			return e;
+		}
+		case Ast_SelectorExpr: {
+			Ast *base = expr->SelectorExpr.expr;
+			Type *t = type_of_expr(base);
+			AddressingMode mode = base->tav.mode;
+			if (t == nullptr || (mode != Addressing_Variable && mode != Addressing_Value)) {
+				return nullptr;
+			}
+			if (base_type(t)->kind != Type_Struct || is_type_soa_struct(t)) {
+				return nullptr;
+			}
+			if (expr->SelectorExpr.selector->kind != Ast_Ident) {
+				return nullptr;
+			}
+			expr = base;
+			break;
+		}
+		default:
+			return nullptr;
+		}
+	}
+}
+
+gb_internal bool wb_bce_same_path(Ast *a, Ast *b) {
+	a = unparen_expr(a);
+	b = unparen_expr(b);
+	if (a->kind != b->kind) {
+		return false;
+	}
+	switch (a->kind) {
+	case Ast_Ident:
+		return entity_of_node(a) == entity_of_node(b);
+	case Ast_SelectorExpr:
+		return a->SelectorExpr.selector->Ident.token.string == b->SelectorExpr.selector->Ident.token.string &&
+		       wb_bce_same_path(a->SelectorExpr.expr, b->SelectorExpr.expr);
+	default:
+		return false;
+	}
+}
+
+// Whether assigning to `lhs` may change the value of `root` (writes through
+// pointers do not count: the roots are not aliased)
+gb_internal bool wb_bce_writes(Ast *lhs, Entity *root) {
+	for (;;) {
+		lhs = unparen_expr(lhs);
+		switch (lhs->kind) {
+		case Ast_Ident:
+			for (Entity *e = entity_of_node(lhs); e != nullptr && e->kind == Entity_Variable; e = e->using_parent) {
+				if (e == root) {
+					return true;
+				}
+				if ((e->flags & EntityFlag_Using) == 0) {
+					break;
+				}
+			}
+			return false;
+		case Ast_SelectorExpr: {
+			Type *t = type_of_expr(lhs->SelectorExpr.expr);
+			if (t == nullptr || is_type_pointer(t) || is_type_soa_pointer(t)) {
+				return false;
+			}
+			lhs = lhs->SelectorExpr.expr;
+			break;
+		}
+		case Ast_IndexExpr: {
+			// elements stored elsewhere than in the indexed value itself
+			Type *t = type_of_expr(lhs->IndexExpr.expr);
+			if (t == nullptr) {
+				return false;
+			}
+			Type *bt = base_type(t);
+			if (bt->kind == Type_Pointer || bt->kind == Type_MultiPointer || bt->kind == Type_SoaPointer ||
+			    bt->kind == Type_Slice || bt->kind == Type_DynamicArray || bt->kind == Type_Map || is_type_string(bt) ||
+			    (is_type_soa_struct(bt) && bt->Struct.soa_kind != StructSoa_Fixed)) {
+				return false;
+			}
+			lhs = lhs->IndexExpr.expr;
+			break;
+		}
+		case Ast_MatrixIndexExpr:
+			lhs = lhs->MatrixIndexExpr.expr;
+			break;
+		case Ast_DerefExpr:
+			return false;
+		default:
+			return true;
+		}
+	}
+}
+
+gb_internal bool wb_bce_body_writes(Ast *body, Entity *root) {
+	bool written = false;
+	wb_walk_ast(body, [&](Ast *n) -> bool {
+		if (written || n->kind == Ast_ProcLit) {
+			return false;
+		}
+		if (n->kind == Ast_AssignStmt) {
+			for (Ast *lhs : n->AssignStmt.lhs) {
+				if (wb_bce_writes(lhs, root)) {
+					written = true;
+				}
+			}
+		}
+		return !written;
+	});
+	return written;
+}
+
+// `len(path)`, possibly converted to another integer type (which cannot make
+// it larger): the path
+gb_internal Ast *wb_bce_len_operand(Ast *expr) {
+	expr = unparen_expr(expr);
+	if (expr->kind != Ast_CallExpr || expr->CallExpr.args.count != 1) {
+		return nullptr;
+	}
+	if (expr->CallExpr.proc->tav.mode == Addressing_Type) {
+		Ast *arg = expr->CallExpr.args[0];
+		if (is_type_integer(type_of_expr(expr)) && is_type_integer(type_of_expr(arg))) {
+			return wb_bce_len_operand(arg);
+		}
+		return nullptr;
+	}
+	Entity *e = entity_of_node(expr->CallExpr.proc);
+	if (e == nullptr || e->kind != Entity_Builtin || e->Builtin.id != BuiltinProc_len) {
+		return nullptr;
+	}
+	return expr->CallExpr.args[0];
+}
+
+// The element count of `path` (a fixed array, slice, string or dynamic array)
+gb_internal wbValue wb_bce_path_len(wbProcedure *p, Ast *path) {
+	Type *bt = base_type(type_of_expr(path));
+	if (bt->kind == Type_Array) {
+		return wb_value_const_int(t_int, bt->Array.count);
+	}
+	wbValue s = wb_build_expr(p, path);
+	if (s.kind != wbValue_Memory) {
+		return wb_value_invalid();
+	}
+	return wb_emit_slice_len(p, s);
+}
+
+struct wbBceLoop {
+	Array<Ast *> exprs;  // `path[i]` expressions of the body
+	Array<Ast *> paths;  // the distinct paths among them
+	Array<bool>  proven; // per path: in range by the loop bounds alone
+	bool test_lo;        // the lower bound is a signed variable: `lo >= 0` is to be tested
+};
+
+#define WB_BCE_MAX_BODY 400 // AST nodes of a body worth emitting twice
+
+// Finds the `path[i]` expressions of the loop body whose checks the bounds
+// make redundant, or which a test of `hi <= len(path)` before the loop would
+gb_internal bool wb_bce_analyze(wbProcedure *p, AstRangeStmt *rs, AstBinaryExpr *be, Ast *val0, wbBceLoop *bce) {
+	if (wb_bounds_check_disabled(p) || val0 == nullptr || is_blank_ident(val0)) {
+		return false;
+	}
+	Entity *iv = entity_of_node(val0);
+	if (iv == nullptr || (iv->flags & EntityFlag_Value) == 0) {
+		return false;
+	}
+	// Bounds the body cannot change: constants, locals nothing points into,
+	// and their lengths
+	Ast *lo = unparen_expr(be->left);
+	Ast *hi = unparen_expr(be->right);
+	bce->test_lo = false;
+	if (lo->tav.mode == Addressing_Constant) {
+		if (lo->tav.value.kind != ExactValue_Integer || big_int_is_neg(&lo->tav.value.value_integer)) {
+			return false;
+		}
+	} else if (!is_type_integer(type_of_expr(lo))) {
+		return false;
+	} else {
+		bce->test_lo = wb_type_is_signed(type_of_expr(lo));
+	}
+	Ast *hi_len_path = wb_bce_len_operand(hi);
+	if (hi->tav.mode == Addressing_Constant) {
+		if (hi->tav.value.kind != ExactValue_Integer) {
+			return false;
+		}
+	} else {
+		Ast *dep = hi_len_path != nullptr ? hi_len_path : hi;
+		Entity *root = wb_bce_path_root(p, dep);
+		if (root == nullptr || wb_bce_body_writes(rs->body, root)) {
+			return false;
+		}
+		if (hi_len_path != nullptr) {
+			Type *bt = base_type(type_of_expr(hi_len_path));
+			if (bt->kind != Type_Array && bt->kind != Type_Slice && bt->kind != Type_DynamicArray &&
+			    !(is_type_string(bt) && !is_type_cstring(bt))) {
+				return false;
+			}
+		}
 	}
 	bool inclusive = be->op.kind != Token_RangeHalf;
 
-	Type *val_type = val0 != nullptr && !is_blank_ident(val0) ? type_of_expr(val0) : nullptr;
-	if (val_type == nullptr) {
-		val_type = be->left->tav.type;
-		if (is_type_untyped(val_type)) {
-			val_type = default_type(val_type);
-		}
+	isize body_size = 0;
+	wb_walk_ast(rs->body, [&](Ast *n) -> bool {
+		body_size += 1;
+		return n->kind != Ast_ProcLit;
+	});
+	// (the checked version of an enclosing loop is not worth another copy)
+	bool may_version = body_size <= WB_BCE_MAX_BODY && p->bce_checked_depth == 0;
+	if (bce->test_lo && !may_version) {
+		return false;
 	}
-	wbValType vt = wb_valtype_of(val_type);
-	if (vt != wbValType_i32 && vt != wbValType_i64) {
-		wb_unsupported_type(p, node, val_type);
-		return;
-	}
-	bool is_signed = wb_type_is_signed(val_type);
 
-	// value = lower; index = 0
-	wbValue lower = wb_emit_conv(p, wb_build_expr(p, be->left), val_type);
-	if (lower.kind == wbValue_Invalid) {
-		return;
-	}
-	u32 value = wb_add_local(p, vt);
-	u32 index = wb_add_local(p, wbValType_i32);
-	wb_push(p, lower);
-	wb_local_set(p, value);
-	wb_i32_const(p, 0);
-	wb_local_set(p, index);
+	auto ta = temporary_allocator();
+	bce->exprs  = array_make<Ast *>(ta, 0, 8);
+	bce->paths  = array_make<Ast *>(ta, 0, 8);
+	bce->proven = array_make<bool>(ta, 0, 8);
+	wb_walk_ast(rs->body, [&](Ast *n) -> bool {
+		if (n->kind == Ast_ProcLit) {
+			return false;
+		}
+		if (n->kind != Ast_IndexExpr) {
+			return true;
+		}
+		Ast *index = unparen_expr(n->IndexExpr.index);
+		if (index->kind != Ast_Ident || entity_of_node(index) != iv) {
+			return true;
+		}
+		Ast *path = n->IndexExpr.expr;
+		Type *bt = base_type(type_of_expr(path));
+		if (bt->kind != Type_Array && bt->kind != Type_Slice && bt->kind != Type_DynamicArray &&
+		    !(is_type_string(bt) && !is_type_cstring(bt))) {
+			return true;
+		}
+		if (n->IndexExpr.expr->tav.mode == Addressing_SoaVariable) {
+			return true;
+		}
+		Entity *root = wb_bce_path_root(p, path);
+		if (root == nullptr) {
+			return true;
+		}
+		isize pi = -1;
+		for (isize i = 0; i < bce->paths.count; i++) {
+			if (wb_bce_same_path(bce->paths[i], path)) {
+				pi = i;
+				break;
+			}
+		}
+		if (pi < 0) {
+			// (the length of a fixed array is not something the body can change)
+			if (bt->kind != Type_Array && wb_bce_body_writes(rs->body, root)) {
+				return true;
+			}
+			bool proven = false;
+			if (hi_len_path != nullptr && !inclusive && wb_bce_same_path(hi_len_path, path)) {
+				proven = true;
+			} else if (hi->tav.mode == Addressing_Constant && bt->kind == Type_Array) {
+				i64 count = bt->Array.count;
+				i64 h = exact_value_to_i64(hi->tav.value);
+				proven = inclusive ? h < count : h <= count;
+			}
+			if (!proven && !may_version) {
+				return true;
+			}
+			pi = bce->paths.count;
+			array_add(&bce->paths, path);
+			array_add(&bce->proven, proven);
+		}
+		array_add(&bce->exprs, n);
+		return true;
+	});
+	return bce->exprs.count > 0;
+}
+
+gb_internal void wb_build_range_interval_loop(wbProcedure *p, AstRangeStmt *rs, AstBinaryExpr *be, Ast *val0, Ast *val1,
+                                              Type *val_type, u32 value, u32 index) {
+	wbValType vt = wb_valtype_of(val_type);
+	bool is_signed = wb_type_is_signed(val_type);
+	bool inclusive = be->op.kind != Token_RangeHalf;
 
 	u32 break_depth = wb_open_block(p);
 	u32 loop_depth  = wb_open_loop(p);
@@ -614,6 +1077,94 @@ gb_internal void wb_build_range_interval(wbProcedure *p, AstRangeStmt *rs, Ast *
 	wb_br(p, loop_depth);
 	wb_close(p); // loop
 	wb_close(p); // break
+}
+
+gb_internal void wb_build_range_interval(wbProcedure *p, AstRangeStmt *rs, Ast *node, Ast *val0, Ast *val1) {
+	ast_node(be, BinaryExpr, unparen_expr(rs->expr));
+	if (rs->reverse) {
+		wb_unsupported(p, node, "'#reverse' interval loop");
+		return;
+	}
+	bool inclusive = be->op.kind != Token_RangeHalf;
+
+	Type *val_type = val0 != nullptr && !is_blank_ident(val0) ? type_of_expr(val0) : nullptr;
+	if (val_type == nullptr) {
+		val_type = be->left->tav.type;
+		if (is_type_untyped(val_type)) {
+			val_type = default_type(val_type);
+		}
+	}
+	wbValType vt = wb_valtype_of(val_type);
+	if (vt != wbValType_i32 && vt != wbValType_i64) {
+		wb_unsupported_type(p, node, val_type);
+		return;
+	}
+	bool is_signed = wb_type_is_signed(val_type);
+
+	// value = lower; index = 0
+	wbValue lower = wb_emit_conv(p, wb_build_expr(p, be->left), val_type);
+	if (lower.kind == wbValue_Invalid) {
+		return;
+	}
+	u32 value = wb_add_local(p, vt);
+	u32 index = wb_add_local(p, wbValType_i32);
+	wb_push(p, lower);
+	wb_local_set(p, value);
+	wb_i32_const(p, 0);
+	wb_local_set(p, index);
+
+	wbBceLoop bce = {};
+	if (vt != wbValType_i32 || !wb_bce_analyze(p, rs, be, val0, &bce)) {
+		wb_build_range_interval_loop(p, rs, be, val0, val1, val_type, value, index);
+		return;
+	}
+
+	// The test of what the bounds do not prove
+	isize tests = 0;
+	if (bce.test_lo) {
+		wb_local_get(p, value);
+		wb_i32_const(p, 0);
+		wb_op(p, wbOp_i32_ge_s);
+		tests += 1;
+	}
+	wbValue upper = {};
+	for (isize i = 0; i < bce.paths.count; i++) {
+		if (bce.proven[i]) {
+			continue;
+		}
+		if (upper.kind == wbValue_Invalid) {
+			upper = wb_value_to_local(p, wb_emit_conv(p, wb_build_expr(p, be->right), val_type));
+		}
+		wbValue len = wb_bce_path_len(p, bce.paths[i]);
+		if (len.kind == wbValue_Invalid) {
+			continue;
+		}
+		wb_push(p, upper);
+		wb_push(p, len);
+		wb_emit_binary_op(p, inclusive ? Token_Lt : Token_LtEq, wbValType_i32, is_signed);
+		if (tests > 0) {
+			wb_op(p, wbOp_i32_and);
+		}
+		tests += 1;
+	}
+
+	if (tests > 0) {
+		wb_open_if(p);
+	}
+	for (Ast *e : bce.exprs) {
+		ptr_set_add(&p->unchecked, e);
+	}
+	wb_build_range_interval_loop(p, rs, be, val0, val1, val_type, value, index);
+	for (Ast *e : bce.exprs) {
+		ptr_set_remove(&p->unchecked, e);
+	}
+	if (tests > 0) {
+		wb_else(p);
+		p->bce_checked_depth += 1;
+		wb_build_range_interval_loop(p, rs, be, val0, val1, val_type, value, index);
+		p->bce_checked_depth -= 1;
+		wb_close(p);
+	}
 }
 
 // Ranges over arrays, slices, strings (as bytes are not iterated: runes are) and dynamic arrays
@@ -1665,22 +2216,39 @@ gb_internal void wb_build_stmt(wbProcedure *p, Ast *node) {
 }
 
 // Finds the variables whose address is taken so that they can be given
-// memory instead of a register.
+// memory instead of a register, and the variables some pointer may refer
+// into (`aliased`) so that the others can be passed to callees by pointer
+// without a copy.
 
-gb_internal void wb_mark_addressed_root(wbProcedure *p, Ast *expr) {
+gb_internal void wb_mark_aliased_entity(wbProcedure *p, Entity *e, bool addressed) {
+	if (e == nullptr || e->kind != Entity_Variable) {
+		return;
+	}
+	ptr_set_add(&p->aliased, e);
+	if (addressed) {
+		ptr_set_add(&p->addressed, e);
+	}
+	// a `using x` field names storage inside its parent
+	while (e->flags & EntityFlag_Using) {
+		Entity *parent = e->using_parent;
+		if (parent == nullptr || parent->kind != Entity_Variable || is_type_pointer(parent->type)) {
+			break;
+		}
+		ptr_set_add(&p->aliased, parent);
+		e = parent;
+	}
+}
+
+gb_internal void wb_mark_root(wbProcedure *p, Ast *expr, bool addressed) {
 	for (;;) {
 		if (expr == nullptr) {
 			return;
 		}
 		expr = unparen_expr(expr);
 		switch (expr->kind) {
-		case Ast_Ident: {
-			Entity *e = entity_of_node(expr);
-			if (e != nullptr && e->kind == Entity_Variable) {
-				ptr_set_add(&p->addressed, e);
-			}
+		case Ast_Ident:
+			wb_mark_aliased_entity(p, entity_of_node(expr), addressed);
 			return;
-		}
 		case Ast_SelectorExpr: {
 			Ast *base = expr->SelectorExpr.expr;
 			Type *t = type_of_expr(base);
@@ -1715,6 +2283,158 @@ gb_internal void wb_mark_addressed_root(wbProcedure *p, Ast *expr) {
 	}
 }
 
+gb_internal void wb_mark_addressed_root(wbProcedure *p, Ast *expr) {
+	wb_mark_root(p, expr, true);
+}
+
+// Marks every variable mentioned in `expr` as aliased: used where a value is
+// converted to `any` (which refers to the value's storage) or handed to a
+// builtin, and the exact operand is not worth tracking
+gb_internal void wb_mark_aliased_deep(wbProcedure *p, Ast *expr) {
+	if (expr == nullptr) {
+		return;
+	}
+	switch (expr->kind) {
+	case Ast_Ident:            wb_mark_aliased_entity(p, entity_of_node(expr), false); break;
+	case Ast_ParenExpr:        wb_mark_aliased_deep(p, expr->ParenExpr.expr); break;
+	case Ast_UnaryExpr:        wb_mark_aliased_deep(p, expr->UnaryExpr.expr); break;
+	case Ast_BinaryExpr:
+		wb_mark_aliased_deep(p, expr->BinaryExpr.left);
+		wb_mark_aliased_deep(p, expr->BinaryExpr.right);
+		break;
+	case Ast_SelectorExpr:     wb_mark_aliased_deep(p, expr->SelectorExpr.expr); break;
+	case Ast_SelectorCallExpr: wb_mark_aliased_deep(p, expr->SelectorCallExpr.call); break;
+	case Ast_IndexExpr:
+		wb_mark_aliased_deep(p, expr->IndexExpr.expr);
+		wb_mark_aliased_deep(p, expr->IndexExpr.index);
+		break;
+	case Ast_MatrixIndexExpr:
+		wb_mark_aliased_deep(p, expr->MatrixIndexExpr.expr);
+		wb_mark_aliased_deep(p, expr->MatrixIndexExpr.row_index);
+		wb_mark_aliased_deep(p, expr->MatrixIndexExpr.column_index);
+		break;
+	case Ast_SliceExpr:
+		wb_mark_aliased_deep(p, expr->SliceExpr.expr);
+		wb_mark_aliased_deep(p, expr->SliceExpr.low);
+		wb_mark_aliased_deep(p, expr->SliceExpr.high);
+		break;
+	case Ast_DerefExpr:        wb_mark_aliased_deep(p, expr->DerefExpr.expr); break;
+	case Ast_CallExpr:
+		wb_mark_aliased_deep(p, expr->CallExpr.proc);
+		for (Ast *arg : expr->CallExpr.args) wb_mark_aliased_deep(p, arg);
+		break;
+	case Ast_FieldValue:       wb_mark_aliased_deep(p, expr->FieldValue.value); break;
+	case Ast_CompoundLit:
+		for (Ast *elem : expr->CompoundLit.elems) wb_mark_aliased_deep(p, elem);
+		break;
+	case Ast_TypeCast:         wb_mark_aliased_deep(p, expr->TypeCast.expr); break;
+	case Ast_AutoCast:         wb_mark_aliased_deep(p, expr->AutoCast.expr); break;
+	case Ast_TernaryIfExpr:
+		wb_mark_aliased_deep(p, expr->TernaryIfExpr.cond);
+		wb_mark_aliased_deep(p, expr->TernaryIfExpr.x);
+		wb_mark_aliased_deep(p, expr->TernaryIfExpr.y);
+		break;
+	case Ast_TernaryWhenExpr:
+		wb_mark_aliased_deep(p, expr->TernaryWhenExpr.x);
+		wb_mark_aliased_deep(p, expr->TernaryWhenExpr.y);
+		break;
+	case Ast_OrElseExpr:
+		wb_mark_aliased_deep(p, expr->OrElseExpr.x);
+		wb_mark_aliased_deep(p, expr->OrElseExpr.y);
+		break;
+	case Ast_OrReturnExpr:     wb_mark_aliased_deep(p, expr->OrReturnExpr.expr); break;
+	case Ast_OrBranchExpr:     wb_mark_aliased_deep(p, expr->OrBranchExpr.expr); break;
+	case Ast_TypeAssertion:    wb_mark_aliased_deep(p, expr->TypeAssertion.expr); break;
+	default:
+		break;
+	}
+}
+
+// Whether storing into a value of type `t` may convert something to `any`
+gb_internal bool wb_type_has_any_slot(Type *t) {
+	if (t == nullptr) {
+		return false;
+	}
+	Type *bt = base_type(t);
+	switch (bt->kind) {
+	case Type_Basic:           return is_type_any(bt);
+	case Type_Array:           return is_type_any(bt->Array.elem);
+	case Type_EnumeratedArray: return is_type_any(bt->EnumeratedArray.elem);
+	case Type_Slice:           return is_type_any(bt->Slice.elem);
+	case Type_DynamicArray:    return is_type_any(bt->DynamicArray.elem);
+	case Type_Map:             return is_type_any(bt->Map.key) || is_type_any(bt->Map.value);
+	case Type_Struct:
+		for (Entity *f : bt->Struct.fields) {
+			if (is_type_any(f->type)) {
+				return true;
+			}
+		}
+		return false;
+	case Type_Tuple:
+		for (Entity *v : bt->Tuple.variables) {
+			if (is_type_any(v->type)) {
+				return true;
+			}
+		}
+		return false;
+	default:
+		return false;
+	}
+}
+
+// Whether calling `proc_type` with the arguments converts one to `any`
+gb_internal bool wb_call_takes_any(Type *proc_type) {
+	if (proc_type == nullptr) {
+		return true;
+	}
+	Type *pt = base_type(proc_type);
+	if (pt->kind != Type_Proc) {
+		return true;
+	}
+	if (pt->Proc.params == nullptr) {
+		return false;
+	}
+	for (Entity *param : pt->Proc.params->Tuple.variables) {
+		if (param->kind != Entity_Variable) {
+			continue;
+		}
+		if (is_type_any(param->type) || (is_type_slice(param->type) && is_type_any(base_type(param->type)->Slice.elem))) {
+			return true;
+		}
+	}
+	return false;
+}
+
+// Builtins that only read their operands (`len(x)`, `min(a, b)`, ...)
+gb_internal bool wb_builtin_reads_values(BuiltinProcId id) {
+	switch (id) {
+	case BuiltinProc_len:
+	case BuiltinProc_cap:
+	case BuiltinProc_size_of:
+	case BuiltinProc_align_of:
+	case BuiltinProc_offset_of:
+	case BuiltinProc_offset_of_by_string:
+	case BuiltinProc_type_of:
+	case BuiltinProc_type_info_of:
+	case BuiltinProc_typeid_of:
+	case BuiltinProc_swizzle:
+	case BuiltinProc_complex:
+	case BuiltinProc_quaternion:
+	case BuiltinProc_real:
+	case BuiltinProc_imag:
+	case BuiltinProc_jmag:
+	case BuiltinProc_kmag:
+	case BuiltinProc_conj:
+	case BuiltinProc_min:
+	case BuiltinProc_max:
+	case BuiltinProc_abs:
+	case BuiltinProc_clamp:
+		return true;
+	default:
+		return false;
+	}
+}
+
 gb_internal void wb_prescan_addressed(wbProcedure *p, Ast *node) {
 	if (node == nullptr) {
 		return;
@@ -1732,20 +2452,55 @@ gb_internal void wb_prescan_addressed(wbProcedure *p, Ast *node) {
 		wb_prescan_addressed(p, node->BinaryExpr.right);
 		break;
 	case Ast_SelectorExpr: wb_prescan_addressed(p, node->SelectorExpr.expr); break;
-	case Ast_IndexExpr:
+	case Ast_IndexExpr: {
 		wb_prescan_addressed(p, node->IndexExpr.expr);
 		wb_prescan_addressed(p, node->IndexExpr.index);
+		Type *t = type_of_expr(node->IndexExpr.expr);
+		if (t != nullptr && is_type_map(type_deref(t)) && is_type_any(base_type(type_deref(t))->Map.key)) {
+			wb_mark_aliased_deep(p, node->IndexExpr.index);
+		}
 		break;
-	case Ast_SliceExpr:
-		// slicing an array takes its address, but arrays always live in memory
+	}
+	case Ast_SliceExpr: {
+		// slicing anything but a slice/string/pointer refers into the operand
+		// itself (arrays always live in memory, so this is only aliasing)
+		Type *t = type_of_expr(node->SliceExpr.expr);
+		if (t == nullptr || !(is_type_slice(t) || is_type_dynamic_array(t) || is_type_string(t) ||
+		                      is_type_pointer(t) || is_type_multi_pointer(t))) {
+			wb_mark_root(p, node->SliceExpr.expr, false);
+		}
 		wb_prescan_addressed(p, node->SliceExpr.expr);
 		wb_prescan_addressed(p, node->SliceExpr.low);
 		wb_prescan_addressed(p, node->SliceExpr.high);
 		break;
+	}
+	case Ast_MatrixIndexExpr:
+		wb_prescan_addressed(p, node->MatrixIndexExpr.expr);
+		wb_prescan_addressed(p, node->MatrixIndexExpr.row_index);
+		wb_prescan_addressed(p, node->MatrixIndexExpr.column_index);
+		break;
 	case Ast_DerefExpr:    wb_prescan_addressed(p, node->DerefExpr.expr); break;
+	case Ast_SelectorCallExpr: wb_prescan_addressed(p, node->SelectorCallExpr.call); break;
 	case Ast_CallExpr: {
 		wb_prescan_addressed(p, node->CallExpr.proc);
 		for (Ast *arg : node->CallExpr.args) wb_prescan_addressed(p, arg);
+		// Builtins may refer into their operands (`raw_data`, `soa_unzip`,
+		// `append` to a []any, ...); so does a conversion of an argument to `any`
+		{
+			TypeAndValue ptv = type_and_value_of_expr(node->CallExpr.proc);
+			Entity *pe = entity_of_node(node->CallExpr.proc);
+			bool aliases = false;
+			if (pe != nullptr && pe->kind == Entity_Builtin) {
+				aliases = !wb_builtin_reads_values(cast(BuiltinProcId)pe->Builtin.id);
+			} else if (ptv.mode == Addressing_Type) {
+				aliases = is_type_any(ptv.type);
+			} else {
+				aliases = wb_call_takes_any(ptv.type);
+			}
+			if (aliases) {
+				for (Ast *arg : node->CallExpr.args) wb_mark_aliased_deep(p, arg);
+			}
+		}
 		// `@(deferred_in_by_ptr)` procedures receive the addresses of the arguments
 		Entity *e = entity_of_node(node->CallExpr.proc);
 		if (e != nullptr && e->kind == Entity_Procedure && entity_has_deferred_procedure(e)) {
@@ -1757,11 +2512,26 @@ gb_internal void wb_prescan_addressed(wbProcedure *p, Ast *node) {
 		break;
 	}
 	case Ast_FieldValue:   wb_prescan_addressed(p, node->FieldValue.value); break;
-	case Ast_CompoundLit:
-		for (Ast *elem : node->CompoundLit.elems) wb_prescan_addressed(p, elem);
+	case Ast_CompoundLit: {
+		bool any_slot = wb_type_has_any_slot(type_of_expr(node));
+		for (Ast *elem : node->CompoundLit.elems) {
+			wb_prescan_addressed(p, elem);
+			if (any_slot) wb_mark_aliased_deep(p, elem);
+		}
 		break;
-	case Ast_TypeCast:     wb_prescan_addressed(p, node->TypeCast.expr); break;
-	case Ast_AutoCast:     wb_prescan_addressed(p, node->AutoCast.expr); break;
+	}
+	case Ast_TypeCast:
+		if (is_type_any(node->tav.type)) {
+			wb_mark_aliased_deep(p, node->TypeCast.expr);
+		}
+		wb_prescan_addressed(p, node->TypeCast.expr);
+		break;
+	case Ast_AutoCast:
+		if (is_type_any(node->tav.type)) {
+			wb_mark_aliased_deep(p, node->AutoCast.expr);
+		}
+		wb_prescan_addressed(p, node->AutoCast.expr);
+		break;
 	case Ast_TernaryIfExpr:
 		wb_prescan_addressed(p, node->TernaryIfExpr.cond);
 		wb_prescan_addressed(p, node->TernaryIfExpr.x);
@@ -1776,13 +2546,22 @@ gb_internal void wb_prescan_addressed(wbProcedure *p, Ast *node) {
 		wb_prescan_addressed(p, node->OrElseExpr.y);
 		break;
 	case Ast_OrReturnExpr: wb_prescan_addressed(p, node->OrReturnExpr.expr); break;
+	case Ast_OrBranchExpr: wb_prescan_addressed(p, node->OrBranchExpr.expr); break;
 	case Ast_TypeAssertion: wb_prescan_addressed(p, node->TypeAssertion.expr); break;
 
 	case Ast_ExprStmt:     wb_prescan_addressed(p, node->ExprStmt.expr); break;
-	case Ast_AssignStmt:
-		for (Ast *e : node->AssignStmt.lhs) wb_prescan_addressed(p, e);
-		for (Ast *e : node->AssignStmt.rhs) wb_prescan_addressed(p, e);
+	case Ast_AssignStmt: {
+		bool any_lhs = false;
+		for (Ast *e : node->AssignStmt.lhs) {
+			wb_prescan_addressed(p, e);
+			any_lhs = any_lhs || wb_type_has_any_slot(type_of_expr(e));
+		}
+		for (Ast *e : node->AssignStmt.rhs) {
+			wb_prescan_addressed(p, e);
+			if (any_lhs) wb_mark_aliased_deep(p, e);
+		}
 		break;
+	}
 	case Ast_BlockStmt:
 		for (Ast *s : node->BlockStmt.stmts) wb_prescan_addressed(p, s);
 		break;
@@ -1796,9 +2575,14 @@ gb_internal void wb_prescan_addressed(wbProcedure *p, Ast *node) {
 		wb_prescan_addressed(p, node->WhenStmt.body);
 		wb_prescan_addressed(p, node->WhenStmt.else_stmt);
 		break;
-	case Ast_ReturnStmt:
-		for (Ast *e : node->ReturnStmt.results) wb_prescan_addressed(p, e);
+	case Ast_ReturnStmt: {
+		bool any_result = p->type != nullptr && wb_type_has_any_slot(base_type(p->type)->Proc.results);
+		for (Ast *e : node->ReturnStmt.results) {
+			wb_prescan_addressed(p, e);
+			if (any_result) wb_mark_aliased_deep(p, e);
+		}
 		break;
+	}
 	case Ast_ForStmt:
 		wb_prescan_addressed(p, node->ForStmt.init);
 		wb_prescan_addressed(p, node->ForStmt.cond);
@@ -1809,6 +2593,13 @@ gb_internal void wb_prescan_addressed(wbProcedure *p, Ast *node) {
 		wb_prescan_addressed(p, node->RangeStmt.init);
 		wb_prescan_addressed(p, node->RangeStmt.expr);
 		wb_prescan_addressed(p, node->RangeStmt.body);
+		// `for &v in x` points into x
+		for (Ast *val : node->RangeStmt.vals) {
+			if (val != nullptr && val->kind == Ast_UnaryExpr && val->UnaryExpr.op.kind == Token_And) {
+				wb_mark_root(p, node->RangeStmt.expr, false);
+				break;
+			}
+		}
 		break;
 	case Ast_UnrollRangeStmt:
 		wb_prescan_addressed(p, node->UnrollRangeStmt.init);
@@ -1829,9 +2620,18 @@ gb_internal void wb_prescan_addressed(wbProcedure *p, Ast *node) {
 		for (Ast *s : node->CaseClause.stmts) wb_prescan_addressed(p, s);
 		break;
 	case Ast_DeferStmt:    wb_prescan_addressed(p, node->DeferStmt.stmt); break;
-	case Ast_ValueDecl:
-		for (Ast *e : node->ValueDecl.values) wb_prescan_addressed(p, e);
+	case Ast_ValueDecl: {
+		bool any_name = false;
+		for (Ast *name : node->ValueDecl.names) {
+			Entity *e = entity_of_node(name);
+			any_name = any_name || (e != nullptr && wb_type_has_any_slot(e->type));
+		}
+		for (Ast *e : node->ValueDecl.values) {
+			wb_prescan_addressed(p, e);
+			if (any_name) wb_mark_aliased_deep(p, e);
+		}
 		break;
+	}
 	default:
 		// Procedure literals are separate procedures; other node kinds cannot
 		// take addresses (or are unsupported and reported during lowering)

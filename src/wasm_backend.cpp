@@ -7,6 +7,7 @@
 
 #include "wasm_backend.hpp"
 #include "wasm_backend_emit.cpp"
+#include "wasm_backend_opt.cpp"
 
 gb_internal wbValue wb_build_expr(wbProcedure *p, Ast *expr);
 gb_internal wbAddr  wb_build_addr(wbProcedure *p, Ast *expr);
@@ -25,6 +26,7 @@ gb_internal void wb_build_test_main_body(wbProcedure *p);
 gb_internal void wb_emit_call_no_args(wbProcedure *p, Entity *e);
 gb_internal u32 wb_data_alloc(wbModule *m, i64 size, i64 align);
 gb_internal u32     wb_table_index(wbModule *m, wbProcedure *p);
+gb_internal void    wb_gc_procedures(wbModule *m);
 gb_internal wbProcedure *wb_hasher_proc_for_type(wbModule *m, Type *type);
 gb_internal wbProcedure *wb_equal_proc_for_type(wbModule *m, Type *type);
 gb_internal void    wb_build_compound_lit(wbProcedure *p, Ast *expr, wbAddr dst);
@@ -37,6 +39,8 @@ gb_internal wbAddr  wb_context_for_write(wbProcedure *p);
 gb_internal void    wb_push_context_ptr(wbProcedure *p, wbAddr ctx);
 gb_internal void    wb_build_hasher_body(wbProcedure *p);
 gb_internal void    wb_build_equal_body(wbProcedure *p);
+gb_internal void    wb_build_map_get_body(wbProcedure *p);
+gb_internal void    wb_build_map_set_body(wbProcedure *p);
 gb_internal wbValue wb_map_load(wbProcedure *p, wbAddr addr);
 gb_internal void    wb_map_set(wbProcedure *p, wbAddr addr, wbValue v);
 gb_internal wbValue wb_map_get_ptr(wbProcedure *p, wbAddr addr, Type *ptr_type);
@@ -61,6 +65,7 @@ gb_internal wbValue wb_build_soa_slice_expr(wbProcedure *p, Ast *expr);
 gb_internal wbValue wb_build_soa_zip(wbProcedure *p, Ast *expr);
 gb_internal wbValue wb_build_atomic_call(wbProcedure *p, Ast *expr, BuiltinProcId id);
 gb_internal wbValue wb_build_soa_unzip(wbProcedure *p, Ast *expr);
+gb_internal void    wb_build_soa_copy_from_slice(wbProcedure *p, Ast *expr);
 gb_internal void    wb_build_range_soa(wbProcedure *p, AstRangeStmt *rs, Ast *node, Ast *val0, Ast *val1);
 
 // Diagnostics
@@ -460,6 +465,8 @@ gb_internal wbProcedure *wb_alloc_procedure(wbModule *m, String name) {
 	array_init(&p->result_addrs, m->allocator);
 	array_init(&p->labels,       m->allocator);
 	array_init(&p->call_relocs,  m->allocator);
+	array_init(&p->instrs,       m->allocator);
+	array_init(&p->slots,        m->allocator);
 	array_init(&p->defers,       m->allocator);
 	array_init(&p->scopes,       m->allocator);
 	array_init(&p->context_stack, m->allocator);
@@ -467,6 +474,8 @@ gb_internal wbProcedure *wb_alloc_procedure(wbModule *m, String name) {
 	map_init(&p->selector_values);
 	map_init(&p->selector_addrs);
 	ptr_set_init(&p->addressed);
+	ptr_set_init(&p->aliased);
+	ptr_set_init(&p->unchecked);
 	wb_buffer_init(&p->prologue, m->allocator, 16);
 	wb_buffer_init(&p->code, m->allocator);
 	return p;
@@ -607,7 +616,12 @@ gb_internal wbProcedure *wb_lookup_runtime_procedure(wbModule *m, char const *na
 	GB_ASSERT(pkg != nullptr);
 	Entity *e = scope_lookup_current(pkg->scope, string_interner_insert(make_string_c(name)));
 	GB_ASSERT_MSG(e != nullptr, "Runtime procedure not found: %s", name);
-	return wb_procedure_for_entity(m, e);
+	wbProcedure *p = wb_procedure_for_entity(m, e);
+	if (string_ends_with(p->name, str_lit("_error")) || string_starts_with(p->name, str_lit("type_assertion_check"))) {
+		// Only reached when a check the backend emitted inline has already failed
+		p->never_inline = true;
+	}
+	return p;
 }
 
 gb_internal u32 wb_add_local(wbProcedure *p, wbValType vt, String name = {}) {
@@ -739,6 +753,8 @@ gb_internal i32 wb_alloc_slot(wbProcedure *p, i64 size, i64 align) {
 	p->frame_size = cast(u32)((p->frame_size + align-1) & ~(align-1));
 	i32 offset = cast(i32)p->frame_size;
 	p->frame_size += cast(u32)size;
+	wbFrameSlot slot = {cast(u32)offset, cast(u32)size};
+	array_add(&p->slots, slot);
 	return offset;
 }
 
@@ -856,6 +872,26 @@ gb_internal void wb_emit_store(wbProcedure *p, u32 base, i32 offset, wbValue v, 
 	wb_emit_store_op(p, type, cast(u32)offset);
 }
 
+// Engines implement `memory.copy`/`memory.fill` as out-of-line runtime calls, so
+// copies of small aggregates (vectors, slices, strings, contexts...) are expanded
+// into plain loads and stores up to this many bytes.
+enum { WB_INLINE_COPY_MAX = 128 };
+
+// Pushes the base address for a memory access at local[base] + offset and
+// returns the (non-negative) offset left for the memarg immediate.
+gb_internal u32 wb_push_memarg_base(wbProcedure *p, u32 base, i32 offset) {
+	if (base == WB_NO_LOCAL) {
+		wb_i32_const(p, 0);
+		return cast(u32)offset;
+	}
+	if (offset < 0) {
+		wb_push_address(p, base, offset);
+		return 0;
+	}
+	wb_local_get(p, base);
+	return cast(u32)offset;
+}
+
 gb_internal void wb_emit_copy(wbProcedure *p, u32 dst_base, i32 dst_offset, u32 src_base, i32 src_offset, i64 size) {
 	if (size <= 0) {
 		return;
@@ -863,20 +899,208 @@ gb_internal void wb_emit_copy(wbProcedure *p, u32 dst_base, i32 dst_offset, u32 
 	if (dst_base == src_base && dst_offset == src_offset) {
 		return;
 	}
-	wb_push_address(p, dst_base, dst_offset);
-	wb_push_address(p, src_base, src_offset);
-	wb_i32_const(p, cast(i32)size);
-	wb_memory_copy(p);
+	// The inline expansion has memcpy semantics (chunks are copied in order), which is
+	// what aggregate assignment through pointers gets on the other backends too. Copies
+	// within the same frame have static offsets, so those can be checked for overlap.
+	bool overlaps = dst_base == src_base && dst_base != WB_NO_LOCAL &&
+	                dst_offset > src_offset && dst_offset < src_offset + size;
+	if (size > WB_INLINE_COPY_MAX || overlaps) {
+		wb_push_address(p, dst_base, dst_offset);
+		wb_push_address(p, src_base, src_offset);
+		wb_i32_const(p, cast(i32)size);
+		wb_memory_copy(p);
+		return;
+	}
+	for (i64 done = 0; done < size; ) {
+		i64 rem = size - done;
+		i64 chunk = rem >= 8 ? 8 : rem >= 4 ? 4 : rem >= 2 ? 2 : 1;
+		u32 doff = wb_push_memarg_base(p, dst_base, dst_offset + cast(i32)done);
+		u32 soff = wb_push_memarg_base(p, src_base, src_offset + cast(i32)done);
+		switch (chunk) {
+		case 8: wb_memarg(p, wbOp_i64_load,     soff, 1); wb_memarg(p, wbOp_i64_store,   doff, 1); break;
+		case 4: wb_memarg(p, wbOp_i32_load,     soff, 1); wb_memarg(p, wbOp_i32_store,   doff, 1); break;
+		case 2: wb_memarg(p, wbOp_i32_load16_u, soff, 1); wb_memarg(p, wbOp_i32_store16, doff, 1); break;
+		case 1: wb_memarg(p, wbOp_i32_load8_u,  soff, 1); wb_memarg(p, wbOp_i32_store8,  doff, 1); break;
+		}
+		done += chunk;
+	}
+}
+
+// Appends the scalar leaves (field/element offsets and types) of `type`, returns
+// false for types that have to be copied as raw bytes (unions, huge arrays...)
+gb_internal bool wb_copy_leaves(Type *type, i64 base_offset, Array<wbAbiLeaf> *leaves) {
+	enum { MAX_LEAVES = 32 };
+	if (leaves->count >= MAX_LEAVES) {
+		return false;
+	}
+	if (wb_is_scalar(type)) {
+		wbAbiLeaf leaf = {base_offset, type};
+		array_add(leaves, leaf);
+		return true;
+	}
+	Type *bt = base_type(type);
+	switch (bt->kind) {
+	case Type_Struct:
+		if (bt->Struct.is_raw_union) {
+			return false;
+		}
+		for_array(i, bt->Struct.fields) {
+			Type *ft = nullptr;
+			i64 offset = type_offset_of(bt, i, &ft);
+			if (!wb_copy_leaves(ft, base_offset+offset, leaves)) {
+				return false;
+			}
+		}
+		return true;
+	case Type_Array:
+	case Type_EnumeratedArray:
+	case Type_Matrix: {
+		// Matrices are arrays of their element type (the padding is copied as a gap)
+		Type *elem = bt->kind == Type_Array ? bt->Array.elem : bt->kind == Type_EnumeratedArray ? bt->EnumeratedArray.elem : bt->Matrix.elem;
+		i64 elem_size = type_size_of(elem);
+		i64 count = bt->kind == Type_Array ? bt->Array.count : bt->kind == Type_EnumeratedArray ? bt->EnumeratedArray.count : matrix_type_total_internal_elems(bt);
+		if (elem_size == 0) {
+			return true;
+		}
+		for (i64 i = 0; i < count; i++) {
+			if (!wb_copy_leaves(elem, base_offset + i*elem_size, leaves)) {
+				return false;
+			}
+		}
+		return true;
+	}
+	case Type_Map:
+		return t_raw_map != nullptr && wb_copy_leaves(t_raw_map, base_offset, leaves);
+	case Type_DynamicArray: {
+		// Raw_Dynamic_Array: data, len, cap, allocator{procedure, data}
+		i64 ps = build_context.ptr_size;
+		wbAbiLeaf data = {base_offset,        t_rawptr};
+		wbAbiLeaf len  = {base_offset + ps,   t_int};
+		wbAbiLeaf cap  = {base_offset + 2*ps, t_int};
+		wbAbiLeaf ap   = {base_offset + 3*ps, t_rawptr};
+		wbAbiLeaf ad   = {base_offset + 4*ps, t_rawptr};
+		array_add(leaves, data);
+		array_add(leaves, len);
+		array_add(leaves, cap);
+		array_add(leaves, ap);
+		array_add(leaves, ad);
+		return true;
+	}
+	case Type_Slice: case Type_Proc: case Type_Pointer: case Type_MultiPointer: case Type_SoaPointer:
+	case Type_Basic:
+		if (is_type_string(bt) || is_type_any(bt) || bt->kind == Type_Slice) {
+			wbAbiLeaf data = {base_offset, t_rawptr};
+			wbAbiLeaf len  = {base_offset + build_context.int_size, is_type_any(bt) ? t_typeid : t_int};
+			array_add(leaves, data);
+			array_add(leaves, len);
+			return true;
+		}
+		if (is_type_complex(bt) || is_type_quaternion(bt)) {
+			Type *elem = base_complex_elem_type(bt);
+			i64 elem_size = type_size_of(elem);
+			for (i64 i = 0; i < type_size_of(bt)/elem_size; i++) {
+				wbAbiLeaf leaf = {base_offset + i*elem_size, elem};
+				array_add(leaves, leaf);
+			}
+			return true;
+		}
+		return false;
+	default:
+		return false;
+	}
+}
+
+// Copies a value of `type` leaf by leaf: loads and stores of the same width as the
+// accesses of the surrounding code let the engine forward stores to later loads
+// (and CPUs avoid store forwarding stalls), which the raw chunk copy defeats.
+// The gaps between leaves (padding) are copied as raw bytes.
+gb_internal void wb_emit_copy(wbProcedure *p, u32 dst_base, i32 dst_offset, u32 src_base, i32 src_offset, Type *type) {
+	i64 size = type_size_of(type);
+	if (size <= 0 || (dst_base == src_base && dst_offset == src_offset)) {
+		return;
+	}
+	if (size > WB_INLINE_COPY_MAX) {
+		wb_emit_copy(p, dst_base, dst_offset, src_base, src_offset, size);
+		return;
+	}
+	auto leaves = array_make<wbAbiLeaf>(temporary_allocator(), 0, 16);
+	if (!wb_copy_leaves(type, 0, &leaves)) {
+		wb_emit_copy(p, dst_base, dst_offset, src_base, src_offset, size);
+		return;
+	}
+	i64 done = 0;
+	for (wbAbiLeaf const &leaf : leaves) {
+		if (leaf.offset > done) {
+			wb_emit_copy(p, dst_base, dst_offset + cast(i32)done, src_base, src_offset + cast(i32)done, leaf.offset - done);
+		}
+		i64 leaf_size = type_size_of(leaf.type);
+		u32 doff = wb_push_memarg_base(p, dst_base, dst_offset + cast(i32)leaf.offset);
+		u32 soff = wb_push_memarg_base(p, src_base, src_offset + cast(i32)leaf.offset);
+		wb_emit_load_op(p, leaf.type, soff);
+		wb_emit_store_op(p, leaf.type, doff);
+		done = leaf.offset + leaf_size;
+	}
+	if (size > done) {
+		wb_emit_copy(p, dst_base, dst_offset + cast(i32)done, src_base, src_offset + cast(i32)done, size - done);
+	}
 }
 
 gb_internal void wb_emit_zero(wbProcedure *p, u32 base, i32 offset, i64 size) {
 	if (size <= 0) {
 		return;
 	}
-	wb_push_address(p, base, offset);
-	wb_i32_const(p, 0);
-	wb_i32_const(p, cast(i32)size);
-	wb_memory_fill(p);
+	if (size > WB_INLINE_COPY_MAX) {
+		wb_push_address(p, base, offset);
+		wb_i32_const(p, 0);
+		wb_i32_const(p, cast(i32)size);
+		wb_memory_fill(p);
+		return;
+	}
+	for (i64 done = 0; done < size; ) {
+		i64 rem = size - done;
+		i64 chunk = rem >= 8 ? 8 : rem >= 4 ? 4 : rem >= 2 ? 2 : 1;
+		u32 doff = wb_push_memarg_base(p, base, offset + cast(i32)done);
+		if (chunk == 8) {
+			wb_i64_const(p, 0);
+		} else {
+			wb_i32_const(p, 0);
+		}
+		switch (chunk) {
+		case 8: wb_memarg(p, wbOp_i64_store,   doff, 1); break;
+		case 4: wb_memarg(p, wbOp_i32_store,   doff, 1); break;
+		case 2: wb_memarg(p, wbOp_i32_store16, doff, 1); break;
+		case 1: wb_memarg(p, wbOp_i32_store8,  doff, 1); break;
+		}
+		done += chunk;
+	}
+}
+
+// Zeroes a value of `type` leaf by leaf (see wb_emit_copy)
+gb_internal void wb_emit_zero(wbProcedure *p, u32 base, i32 offset, Type *type) {
+	i64 size = type_size_of(type);
+	if (size <= 0) {
+		return;
+	}
+	auto leaves = array_make<wbAbiLeaf>(temporary_allocator(), 0, 16);
+	if (size > WB_INLINE_COPY_MAX || !wb_copy_leaves(type, 0, &leaves)) {
+		wb_emit_zero(p, base, offset, size);
+		return;
+	}
+	i64 done = 0;
+	for (wbAbiLeaf const &leaf : leaves) {
+		if (leaf.offset > done) {
+			wb_emit_zero(p, base, offset + cast(i32)done, leaf.offset - done);
+		}
+		wbValue zero = {};
+		zero.kind = wbValue_Const;
+		zero.vt   = wb_valtype_of(leaf.type);
+		zero.type = leaf.type;
+		wb_emit_store(p, base, offset + cast(i32)leaf.offset, zero, leaf.type);
+		done = leaf.offset + type_size_of(leaf.type);
+	}
+	if (size > done) {
+		wb_emit_zero(p, base, offset + cast(i32)done, size - done);
+	}
 }
 
 // Addresses
@@ -1028,7 +1252,7 @@ gb_internal wbValue wb_addr_load(wbProcedure *p, wbAddr addr) {
 		i64 elem_size = type_size_of(elem);
 		wbAddr tmp = wb_add_temp(p, addr.type);
 		for (u8 i = 0; i < addr.swizzle_count; i++) {
-			wb_emit_copy(p, tmp.index, tmp.offset + cast(i32)(i*elem_size), addr.index, addr.offset + cast(i32)(addr.swizzle_indices[i]*elem_size), elem_size);
+			wb_emit_copy(p, tmp.index, tmp.offset + cast(i32)(i*elem_size), addr.index, addr.offset + cast(i32)(addr.swizzle_indices[i]*elem_size), elem);
 		}
 		return wb_value_memory(tmp.index, tmp.offset, addr.type);
 	}
@@ -1054,7 +1278,7 @@ gb_internal void wb_addr_store(wbProcedure *p, wbAddr addr, wbValue v) {
 		break;
 	case wbAddr_Memory:
 		if (v.kind == wbValue_Memory) {
-			wb_emit_copy(p, addr.index, addr.offset, v.index, v.offset, type_size_of(addr.type));
+			wb_emit_copy(p, addr.index, addr.offset, v.index, v.offset, addr.type);
 		} else {
 			wb_emit_store(p, addr.index, addr.offset, v, addr.type);
 		}
@@ -1075,7 +1299,7 @@ gb_internal void wb_addr_store(wbProcedure *p, wbAddr addr, wbValue v) {
 		i64 elem_size = type_size_of(elem);
 		v = wb_value_copy(p, v);
 		for (u8 i = 0; i < addr.swizzle_count; i++) {
-			wb_emit_copy(p, addr.index, addr.offset + cast(i32)(addr.swizzle_indices[i]*elem_size), v.index, v.offset + cast(i32)(i*elem_size), elem_size);
+			wb_emit_copy(p, addr.index, addr.offset + cast(i32)(addr.swizzle_indices[i]*elem_size), v.index, v.offset + cast(i32)(i*elem_size), elem);
 		}
 		break;
 	}
@@ -1108,7 +1332,7 @@ gb_internal void wb_addr_zero(wbProcedure *p, wbAddr addr) {
 			zero.type = addr.type;
 			wb_emit_store(p, addr.index, addr.offset, zero, addr.type);
 		} else {
-			wb_emit_zero(p, addr.index, addr.offset, type_size_of(addr.type));
+			wb_emit_zero(p, addr.index, addr.offset, addr.type);
 		}
 		break;
 	case wbAddr_Map:
@@ -1190,7 +1414,7 @@ gb_internal wbValue wb_value_copy(wbProcedure *p, wbValue v) {
 		return wb_value_to_local(p, v);
 	}
 	wbAddr tmp = wb_add_temp(p, v.type);
-	wb_emit_copy(p, tmp.index, tmp.offset, v.index, v.offset, type_size_of(v.type));
+	wb_emit_copy(p, tmp.index, tmp.offset, v.index, v.offset, v.type);
 	return wb_value_memory(tmp.index, tmp.offset, v.type);
 }
 
@@ -1963,7 +2187,7 @@ gb_internal wbAddr wb_context_for_write(wbProcedure *p) {
 	wbContextData next = {};
 	next.addr = wb_add_temp(p, t_context);
 	next.scope_index = p->scopes.count;
-	wb_emit_copy(p, next.addr.index, next.addr.offset, old.index, old.offset, type_size_of(t_context));
+	wb_emit_copy(p, next.addr.index, next.addr.offset, old.index, old.offset, t_context);
 	array_add(&p->context_stack, next);
 	return next.addr;
 }
@@ -1999,30 +2223,32 @@ gb_internal wbAddr wb_add_variable(wbProcedure *p, Entity *e, Ast *init_expr) {
 	return addr;
 }
 
-gb_internal void wb_emit_epilogue(wbProcedure *p) {
-	wb_local_get(p, p->old_sp_local);
-	wb_global_set(p, p->module->global_stack_pointer);
-}
-
 gb_internal void wb_finish_procedure(wbProcedure *p) {
-	// Frame setup: sp = old_sp - frame_size (kept 16 byte aligned)
-	wbBuffer *saved = &p->code;
+	wb_optimize_procedure(p);
+
+	// Frame setup: sp = old_sp - frame_size (kept 16 byte aligned). The
+	// optimizer has removed the epilogues of procedures without a frame.
+	// The prologue is not part of the instruction stream (the procedure may
+	// be finished again after inlining).
 	wbBuffer code = p->code;
+	isize instr_count = p->instrs.count;
 	p->code = p->prologue;
-	wb_global_get(p, p->module->global_stack_pointer);
+	p->code.data.count = 0;
 	if (p->frame_size > 0) {
 		u32 size = (p->frame_size + 15) & ~15u;
+		wb_global_get(p, p->module->global_stack_pointer);
 		wb_local_tee(p, p->old_sp_local);
 		wb_i32_const(p, cast(i32)size);
 		wb_op(p, wbOp_i32_sub);
 		wb_local_tee(p, p->fp_local);
 		wb_global_set(p, p->module->global_stack_pointer);
-	} else {
+	} else if (p->uses_alloca) {
+		wb_global_get(p, p->module->global_stack_pointer);
 		wb_local_set(p, p->old_sp_local);
 	}
 	p->prologue = p->code;
 	p->code = code;
-	gb_unused(saved);
+	p->instrs.count = instr_count;
 }
 
 gb_internal void wb_build_procedure(wbProcedure *p) {
@@ -2129,6 +2355,12 @@ gb_internal void wb_build_procedure(wbProcedure *p) {
 		break;
 	case wbProcGen_Equal:
 		wb_build_equal_body(p);
+		break;
+	case wbProcGen_MapGet:
+		wb_build_map_get_body(p);
+		break;
+	case wbProcGen_MapSet:
+		wb_build_map_set_body(p);
 		break;
 	case wbProcGen_TestMain:
 		wb_build_test_main_body(p);
@@ -2428,6 +2660,10 @@ gb_internal bool wb_generate_code(CheckerInfo *info) {
 	if (m->error_count > 0) {
 		return false;
 	}
+
+	TIME_SECTION("wasm backend: inline");
+	wb_inline_procedures(m);
+	wb_gc_procedures(m);
 
 	wb_link_resolve_imports(m);
 	if (m->error_count > 0) {

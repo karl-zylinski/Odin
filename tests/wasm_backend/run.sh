@@ -71,8 +71,9 @@ for pkg in */; do
 		if ! "$ODIN" build "$pkg" -target:"$WASI_TARGET" -backend:wasm -out:"$new"; then
 			echo "FAIL $pkg: wasm backend build failed"; failures=$((failures+1)); total=$((total+1)); continue
 		fi
-		expected=$(wasmtime run --preload env="$HOST_ENV" "$ref" 2>&1)
-		actual=$(wasmtime run --preload env="$HOST_ENV" "$new" 2>&1)
+		# (a trap ends the comparison: wasmtime's report of it names functions and offsets)
+		expected=$(wasmtime run --preload env="$HOST_ENV" "$ref" 2>&1 | sed '/^Error: failed to run main module/,$d')
+		actual=$(wasmtime run --preload env="$HOST_ENV" "$new" 2>&1 | sed '/^Error: failed to run main module/,$d')
 		total=$((total+1))
 		if [ "$expected" != "$actual" ]; then
 			echo "FAIL $pkg: output differs"
