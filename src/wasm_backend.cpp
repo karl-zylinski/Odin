@@ -2433,6 +2433,7 @@ gb_internal bool wb_generate_code(CheckerInfo *info) {
 	if (m->error_count > 0) {
 		return false;
 	}
+	wb_link_gc(m);
 
 	TIME_SECTION("wasm backend: write");
 	u32 index = 0;

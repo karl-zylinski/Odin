@@ -401,6 +401,9 @@ struct wbProcedure {
 	bool       is_raw_body;  // linked from an object file: `code` holds the complete function body
 	bool       failed;
 	wbProcedure *alias;      // foreign procedure resolved to a defined function by the linker
+	bool       link_created; // `env` import made by the linker for a symbol no object defines
+	bool       link_live;    // reachable from the program (wasm_backend_link.cpp, object functions and imports)
+	Array<wbProcedure *> link_refs; // object functions: the functions its relocations name
 	wbProcGen  gen;
 	Type *     gen_type;    // the type a hasher/equal procedure is generated for
 	Ast *      curr_stmt;   // statement being lowered (for #caller_location of implicit runtime calls)

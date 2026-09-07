@@ -11,7 +11,9 @@
 // The object's imports are resolved against the procedures of this module by
 // link name (vendor:libc-shim provides malloc, memcpy, ... that way), against
 // the other objects, and finally become `env` imports. The Odin foreign
-// procedures declared against the object are aliased to its functions.
+// procedures declared against the object are aliased to its functions. Only
+// the object functions reachable from those aliases are written out
+// (wb_link_gc), like wasm-ld's --gc-sections.
 
 enum wbSymbolKind : u8 {
 	wbSym_Function = 0,
@@ -594,6 +596,7 @@ gb_internal wbProcedure *wb_link_env_import(wbModule *m, StringMap<wbProcedure *
 	}
 	p->import_module = str_lit("env");
 	p->import_name   = name;
+	p->link_created  = true;
 	array_add(&m->imports, p);
 	string_map_set(env_imports, name, p);
 	return p;
@@ -930,6 +933,96 @@ gb_internal void wb_link_resolve_imports(wbModule *m) {
 	}
 }
 
+// The defined function of `obj` whose body contains the code offset
+gb_internal wbObjFunction *wb_link_function_at(wbObject *obj, u32 offset) {
+	isize lo = 0;
+	isize hi = obj->defined.count;
+	while (lo < hi) {
+		isize mid = lo + (hi-lo)/2;
+		wbObjFunction *g = &obj->defined[mid];
+		if (offset < g->body_start) {
+			hi = mid;
+		} else if (offset >= g->body_end) {
+			lo = mid+1;
+		} else {
+			return g;
+		}
+	}
+	return nullptr;
+}
+
+// Drops the object functions nothing reaches (what --gc-sections does in
+// wasm-ld): an object brings all its functions along, but only the ones the
+// Odin foreign procedures resolve to, and whatever those name through their
+// relocations, end up in the module. The data segments are kept whole, so the
+// functions they hold the addresses of count as reached. Host imports that the
+// objects declare (fputc, ...) are only kept while a reached function calls
+// them, which is why a program that never prints does not need them.
+gb_internal void wb_link_gc(wbModule *m) {
+	if (m->objects.count == 0) {
+		return;
+	}
+	auto worklist = array_make<wbProcedure *>(m->allocator, 0, 256);
+	auto reach = [&](wbProcedure *p) {
+		if (p != nullptr && !p->link_live) {
+			p->link_live = true;
+			if (p->is_raw_body) {
+				array_add(&worklist, p);
+			}
+		}
+	};
+	for (wbObject *obj : m->objects) {
+		if (obj->failed) {
+			continue;
+		}
+		for (wbObjReloc const &rel : obj->code_relocs) {
+			if (rel.type != wbReloc_FunctionIndexLEB && rel.type != wbReloc_TableIndexSLEB && rel.type != wbReloc_TableIndexI32) {
+				continue;
+			}
+			wbObjFunction *f = wb_link_function_at(obj, rel.offset);
+			if (f == nullptr || rel.index >= cast(u32)obj->symbols.count) {
+				continue;
+			}
+			wbProcedure *target = obj->symbols[rel.index].proc;
+			if (target != nullptr) {
+				if (f->proc->link_refs.data == nullptr) {
+					array_init(&f->proc->link_refs, m->allocator, 0, 8);
+				}
+				array_add(&f->proc->link_refs, target);
+			}
+		}
+		for (wbObjReloc const &rel : obj->data_relocs) {
+			if ((rel.type == wbReloc_TableIndexSLEB || rel.type == wbReloc_TableIndexI32) && rel.index < cast(u32)obj->symbols.count) {
+				reach(obj->symbols[rel.index].proc);
+			}
+		}
+	}
+	for (wbProcedure *p : m->aliased) {
+		reach(p->alias);
+	}
+	while (worklist.count > 0) {
+		wbProcedure *p = array_pop(&worklist);
+		for (wbProcedure *target : p->link_refs) {
+			reach(target);
+		}
+	}
+
+	isize kept = 0;
+	for (wbProcedure *p : m->procedures) {
+		if (!p->is_raw_body || p->link_live) {
+			m->procedures[kept++] = p;
+		}
+	}
+	m->procedures.count = kept;
+	kept = 0;
+	for (wbProcedure *p : m->imports) {
+		if (!p->link_created || p->link_live) {
+			m->imports[kept++] = p;
+		}
+	}
+	m->imports.count = kept;
+}
+
 // Rewrites the function/table/type indices and data addresses in the linked
 // code and data. Called once the function indices are final.
 gb_internal void wb_link_apply_relocs(wbModule *m) {
@@ -941,12 +1034,9 @@ gb_internal void wb_link_apply_relocs(wbModule *m) {
 			continue;
 		}
 		for (wbObjReloc const &rel : obj->code_relocs) {
-			wbObjFunction *f = nullptr;
-			for (wbObjFunction &g : obj->defined) {
-				if (rel.offset >= g.body_start && rel.offset < g.body_end) {
-					f = &g;
-					break;
-				}
+			wbObjFunction *f = wb_link_function_at(obj, rel.offset);
+			if (f != nullptr && !f->proc->link_live) {
+				continue; // dropped by wb_link_gc
 			}
 			u32 value = 0;
 			if (f == nullptr || !wb_link_reloc_value(m, obj, rel, &value)) {
