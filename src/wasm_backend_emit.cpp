@@ -162,6 +162,13 @@ gb_internal void wb_memory_fill(wbProcedure *p) {
 	wb_byte(&p->code, 0x00);
 }
 
+// Saturating float to integer truncation (the plain `trunc` opcodes trap on
+// out of range values; Odin leaves the result of such conversions undefined)
+gb_internal void wb_trunc_sat(wbProcedure *p, bool to_i64, bool from_f64, bool is_signed) {
+	wb_byte(&p->code, 0xfc);
+	wb_uleb(&p->code, (to_i64 ? 4 : 0) + (from_f64 ? 2 : 0) + (is_signed ? 0 : 1));
+}
+
 gb_internal void wb_call_indirect(wbProcedure *p, u32 type_index) {
 	wb_byte(&p->code, wbOp_call_indirect);
 	wb_uleb(&p->code, type_index);

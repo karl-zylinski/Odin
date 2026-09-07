@@ -369,6 +369,7 @@ enum wbProcGen : u8 {
 	wbProcGen_CleanupRuntime, // `__$cleanup_runtime`: @(fini) procedures
 	wbProcGen_Hasher,         // `__$hasher$$T`: map key hasher for `gen_type` (see wb_hasher_proc_for_type)
 	wbProcGen_Equal,          // `__$equal$$T`: map key equality for `gen_type`
+	wbProcGen_TestMain,       // `_start` for `odin test`: runs the runtime startup, then testing.runner
 };
 
 struct wbModule;
@@ -392,6 +393,7 @@ struct wbProcedure {
 	u32        table_index; // index in the function table, 0 if not referenced as a value
 
 	bool       is_foreign;
+	bool       is_llvm_intrinsic; // foreign `llvm.*` procedure, lowered at the call site
 	bool       is_export;
 	bool       failed;
 	wbProcGen  gen;
@@ -411,6 +413,8 @@ struct wbProcedure {
 	Array<wbValType> results;
 
 	PtrMap<Entity *, wbAddr> variables; // Odin variable -> storage
+	PtrMap<Ast *, wbValue> selector_values; // `x->f(..)` is `x.f(x, ..)`: x evaluated once (StateFlag_SelectorCallExpr)
+	PtrMap<Ast *, wbAddr>  selector_addrs;
 	PtrSet<Entity *> addressed;         // variables whose address is taken
 	Array<wbAddr> result_addrs;         // named results (empty otherwise)
 
@@ -454,6 +458,7 @@ struct wbModule {
 	Array<u8> data;
 	u32       data_base;
 	PtrMap<Entity *, u32> globals;       // global variable -> absolute address
+	StringMap<wbProcedure *> libm_imports; // host math procedures (`env` module) backing `llvm.*` intrinsics
 	StringMap<u32>        string_bytes;  // interned NUL-terminated string data
 	StringMap<u32>        string_values; // interned `string` {data, len} constants
 	StringMap<u32>        string16_values; // interned `string16` {data, len} constants (keyed by UTF-8 source)

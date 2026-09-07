@@ -133,6 +133,9 @@ gb_internal wbValue wb_emit_comp_against_nil(wbProcedure *p, Ast *node, wbValue 
 gb_internal wbAddr  wb_addr_from_pointer(wbProcedure *p, wbValue ptr, Type *elem_type);
 gb_internal wbValue wb_emit_arith(wbProcedure *p, Ast *node, TokenKind op, wbValue left, wbValue right, Type *operand_type, Type *result_type);
 gb_internal wbValue wb_emit_conv_to_simd(wbProcedure *p, wbValue v, Type *dst);
+gb_internal wbValue wb_emit_byte_swap(wbProcedure *p, wbValue x, Type *type);
+gb_internal wbValue wb_emit_to_platform_endian(wbProcedure *p, wbValue x);
+gb_internal wbValue wb_emit_from_platform_endian(wbProcedure *p, wbValue x, Type *type);
 gb_internal wbValue wb_build_simd_builtin(wbProcedure *p, Ast *expr, BuiltinProcId id);
 gb_internal wbValue wb_emit_runtime_call(wbProcedure *p, char const *name, Array<wbValue> const &args);
 gb_internal wbAddr  wb_map_elem_addr(wbProcedure *p, wbAddr map, Type *map_type, wbValue key, Type *result_type);
@@ -384,6 +387,77 @@ gb_internal wbValue wb_emit_any_cast(wbProcedure *p, Ast *node, wbValue value, T
 	return wb_value_memory(res.index, res.offset, tuple);
 }
 
+// `&x.(T)` / `&x.(T), ok`: a pointer into the union or any's data rather than
+// a copy (lb_build_unary_and)
+gb_internal wbValue wb_build_unary_and_type_assertion(wbProcedure *p, Ast *expr, Ast *inner) {
+	ast_node(ta, TypeAssertion, inner);
+	TokenPos pos = ast_token(expr).pos;
+	Type *tv_type = type_of_expr(expr);
+	Type *type = type_of_expr(inner);
+	bool is_tuple = is_type_tuple(tv_type);
+	Type *ptr_type = is_tuple ? tv_type->Tuple.variables[0]->type : tv_type;
+	Type *ok_type  = is_tuple ? tv_type->Tuple.variables[1]->type : t_bool;
+
+	Type *et = type_of_expr(ta->expr);
+	wbAddr addr = {};
+	if (is_type_pointer(et)) {
+		wbValue ptr = wb_build_expr(p, ta->expr);
+		if (ptr.kind == wbValue_Invalid) {
+			return wb_value_invalid();
+		}
+		addr = wb_addr_from_pointer(p, ptr, type_deref(et));
+	} else {
+		addr = wb_build_addr(p, ta->expr);
+	}
+	if (addr.kind == wbAddr_Invalid) {
+		return wb_value_invalid();
+	}
+	addr = wb_value_to_addr(p, wb_addr_load(p, addr));
+	Type *t = type_deref(et);
+	wbValue value = wb_addr_load(p, addr);
+
+	wbValue cond = {};
+	wbValue data_ptr = {};
+	wbValue from_id = {};
+	if (is_type_union(t)) {
+		Type *src = base_type(t);
+		if (is_type_union_maybe_pointer(src)) {
+			cond = wb_emit_comp_against_nil(p, expr, value, true);
+		} else if (!wb_union_has_tag(src)) {
+			cond = wb_value_const_int(t_bool, 1);
+		} else {
+			wbValue tag = wb_emit_union_tag(p, expr, value);
+			cond = wb_emit_arith(p, expr, Token_CmpEq, tag, wb_const_union_tag(src, type), tag.type, t_bool);
+		}
+		data_ptr = wb_addr_get_ptr(p, addr, ptr_type);
+		from_id = wb_typeid(t);
+	} else if (is_type_any(t)) {
+		wbValue any_data = wb_addr_load(p, wb_addr_field(addr, 0));
+		from_id = wb_addr_load(p, wb_addr_field(addr, 1));
+		cond = wb_emit_arith(p, expr, Token_CmpEq, from_id, wb_typeid(type), t_typeid, t_bool);
+		data_ptr = wb_emit_conv(p, any_data, ptr_type);
+	} else {
+		wb_unsupported_type(p, expr, et);
+		return wb_value_invalid();
+	}
+	if (cond.kind == wbValue_Invalid || data_ptr.kind == wbValue_Invalid) {
+		return wb_value_invalid();
+	}
+	if (!is_tuple) {
+		wb_emit_type_assertion_check(p, cond, pos, from_id, wb_typeid(type), wb_emit_conv(p, data_ptr, t_rawptr));
+		return data_ptr;
+	}
+	// (ok ? ptr : nil, ok)
+	wbAddr res = wb_add_temp(p, tv_type);
+	wb_push(p, data_ptr);
+	wb_i32_const(p, 0);
+	wb_push(p, cond);
+	wb_op(p, wbOp_select);
+	wb_addr_store(p, wb_addr_field(res, 0), wb_pop_to_local(p, wbValType_i32, ptr_type));
+	wb_addr_store(p, wb_addr_field(res, 1), wb_emit_conv(p, cond, ok_type));
+	return wb_value_memory(res.index, res.offset, tv_type);
+}
+
 gb_internal wbValue wb_build_type_assertion(wbProcedure *p, Ast *expr) {
 	ast_node(ta, TypeAssertion, expr);
 	TokenPos pos = ast_token(expr).pos;
@@ -471,6 +545,17 @@ gb_internal wbValue wb_emit_conv(wbProcedure *p, wbValue v, Type *dst) {
 		return z;
 	}
 	wbValType svt = wb_valtype_of(src);
+
+	// Endian-specific scalars convert through their platform types
+	if (is_type_different_to_arch_endianness(src) || is_type_different_to_arch_endianness(dst)) {
+		if ((wb_is_int_class(core_type(src)) || is_type_float(core_type(src)) || is_type_bit_set(src)) &&
+		    (wb_is_int_class(core_type(dst)) || is_type_float(core_type(dst)) || is_type_bit_set(dst))) {
+			Type *platform_dst = is_type_different_to_arch_endianness(dst) ? integer_endian_type_to_platform_type(dst) : dst;
+			wbValue res = wb_emit_to_platform_endian(p, v);
+			res = wb_emit_conv(p, res, platform_dst);
+			return wb_emit_from_platform_endian(p, res, dst);
+		}
+	}
 
 	if (is_type_array_like(dst) && !is_type_array_like(src) && svt != wbValType_Invalid) {
 		// scalar -> [N]T splat (array arithmetic with a scalar operand)
@@ -607,6 +692,21 @@ gb_internal wbValue wb_emit_conv(wbProcedure *p, wbValue v, Type *dst) {
 		return wb_value_memory(res.index, res.offset, dst);
 	}
 
+	// 128-bit integers <-> floats go through the runtime's f64 helpers
+	if (wb_is_int128(src) && is_type_float(core_type(dst))) {
+		auto args = array_make<wbValue>(temporary_allocator(), 1);
+		args[0] = v;
+		wbValue f = wb_emit_runtime_call(p, is_type_unsigned(core_type(src)) ? "floattidf_unsigned" : "floattidf", args);
+		return wb_emit_conv(p, f, dst);
+	}
+	if (is_type_float(core_type(src)) && wb_is_int128(dst)) {
+		auto args = array_make<wbValue>(temporary_allocator(), 1);
+		args[0] = wb_emit_conv(p, v, t_f64);
+		wbValue i = wb_emit_runtime_call(p, is_type_unsigned(core_type(dst)) ? "fixunsdfti" : "fixdfti", args);
+		i.type = dst;
+		return i;
+	}
+
 	// 128-bit integers live in memory as two 64-bit words (little endian)
 	if (wb_is_int_class(core_type(src)) && wb_is_int_class(core_type(dst)) && (type_size_of(src) == 16) != (type_size_of(dst) == 16)) {
 		if (type_size_of(src) == 16) {
@@ -697,10 +797,17 @@ gb_internal wbValue wb_emit_conv(wbProcedure *p, wbValue v, Type *dst) {
 		return v;
 	}
 
-	if (src_int && dst_int && v.vt == dvt && type_size_of(cd) >= type_size_of(cs)) {
-		// Same representation and no narrowing: the bits are already correct
-		v.type = dst;
-		return v;
+	if (src_int && dst_int && v.vt == dvt) {
+		// Same representation. Values narrower than the wasm type are held
+		// sign/zero extended, so they need to be renormalized when narrowing
+		// or when the signedness changes (u8 128 -> i8 -128)
+		i64 ss = type_size_of(cs);
+		i64 ds = type_size_of(cd);
+		bool sub_width = ds < (dvt == wbValType_i64 ? 8 : 4);
+		if (ds >= ss && !(sub_width && wb_type_is_signed(cd) != wb_type_is_signed(cs))) {
+			v.type = dst;
+			return v;
+		}
 	}
 
 	wb_push(p, v);
@@ -712,10 +819,8 @@ gb_internal wbValue wb_emit_conv(wbProcedure *p, wbValue v, Type *dst) {
 			wb_op(p, wbOp_i32_wrap_i64);
 			wb_emit_normalize(p, dst);
 		} else if (v.vt == dvt) {
-			// Same representation: only narrow if the destination is smaller
-			if (type_size_of(cd) < type_size_of(cs)) {
-				wb_emit_normalize(p, dst);
-			}
+			// Same representation: narrowing or signedness change
+			wb_emit_normalize(p, dst);
 		} else {
 			goto unsupported;
 		}
@@ -733,14 +838,8 @@ gb_internal wbValue wb_emit_conv(wbProcedure *p, wbValue v, Type *dst) {
 		}
 	} else if (src_float && dst_int) {
 		bool dst_signed = wb_type_is_signed(cd);
-		if (v.vt == wbValType_f32 && dvt == wbValType_i32) {
-			wb_op(p, dst_signed ? wbOp_i32_trunc_f32_s : wbOp_i32_trunc_f32_u);
-		} else if (v.vt == wbValType_f64 && dvt == wbValType_i32) {
-			wb_op(p, dst_signed ? wbOp_i32_trunc_f64_s : wbOp_i32_trunc_f64_u);
-		} else if (v.vt == wbValType_f32 && dvt == wbValType_i64) {
-			wb_op(p, dst_signed ? wbOp_i64_trunc_f32_s : wbOp_i64_trunc_f32_u);
-		} else if (v.vt == wbValType_f64 && dvt == wbValType_i64) {
-			wb_op(p, dst_signed ? wbOp_i64_trunc_f64_s : wbOp_i64_trunc_f64_u);
+		if ((v.vt == wbValType_f32 || v.vt == wbValType_f64) && (dvt == wbValType_i32 || dvt == wbValType_i64)) {
+			wb_trunc_sat(p, dvt == wbValType_i64, v.vt == wbValType_f64, dst_signed);
 		} else {
 			goto unsupported;
 		}
@@ -1359,6 +1458,12 @@ gb_internal wbAddr wb_build_addr_index(wbProcedure *p, Ast *expr) {
 		wb_emit_bounds_check(p, ast_token(ie->index), index, wb_value_const_int(t_int, count));
 		return wb_emit_elem_addr(p, base.index, base.offset, index, elem_type);
 	}
+	case Type_FixedCapacityDynamicArray: {
+		// the elements are in place, checked against the current length
+		wbValue len = wb_emit_load(p, base.index, base.offset + cast(i32)type_offset_of(bt, 1, nullptr), t_int);
+		wb_emit_bounds_check(p, ast_token(ie->index), index, len);
+		return wb_emit_elem_addr(p, base.index, base.offset, index, elem_type);
+	}
 	case Type_Slice:
 	case Type_DynamicArray:
 	case Type_Basic: {
@@ -1380,8 +1485,27 @@ gb_internal wbAddr wb_build_addr_index(wbProcedure *p, Ast *expr) {
 	return invalid;
 }
 
+gb_internal wbAddr wb_build_addr_internal(wbProcedure *p, Ast *expr);
+
 gb_internal wbAddr wb_build_addr(wbProcedure *p, Ast *expr) {
 	expr = unparen_expr(expr);
+	if (expr->state_flags & StateFlag_SelectorCallExpr) {
+		// see wb_build_expr
+		wbAddr *pa = map_get(&p->selector_addrs, expr);
+		if (pa != nullptr) {
+			wbAddr res = *pa;
+			map_remove(&p->selector_addrs, expr);
+			return res;
+		}
+	}
+	wbAddr addr = wb_build_addr_internal(p, expr);
+	if (expr->state_flags & StateFlag_SelectorCallExpr) {
+		map_set(&p->selector_addrs, expr, addr);
+	}
+	return addr;
+}
+
+gb_internal wbAddr wb_build_addr_internal(wbProcedure *p, Ast *expr) {
 	wbAddr invalid = {};
 
 	switch (expr->kind) {
@@ -1496,6 +1620,31 @@ gb_internal void wb_build_compound_lit_array_elems(wbProcedure *p, Ast *expr, Sl
 	}
 }
 
+// The number of elements an array-like literal initializes (its highest index + 1)
+gb_internal i64 wb_compound_lit_elem_count(Slice<Ast *> const &elems, i64 min_value) {
+	i64 index = 0;
+	i64 max_index = 0;
+	for (Ast *elem : elems) {
+		if (elem->kind == Ast_FieldValue) {
+			ast_node(fv, FieldValue, elem);
+			if (is_ast_range(fv->field)) {
+				ast_node(ie, BinaryExpr, fv->field);
+				i64 hi = exact_value_to_i64(ie->right->tav.value) - min_value;
+				if (ie->op.kind != Token_RangeHalf) {
+					hi += 1;
+				}
+				index = hi;
+			} else {
+				index = exact_value_to_i64(fv->field->tav.value) - min_value + 1;
+			}
+		} else {
+			index++;
+		}
+		max_index = gb_max(max_index, index);
+	}
+	return max_index;
+}
+
 // Populates `dst` (of the literal's type) from a non-constant compound literal
 gb_internal void wb_build_compound_lit(wbProcedure *p, Ast *expr, wbAddr dst) {
 	ast_node(cl, CompoundLit, expr);
@@ -1562,8 +1711,39 @@ gb_internal void wb_build_compound_lit(wbProcedure *p, Ast *expr, wbAddr dst) {
 		}
 		return;
 	}
+	case Type_BitField: {
+		// Fields are named or positional, stored through bit field addresses
+		for_array(i, cl->elems) {
+			Ast *elem = cl->elems[i];
+			Ast *value_expr = elem;
+			i32 index = cast(i32)i;
+			if (elem->kind == Ast_FieldValue) {
+				ast_node(fv, FieldValue, elem);
+				Selection sel = lookup_field(bt, fv->field->Ident.interned, false);
+				GB_ASSERT(sel.entity != nullptr && sel.index.count == 1);
+				index = sel.index[0];
+				value_expr = fv->value;
+			}
+			wbAddr field_addr = dst;
+			field_addr.kind       = wbAddr_BitField;
+			field_addr.type       = bt->BitField.fields[index]->type;
+			field_addr.bit_size   = bt->BitField.bit_sizes[index];
+			field_addr.bit_offset = cast(i32)bt->BitField.bit_offsets[index];
+			wb_addr_store(p, field_addr, wb_emit_conv(p, wb_build_expr(p, value_expr), field_addr.type));
+		}
+		return;
+	}
 	case Type_Array:
 		wb_build_compound_lit_array_elems(p, expr, cl->elems, dst, bt->Array.elem);
+		return;
+	case Type_SimdVector:
+		// laid out like `[N]T` (see wasm_backend_simd.cpp)
+		wb_build_compound_lit_array_elems(p, expr, cl->elems, dst, bt->SimdVector.elem);
+		return;
+	case Type_FixedCapacityDynamicArray:
+		// [dynamic; N]T: {data: [N]T, len: int}
+		wb_build_compound_lit_array_elems(p, expr, cl->elems, dst, bt->FixedCapacityDynamicArray.elem);
+		wb_addr_store(p, wb_addr_offset(dst, type_offset_of(bt, 1, nullptr), t_int), wb_value_const_int(t_int, wb_compound_lit_elem_count(cl->elems)));
 		return;
 	case Type_EnumeratedArray:
 		wb_build_compound_lit_array_elems(p, expr, cl->elems, dst, bt->EnumeratedArray.elem, exact_value_to_i64(*bt->EnumeratedArray.min_value));
@@ -1645,6 +1825,8 @@ gb_internal void wb_build_compound_lit(wbProcedure *p, Ast *expr, wbAddr dst) {
 	case Type_BitSet: {
 		// res |= 1 << (elem - lower) for each (runtime) element
 		Type *it = bit_set_to_int(bt);
+		Type *set_type = it;
+		it = integer_endian_type_to_platform_type(it);
 		wbValType vt = wb_valtype_of(it);
 		if (vt != wbValType_i32 && vt != wbValType_i64) {
 			wb_unsupported_type(p, expr, type);
@@ -1682,7 +1864,7 @@ gb_internal void wb_build_compound_lit(wbProcedure *p, Ast *expr, wbAddr dst) {
 			}
 			wb_local_set(p, res);
 		}
-		wb_emit_store(p, dst.index, dst.offset, wb_value_local(res, vt, it), it);
+		wb_emit_store(p, dst.index, dst.offset, wb_emit_from_platform_endian(p, wb_value_local(res, vt, it), set_type), set_type);
 		return;
 	}
 	default:
@@ -1704,6 +1886,9 @@ gb_internal wbValue wb_build_unary_expr(wbProcedure *p, Ast *expr) {
 		// &x
 		Ast *inner = unparen_expr(ue->expr);
 		wbAddr addr = {};
+		if (inner->kind == Ast_TypeAssertion) {
+			return wb_build_unary_and_type_assertion(p, expr, inner);
+		}
 		if (inner->kind == Ast_CompoundLit && wb_is_startup_proc(p)) {
 			// `x := &T{...}` at file scope: the literal must outlive the
 			// initializer, so it gets static storage (lb_add_global_generated_from_procedure)
@@ -1781,6 +1966,10 @@ gb_internal wbValue wb_build_unary_expr(wbProcedure *p, Ast *expr) {
 	x = wb_emit_conv(p, x, type);
 	if (x.kind == wbValue_Invalid) {
 		return x;
+	}
+	if (ue->op.kind == Token_Sub && is_type_different_to_arch_endianness(type)) {
+		// negate as the platform type
+		return wb_emit_arith(p, expr, Token_Sub, wb_const(p, expr, type, exact_value_i64(0)), x, type, type);
 	}
 
 	switch (ue->op.kind) {
@@ -2380,8 +2569,46 @@ gb_internal wbValue wb_emit_arith(wbProcedure *p, Ast *node, TokenKind op, wbVal
 	if (left.kind == wbValue_Invalid || right.kind == wbValue_Invalid) {
 		return wb_value_invalid();
 	}
+	// Endian-specific operands are computed on as their platform types; the
+	// bitwise operations (and bit_sets, which only use them) are byte order agnostic
+	if (is_type_different_to_arch_endianness(operand_type) && !is_type_bit_set(operand_type)) {
+		switch (op) {
+		case Token_And: case Token_Or: case Token_Xor: case Token_AndNot:
+			break;
+		default: {
+			Type *platform_operand = integer_endian_type_to_platform_type(operand_type);
+			Type *platform_result = is_type_different_to_arch_endianness(result_type) ? integer_endian_type_to_platform_type(result_type) : result_type;
+			left  = wb_emit_to_platform_endian(p, left);
+			right = wb_emit_to_platform_endian(p, right);
+			wbValue res = wb_emit_arith(p, node, op, left, right, platform_operand, platform_result);
+			return wb_emit_from_platform_endian(p, res, result_type);
+		}
+		}
+	}
 	if (is_type_matrix(left.type) || is_type_matrix(right.type)) {
 		return wb_emit_arith_matrix(p, node, op, left, right, result_type, false);
+	}
+	if (wb_is_comparison(op) && (is_type_cstring(operand_type) || is_type_cstring16(operand_type))) {
+		// C strings compare by content, except against nil (a plain pointer compare)
+		bool against_nil = (left.kind == wbValue_Const && left.i == 0) || (right.kind == wbValue_Const && right.i == 0);
+		if (!against_nil) {
+			char const *name = nullptr;
+			bool is16 = is_type_cstring16(operand_type);
+			switch (op) {
+			case Token_CmpEq: name = is16 ? "cstring16_eq" : "cstring_eq"; break;
+			case Token_NotEq: name = is16 ? "cstring16_ne" : "cstring_ne"; break;
+			case Token_Lt:    name = is16 ? "cstring16_lt" : "cstring_lt"; break;
+			case Token_Gt:    name = is16 ? "cstring16_gt" : "cstring_gt"; break;
+			case Token_LtEq:  name = is16 ? "cstring16_le" : "cstring_le"; break;
+			case Token_GtEq:  name = is16 ? "cstring16_ge" : "cstring_ge"; break;
+			}
+			GB_ASSERT(name != nullptr);
+			auto args = array_make<wbValue>(temporary_allocator(), 0, 2);
+			array_add(&args, wb_emit_conv(p, left,  is16 ? t_cstring16 : t_cstring));
+			array_add(&args, wb_emit_conv(p, right, is16 ? t_cstring16 : t_cstring));
+			wbValue res = wb_emit_runtime_call(p, name, args);
+			return wb_emit_conv(p, res, result_type);
+		}
 	}
 	if (is_type_array_like(operand_type) && !wb_is_comparison(op)) {
 		return wb_emit_conv(p, wb_emit_arith_array(p, node, op, left, right, operand_type), result_type);
@@ -2771,11 +2998,14 @@ gb_internal wbValue wb_build_in_expr(wbProcedure *p, Ast *expr) {
 		return wb_value_invalid();
 	}
 	Type *it = bit_set_to_int(rt);
+	// endian-specific sets are tested as their platform integer
+	right.type = it;
+	right = wb_emit_to_platform_endian(p, right);
+	it = right.type;
 	wbValType vt = wb_valtype_of(it);
 	if (wb_is_int128(it)) {
 		// ((set >> (elem-lower)) & 1) != 0, on the low word after the shift
 		right = wb_value_copy(p, right);
-		right.type = it;
 		wbValue elem = wb_emit_conv(p, wb_build_expr(p, be->left), t_i64);
 		if (elem.kind == wbValue_Invalid) {
 			return wb_value_invalid();
@@ -2856,6 +3086,10 @@ gb_internal wbValue wb_emit_logical_binary(wbProcedure *p, Ast *expr, TokenKind 
 	return wb_value_local(res, vt, type);
 }
 
+gb_internal bool wb_is_empty_string_constant(Ast *expr) {
+	return expr->tav.value.kind == ExactValue_String && is_type_string(expr->tav.type) && expr->tav.value.value_string.len == 0;
+}
+
 gb_internal wbValue wb_build_binary_expr(wbProcedure *p, Ast *expr) {
 	ast_node(be, BinaryExpr, expr);
 	Type *type = expr->tav.type;
@@ -2883,6 +3117,23 @@ gb_internal wbValue wb_build_binary_expr(wbProcedure *p, Ast *expr) {
 		return wb_emit_arith_matrix(p, expr, be->op.kind, left, right, type, false);
 	}
 
+	// `x == ""` / `"" != x`: a length test (so that a nil cstring is "")
+	if (be->op.kind == Token_CmpEq || be->op.kind == Token_NotEq) {
+		Ast *other = nullptr;
+		if (wb_is_empty_string_constant(be->right) && !is_type_union(be->left->tav.type)) {
+			other = be->left;
+		} else if (wb_is_empty_string_constant(be->left) && !is_type_union(be->right->tav.type)) {
+			other = be->right;
+		}
+		if (other != nullptr && is_type_string(other->tav.type)) {
+			bool is16 = is_type_string16(other->tav.type) || is_type_cstring16(other->tav.type);
+			wbValue s = wb_emit_conv(p, wb_build_expr(p, other), is16 ? t_string16 : t_string);
+			wbValue len = wb_emit_slice_len(p, s);
+			wbValue res = wb_emit_arith(p, expr, be->op.kind, len, wb_value_const_int(t_int, 0), t_int, t_bool);
+			return wb_emit_conv(p, res, type);
+		}
+	}
+
 	// Comparisons operate on the (common) operand type, not the bool result type
 	Type *operand_type = type;
 	if (wb_is_comparison(be->op.kind)) {
@@ -2908,10 +3159,141 @@ gb_internal wbValue wb_build_binary_expr(wbProcedure *p, Ast *expr) {
 	} else {
 		right = wb_emit_conv(p, wb_build_expr(p, be->right), operand_type);
 	}
+	if (wb_is_comparison(be->op.kind) && !is_type_boolean(core_type(type))) {
+		// `int(a == b)`: the checker types the untyped bool as the target type
+		wbValue res = wb_emit_arith(p, expr, be->op.kind, left, right, operand_type, t_bool);
+		return wb_emit_conv(p, res, type);
+	}
 	return wb_emit_arith(p, expr, be->op.kind, left, right, operand_type, type);
 }
 
 // Calls
+
+// A host math procedure imported from the `env` module (as LLVM does for the
+// libm calls it cannot lower to wasm instructions)
+gb_internal wbProcedure *wb_libm_import(wbModule *m, String const &name, wbValType vt, isize arg_count) {
+	wbProcedure **found = string_map_get(&m->libm_imports, name);
+	if (found != nullptr) {
+		return *found;
+	}
+	wbProcedure *proc = wb_alloc_procedure(m, name);
+	proc->is_foreign = true;
+	wbFuncType ft = {};
+	array_init(&ft.params,  m->allocator);
+	array_init(&ft.results, m->allocator);
+	for (isize i = 0; i < arg_count; i++) {
+		array_add(&ft.params, vt);
+	}
+	array_add(&ft.results, vt);
+	proc->type_index = wb_add_functype(m, ft);
+	array_add(&proc->results, vt);
+	proc->import_module = str_lit("env");
+	proc->import_name   = name;
+	array_add(&m->imports, proc);
+	string_map_set(&m->libm_imports, name, proc);
+	return proc;
+}
+
+// Foreign procedures with an `llvm.<op>.<type>` link name (core:math binds
+// `llvm.sin.f64` and friends). The ones with wasm instructions are inlined,
+// the rest call libm procedures imported from the host as LLVM would.
+// f16 operands are computed in f32.
+gb_internal wbValue wb_build_llvm_intrinsic_call(wbProcedure *p, Ast *expr, wbProcedure *callee) {
+	ast_node(ce, CallExpr, expr);
+	Type *pt = base_type(callee->type);
+	Type *result_type = pt->Proc.result_count == 1 ? pt->Proc.results->Tuple.variables[0]->type : nullptr;
+	isize param_count = pt->Proc.params ? pt->Proc.params->Tuple.variables.count : 0;
+
+	String name = substring(callee->name, 5, callee->name.len); // after "llvm."
+	String op = name;
+	for (isize i = name.len-1; i >= 0; i--) {
+		if (name.text[i] == '.') {
+			op = substring(name, 0, i);
+			break;
+		}
+	}
+
+	Type *ft = result_type;
+	if (ft == nullptr || !is_type_float(ft) || param_count == 0 || ce->args.count != param_count) {
+		wb_unsupported(p, expr, "LLVM intrinsic");
+		return wb_value_invalid();
+	}
+	Type *ct = wb_is_f16(ft) ? t_f32 : ft;
+	wbValType vt = wb_valtype_of(ct);
+	bool f64 = vt == wbValType_f64;
+
+	auto args = array_make<wbValue>(temporary_allocator(), 0, param_count);
+	for (Ast *arg : ce->args) {
+		Type *param_type = pt->Proc.params->Tuple.variables[args.count]->type;
+		wbValue v = wb_emit_conv(p, wb_build_expr(p, arg), param_type);
+		if (is_type_float(param_type)) {
+			v = wb_emit_conv(p, v, ct);
+		}
+		if (v.kind == wbValue_Invalid) {
+			return v;
+		}
+		array_add(&args, v);
+	}
+	if (param_count > 1) {
+		for_array(i, args) {
+			args[i] = wb_value_fresh(p, args[i]);
+		}
+	}
+
+	wbOp unary = wbOp_unreachable, binary = wbOp_unreachable;
+	if      (op == "sqrt")      unary = f64 ? wbOp_f64_sqrt     : wbOp_f32_sqrt;
+	else if (op == "fabs")      unary = f64 ? wbOp_f64_abs      : wbOp_f32_abs;
+	else if (op == "floor")     unary = f64 ? wbOp_f64_floor    : wbOp_f32_floor;
+	else if (op == "ceil")      unary = f64 ? wbOp_f64_ceil     : wbOp_f32_ceil;
+	else if (op == "trunc")     unary = f64 ? wbOp_f64_trunc    : wbOp_f32_trunc;
+	else if (op == "rint" || op == "nearbyint" || op == "roundeven") unary = f64 ? wbOp_f64_nearest : wbOp_f32_nearest;
+	else if (op == "copysign")  binary = f64 ? wbOp_f64_copysign : wbOp_f32_copysign;
+	else if (op == "minnum")    binary = f64 ? wbOp_f64_min      : wbOp_f32_min;
+	else if (op == "maxnum")    binary = f64 ? wbOp_f64_max      : wbOp_f32_max;
+
+	if (unary != wbOp_unreachable && args.count == 1) {
+		wb_push(p, args[0]);
+		wb_op(p, unary);
+	} else if (binary != wbOp_unreachable && args.count == 2) {
+		wb_push(p, args[0]);
+		wb_push(p, args[1]);
+		wb_op(p, binary);
+	} else if ((op == "fmuladd" || op == "fma") && args.count == 3) {
+		wb_push(p, args[0]);
+		wb_push(p, args[1]);
+		wb_op(p, f64 ? wbOp_f64_mul : wbOp_f32_mul);
+		wb_push(p, args[2]);
+		wb_op(p, f64 ? wbOp_f64_add : wbOp_f32_add);
+	} else {
+		// libm: `sin`/`sinf`, `pow`/`powf`, ...
+		static char const *libm_names[] = {
+			"sin", "cos", "tan", "asin", "acos", "atan", "atan2", "sinh", "cosh", "tanh",
+			"exp", "exp2", "exp10", "log", "log2", "log10", "pow", "round", "cbrt", "fmod",
+		};
+		bool known = false;
+		for (char const *n : libm_names) {
+			if (op == make_string_c(n)) {
+				known = true;
+				break;
+			}
+		}
+		if (!known) {
+			wb_unsupported(p, expr, "LLVM intrinsic");
+			return wb_value_invalid();
+		}
+		gbString import_name = gb_string_make_length(temporary_allocator(), op.text, op.len);
+		if (!f64) {
+			import_name = gb_string_appendc(import_name, "f");
+		}
+		wbProcedure *libm = wb_libm_import(p->module, copy_string(permanent_allocator(), make_string_c(import_name)), vt, args.count);
+		for (wbValue const &v : args) {
+			wb_push(p, v);
+		}
+		wb_call(p, libm);
+	}
+	wbValue res = wb_pop_to_local(p, vt, ct);
+	return wb_emit_conv(p, res, result_type);
+}
 
 gb_internal wbValue wb_source_code_location(wbProcedure *p, String const &procedure, TokenPos const &pos) {
 	Type *type = t_source_code_location;
@@ -2996,15 +3378,43 @@ gb_internal wbValue wb_build_param_value(wbProcedure *p, Ast *call, Type *param_
 	}
 }
 
-// Reverses the byte order of a 2, 4 or 8 byte integer held in a wasm local:
-// (x >> 8*i & 0xff) << 8*(n-1-i) for each byte, or'd together
+// Reverses the byte order of a 2, 4, 8 or 16 byte integer or float and gives
+// the result `type` (the same size as the input). Integers held in a wasm local:
+// (x >> 8*i & 0xff) << 8*(n-1-i) for each byte, or'd together; floats go
+// through their integer bit pattern; 128-bit values swap the two words in memory.
 gb_internal wbValue wb_emit_byte_swap(wbProcedure *p, wbValue x, Type *type) {
-	wbValType vt = wb_valtype_of(type);
+	if (x.kind == wbValue_Invalid) {
+		return x;
+	}
 	i64 size = type_size_of(type);
-	x = wb_value_to_local(p, x);
+	if (size == 1) {
+		x.type = type;
+		return x;
+	}
+	if (size == 16) {
+		GB_ASSERT(x.kind == wbValue_Memory);
+		wbAddr res = wb_add_temp(p, type);
+		for (i32 w = 0; w < 2; w++) {
+			wbValue word = wb_emit_load(p, x.index, x.offset + 8*w, t_u64);
+			wb_emit_store(p, res.index, res.offset + 8*(1-w), wb_emit_byte_swap(p, word, t_u64), t_u64);
+		}
+		return wb_value_memory(res.index, res.offset, type);
+	}
+	wbValType vt = wb_valtype_of(type);
+	bool is_float = vt == wbValType_f32 || vt == wbValType_f64;
+	Type *it = type;
+	if (is_float) {
+		it = size == 4 ? t_u32 : t_u64;
+	}
+	wbValType ivt = wb_valtype_of(it);
+	wb_push(p, x);
+	if (is_float) {
+		wb_op(p, size == 4 ? wbOp_i32_reinterpret_f32 : wbOp_i64_reinterpret_f64);
+	}
+	wbValue bits = wb_pop_to_local(p, ivt, it);
 	for (i64 i = 0; i < size; i++) {
-		wb_push(p, x);
-		if (vt == wbValType_i64) {
+		wb_push(p, bits);
+		if (ivt == wbValType_i64) {
 			if (8*i != 0)  { wb_i64_const(p, 8*i); wb_op(p, wbOp_i64_shr_u); }
 			wb_i64_const(p, 0xff); wb_op(p, wbOp_i64_and);
 			i64 sh = 8*(size-1-i);
@@ -3018,16 +3428,116 @@ gb_internal wbValue wb_emit_byte_swap(wbProcedure *p, wbValue x, Type *type) {
 			if (i != 0)  { wb_op(p, wbOp_i32_or); }
 		}
 	}
+	if (is_float) {
+		wb_op(p, size == 4 ? wbOp_f32_reinterpret_i32 : wbOp_f64_reinterpret_i64);
+	} else {
+		wb_emit_normalize(p, type);
+	}
+	return wb_pop_to_local(p, vt, type);
+}
+
+// Endian-specific types (u32be, f64le, ...) hold their bytes in the declared
+// order, so on a target of the other endianness the platform value is the byte
+// swapped one. `wb_emit_to_platform_endian` yields the value as its platform
+// type, `wb_emit_from_platform_endian` goes back.
+gb_internal wbValue wb_emit_to_platform_endian(wbProcedure *p, wbValue x) {
+	if (x.kind == wbValue_Invalid || !is_type_different_to_arch_endianness(x.type)) {
+		return x;
+	}
+	return wb_emit_byte_swap(p, x, integer_endian_type_to_platform_type(x.type));
+}
+gb_internal wbValue wb_emit_from_platform_endian(wbProcedure *p, wbValue x, Type *type) {
+	if (x.kind == wbValue_Invalid) {
+		return x;
+	}
+	if (!is_type_different_to_arch_endianness(type)) {
+		x.type = type;
+		return x;
+	}
+	return wb_emit_byte_swap(p, x, type);
+}
+
+// `alloca`: memory below the frame, freed by the epilogue's stack pointer restore
+// sp = (sp - size) & -align
+gb_internal wbValue wb_emit_alloca(wbProcedure *p, wbValue size, i64 align, Type *type) {
+	wb_global_get(p, p->module->global_stack_pointer);
+	wb_push(p, size);
+	wb_op(p, wbOp_i32_sub);
+	if (align > 1) {
+		wb_i32_const(p, cast(i32)-align);
+		wb_op(p, wbOp_i32_and);
+	}
+	wbValue res = wb_pop_to_local(p, wbValType_i32, type);
+	wb_push(p, res);
+	wb_global_set(p, p->module->global_stack_pointer);
+	return res;
+}
+
+// Reverses the bits of a 1, 2, 4 or 8 byte integer: byte swap, then swap
+// nibbles, bit pairs and single bits within each byte using masks
+gb_internal wbValue wb_emit_reverse_bits(wbProcedure *p, wbValue x, Type *type) {
+	wbValType vt = wb_valtype_of(type);
+	i64 size = type_size_of(type);
+	Type *ut = size == 8 ? t_u64 : size == 4 ? t_u32 : size == 2 ? t_u16 : t_u8;
+	x.type = ut;
+	x = wb_emit_byte_swap(p, x, ut);
+	struct { u64 mask; i64 shift; } steps[] = {
+		{0x0f0f0f0f0f0f0f0full, 4},
+		{0x3333333333333333ull, 2},
+		{0x5555555555555555ull, 1},
+	};
+	for (auto const &step : steps) {
+		u64 mask = size == 8 ? step.mask : step.mask & ((1ull << (8*size)) - 1);
+		// ((x >> s) & m) | ((x & m) << s)
+		wb_push(p, x);
+		if (vt == wbValType_i64) {
+			wb_i64_const(p, step.shift); wb_op(p, wbOp_i64_shr_u);
+			wb_i64_const(p, cast(i64)mask); wb_op(p, wbOp_i64_and);
+			wb_push(p, x);
+			wb_i64_const(p, cast(i64)mask); wb_op(p, wbOp_i64_and);
+			wb_i64_const(p, step.shift); wb_op(p, wbOp_i64_shl);
+			wb_op(p, wbOp_i64_or);
+		} else {
+			wb_i32_const(p, cast(i32)step.shift); wb_op(p, wbOp_i32_shr_u);
+			wb_i32_const(p, cast(i32)mask); wb_op(p, wbOp_i32_and);
+			wb_push(p, x);
+			wb_i32_const(p, cast(i32)mask); wb_op(p, wbOp_i32_and);
+			wb_i32_const(p, cast(i32)step.shift); wb_op(p, wbOp_i32_shl);
+			wb_op(p, wbOp_i32_or);
+		}
+		x = wb_pop_to_local(p, vt, ut);
+	}
+	wb_push(p, x);
 	wb_emit_normalize(p, type);
 	return wb_pop_to_local(p, vt, type);
 }
 
+gb_internal wbValue wb_build_builtin_call_internal(wbProcedure *p, Ast *expr, BuiltinProcId id, Type *type);
+
 gb_internal wbValue wb_build_builtin_call(wbProcedure *p, Ast *expr, BuiltinProcId id) {
-	ast_node(ce, CallExpr, expr);
 	Type *type = expr->tav.type;
 	if (type != nullptr && is_type_untyped(type)) {
 		type = default_type(type);
 	}
+	if (type != nullptr && wb_is_f16(type)) {
+		// f16 is held as raw bits: the float builtins compute in f32
+		switch (id) {
+		case BuiltinProc_min:
+		case BuiltinProc_max:
+		case BuiltinProc_abs:
+		case BuiltinProc_clamp:
+		case BuiltinProc_sqrt:
+		case BuiltinProc_fused_mul_add:
+			return wb_emit_conv(p, wb_build_builtin_call_internal(p, expr, id, t_f32), type);
+		default:
+			break;
+		}
+	}
+	return wb_build_builtin_call_internal(p, expr, id, type);
+}
+
+gb_internal wbValue wb_build_builtin_call_internal(wbProcedure *p, Ast *expr, BuiltinProcId id, Type *type) {
+	ast_node(ce, CallExpr, expr);
 	wbValType vt = type != nullptr ? wb_valtype_of(type) : wbValType_Invalid;
 	Slice<Ast *> const &args = ce->args;
 
@@ -3047,9 +3557,18 @@ gb_internal wbValue wb_build_builtin_call(wbProcedure *p, Ast *expr, BuiltinProc
 		if (at->kind == Type_Array) {
 			return wb_value_const_int(t_int, at->Array.count);
 		}
+		if (at->kind == Type_FixedCapacityDynamicArray && id == BuiltinProc_cap) {
+			return wb_value_const_int(t_int, at->FixedCapacityDynamicArray.capacity);
+		}
 		wbValue s = wb_build_expr(p, args[0]);
 		if (s.kind == wbValue_Invalid) {
 			return s;
+		}
+		if (at->kind == Type_FixedCapacityDynamicArray) {
+			if (s.kind == wbValue_Local) {
+				s = wb_value_memory(s.index, 0, type_deref(s.type));
+			}
+			return wb_emit_load(p, s.index, s.offset + cast(i32)type_offset_of(at, 1, nullptr), t_int);
 		}
 		if (is_type_cstring(at) || is_type_cstring16(at)) {
 			// NUL terminated: counted by the runtime
@@ -3118,10 +3637,15 @@ gb_internal wbValue wb_build_builtin_call(wbProcedure *p, Ast *expr, BuiltinProc
 			data.type = type;
 			return data;
 		}
-		if (at->kind == Type_Pointer && is_type_array(type_deref(at))) {
+		if (at->kind == Type_Pointer && (is_type_array(type_deref(at)) || is_type_fixed_capacity_dynamic_array(type_deref(at)))) {
 			wbValue ptr = wb_build_expr(p, args[0]);
 			ptr.type = type;
 			return ptr;
+		}
+		if (at->kind == Type_FixedCapacityDynamicArray) {
+			wbAddr addr = wb_build_addr(p, args[0]);
+			if (addr.kind == wbAddr_Invalid) return wb_value_invalid();
+			return wb_addr_get_ptr(p, addr, type);
 		}
 		break;
 	}
@@ -3373,6 +3897,32 @@ gb_internal wbValue wb_build_builtin_call(wbProcedure *p, Ast *expr, BuiltinProc
 		wb_emit_store(p, res.index, res.offset + cast(i32)bool_offset, wb_value_local(overflow, wbValType_i32, t_bool), t_bool);
 		return wb_value_memory(res.index, res.offset, tuple);
 	}
+	case BuiltinProc_likely:
+	case BuiltinProc_unlikely:
+		return wb_emit_conv(p, wb_build_expr(p, args[0]), type);
+	case BuiltinProc_reverse_bits: {
+		// bit i of x moves to bit n-1-i; byte swap first, then reverse the bits within each byte
+		// with masked swaps of 4, 2 and 1 bit groups
+		wbValue x = wb_emit_conv(p, wb_build_expr(p, args[0]), type);
+		if (x.kind == wbValue_Invalid) return x;
+		if (wb_is_int128(type)) {
+			wbAddr res = wb_add_temp(p, type);
+			for (i32 w = 0; w < 2; w++) {
+				wbValue word = wb_emit_load(p, x.index, x.offset + 8*w, t_u64);
+				wbValue r = wb_emit_reverse_bits(p, word, t_u64);
+				wb_emit_store(p, res.index, res.offset + 8*(1-w), r, t_u64);
+			}
+			return wb_value_memory(res.index, res.offset, type);
+		}
+		return wb_emit_reverse_bits(p, x, type);
+	}
+	case BuiltinProc_alloca: {
+		// stack memory of a runtime size: bump the stack pointer
+		wbValue size = wb_emit_conv(p, wb_build_expr(p, args[0]), t_int);
+		i64 align = exact_value_to_i64(type_and_value_of_expr(args[1]).value);
+		if (size.kind == wbValue_Invalid) return size;
+		return wb_emit_alloca(p, size, align, type);
+	}
 	case BuiltinProc_expect: {
 		wbValue v = wb_build_expr(p, args[0]);
 		if (wb_expr_has_call(args[1])) v = wb_value_fresh(p, v);
@@ -3409,6 +3959,37 @@ gb_internal wbValue wb_build_builtin_call(wbProcedure *p, Ast *expr, BuiltinProc
 	case BuiltinProc_count_leading_zeros: {
 		wbValue x = wb_emit_conv(p, wb_build_expr(p, args[0]), type);
 		if (x.kind == wbValue_Invalid) return x;
+		if (wb_is_int128(type)) {
+			// on the two words: popcnt(lo) + popcnt(hi); lo != 0 ? ctz(lo) : 64 + ctz(hi); hi != 0 ? clz(hi) : 64 + clz(lo)
+			u32 lo, hi;
+			wb_load_int128(p, x, &lo, &hi);
+			wbAddr res = wb_add_temp(p, type);
+			wb_push_address(p, res.index, res.offset);
+			switch (id) {
+			case BuiltinProc_count_ones:
+				wb_local_get(p, lo); wb_op(p, wbOp_i64_popcnt);
+				wb_local_get(p, hi); wb_op(p, wbOp_i64_popcnt);
+				wb_op(p, wbOp_i64_add);
+				break;
+			case BuiltinProc_count_trailing_zeros:
+				wb_local_get(p, lo); wb_op(p, wbOp_i64_ctz);
+				wb_local_get(p, hi); wb_op(p, wbOp_i64_ctz); wb_i64_const(p, 64); wb_op(p, wbOp_i64_add);
+				wb_local_get(p, lo); wb_op(p, wbOp_i64_eqz); wb_op(p, wbOp_i32_eqz);
+				wb_op(p, wbOp_select);
+				break;
+			default:
+				wb_local_get(p, hi); wb_op(p, wbOp_i64_clz);
+				wb_local_get(p, lo); wb_op(p, wbOp_i64_clz); wb_i64_const(p, 64); wb_op(p, wbOp_i64_add);
+				wb_local_get(p, hi); wb_op(p, wbOp_i64_eqz); wb_op(p, wbOp_i32_eqz);
+				wb_op(p, wbOp_select);
+				break;
+			}
+			wb_memarg(p, wbOp_i64_store, 0, 8);
+			wb_push_address(p, res.index, res.offset + 8);
+			wb_i64_const(p, 0);
+			wb_memarg(p, wbOp_i64_store, 0, 8);
+			return wb_value_memory(res.index, res.offset, type);
+		}
 		i64 bits = 8*type_size_of(type);
 		wb_push(p, x);
 		if (vt == wbValType_i32 && bits < 32) {
@@ -3435,21 +4016,6 @@ gb_internal wbValue wb_build_builtin_call(wbProcedure *p, Ast *expr, BuiltinProc
 	}
 	case BuiltinProc_byte_swap: {
 		wbValue x = wb_emit_conv(p, wb_build_expr(p, args[0]), type);
-		if (x.kind == wbValue_Invalid) return x;
-		i64 size = type_size_of(type);
-		if (size == 1) {
-			return x;
-		}
-		if (size == 16) {
-			// swap the two words, byte swapping each
-			GB_ASSERT(x.kind == wbValue_Memory);
-			wbAddr res = wb_add_temp(p, type);
-			for (i32 w = 0; w < 2; w++) {
-				wbValue word = wb_emit_load(p, x.index, x.offset + 8*w, t_u64);
-				wb_emit_store(p, res.index, res.offset + 8*(1-w), wb_emit_byte_swap(p, word, t_u64), t_u64);
-			}
-			return wb_value_memory(res.index, res.offset, type);
-		}
 		return wb_emit_byte_swap(p, x, type);
 	}
 	case BuiltinProc_sqrt: {
@@ -3457,6 +4023,21 @@ gb_internal wbValue wb_build_builtin_call(wbProcedure *p, Ast *expr, BuiltinProc
 		if (x.kind == wbValue_Invalid) return x;
 		wb_push(p, x);
 		wb_op(p, vt == wbValType_f32 ? wbOp_f32_sqrt : wbOp_f64_sqrt);
+		return wb_pop_to_local(p, vt, type);
+	}
+	case BuiltinProc_fused_mul_add: {
+		// a*b + c (wasm has no fma instruction; LLVM's fmuladd allows the unfused form)
+		wbValue a = wb_emit_conv(p, wb_build_expr(p, args[0]), type);
+		if (wb_expr_has_call(args[1]) || wb_expr_has_call(args[2])) a = wb_value_fresh(p, a);
+		wbValue b = wb_emit_conv(p, wb_build_expr(p, args[1]), type);
+		if (wb_expr_has_call(args[2])) b = wb_value_fresh(p, b);
+		wbValue c = wb_emit_conv(p, wb_build_expr(p, args[2]), type);
+		if (a.kind == wbValue_Invalid || b.kind == wbValue_Invalid || c.kind == wbValue_Invalid) return wb_value_invalid();
+		if (vt != wbValType_f32 && vt != wbValType_f64) break;
+		wb_push(p, a); wb_push(p, b);
+		wb_op(p, vt == wbValType_f32 ? wbOp_f32_mul : wbOp_f64_mul);
+		wb_push(p, c);
+		wb_op(p, vt == wbValType_f32 ? wbOp_f32_add : wbOp_f64_add);
 		return wb_pop_to_local(p, vt, type);
 	}
 	case BuiltinProc_ptr_offset: {
@@ -3931,6 +4512,9 @@ gb_internal wbValue wb_build_call_expr_internal(wbProcedure *p, Ast *expr) {
 	wbValue proc_value = {};
 	if (e != nullptr && e->kind == Entity_Procedure) {
 		callee = wb_procedure_for_entity(p->module, e);
+		if (callee->is_llvm_intrinsic) {
+			return wb_build_llvm_intrinsic_call(p, expr, callee);
+		}
 	} else {
 		proc_value = wb_build_expr(p, ce->proc);
 		if (proc_value.kind == wbValue_Invalid) {
@@ -4249,6 +4833,21 @@ gb_internal wbValue wb_build_slice_expr(wbProcedure *p, Ast *expr) {
 		data = wb_addr_get_ptr(p, addr, t_rawptr);
 		len = wb_value_const_int(t_int, bt->Array.count);
 		elem_type = bt->Array.elem;
+	} else if (bt->kind == Type_FixedCapacityDynamicArray ||
+	           (bt->kind == Type_Pointer && is_type_fixed_capacity_dynamic_array(type_deref(bt)))) {
+		wbAddr addr = {};
+		if (bt->kind == Type_Pointer) {
+			wbValue ptr = wb_build_expr(p, se->expr);
+			if (ptr.kind == wbValue_Invalid) return ptr;
+			addr = wb_addr_from_pointer(p, ptr, type_deref(bt));
+			bt = base_type(type_deref(bt));
+		} else {
+			addr = wb_build_addr(p, se->expr);
+		}
+		if (addr.kind != wbAddr_Memory) return wb_value_invalid();
+		data = wb_addr_get_ptr(p, addr, t_rawptr);
+		len = wb_emit_load(p, addr.index, addr.offset + cast(i32)type_offset_of(bt, 1, nullptr), t_int);
+		elem_type = bt->FixedCapacityDynamicArray.elem;
 	} else if (bt->kind == Type_Slice || bt->kind == Type_DynamicArray || is_type_string(bt) ||
 	           (bt->kind == Type_Pointer && (is_type_slice(type_deref(bt)) || is_type_dynamic_array(type_deref(bt)) || is_type_string(type_deref(bt))))) {
 		wbValue s = wb_build_expr(p, se->expr);
@@ -4317,8 +4916,35 @@ gb_internal wbValue wb_build_slice_expr(wbProcedure *p, Ast *expr) {
 
 // Expressions
 
+gb_internal wbValue wb_build_expr_internal(wbProcedure *p, Ast *expr);
+
+// Selector call expressions `x->f(a)` are checked as `x.f(x, a)`, and `x` must
+// only be evaluated once: the first evaluation is cached for the second
 gb_internal wbValue wb_build_expr(wbProcedure *p, Ast *expr) {
 	expr = unparen_expr(expr);
+	if (expr->state_flags & StateFlag_SelectorCallExpr) {
+		wbValue *pv = map_get(&p->selector_values, expr);
+		if (pv != nullptr) {
+			wbValue res = *pv;
+			map_remove(&p->selector_values, expr);
+			return res;
+		}
+		wbAddr *pa = map_get(&p->selector_addrs, expr);
+		if (pa != nullptr) {
+			wbAddr res = *pa;
+			map_remove(&p->selector_addrs, expr);
+			return wb_addr_load(p, res);
+		}
+	}
+	wbValue res = wb_build_expr_internal(p, expr);
+	if (expr->state_flags & StateFlag_SelectorCallExpr) {
+		res = wb_value_fresh(p, res);
+		map_set(&p->selector_values, expr, res);
+	}
+	return res;
+}
+
+gb_internal wbValue wb_build_expr_internal(wbProcedure *p, Ast *expr) {
 	TypeAndValue tv = type_and_value_of_expr(expr);
 
 	if (tv.value.kind != ExactValue_Invalid) {
@@ -4443,6 +5069,10 @@ gb_internal wbValue wb_build_expr(wbProcedure *p, Ast *expr) {
 
 	case_ast_node(be, BinaryExpr, expr);
 		return wb_build_binary_expr(p, expr);
+	case_end;
+
+	case_ast_node(se, SelectorCallExpr, expr);
+		return wb_build_expr(p, se->call);
 	case_end;
 
 	case_ast_node(ce, CallExpr, expr);

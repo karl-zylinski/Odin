@@ -245,6 +245,10 @@ parse_cli_options :: proc(argv: []string, opts: ^Options, stdout, stderr: io.Wri
 }
 
 runner :: proc(internal_tests: []Internal_Test) -> bool {
+	when !thread.IS_SUPPORTED {
+		return runner_single_threaded(internal_tests)
+	}
+
 	BATCH_BUFFER_SIZE     :: 32 * mem.Kilobyte
 	POOL_BLOCK_SIZE       :: 16 * mem.Kilobyte
 	CLIPBOARD_BUFFER_SIZE :: 16 * mem.Kilobyte

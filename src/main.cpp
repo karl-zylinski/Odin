@@ -4643,13 +4643,42 @@ end_of_code_gen:;
 			array_free(&run_args_cstring);
 		});
 
+		// WebAssembly outputs cannot be executed directly; run them with a
+		// runtime (`wasmtime` unless ODIN_WASM_RUNTIME says otherwise)
+		bool honor_path = false;
+		char const *program = exe_name_cstring;
+		if (is_arch_wasm()) {
+			char const *wasm_runtime = gb_get_env("ODIN_WASM_RUNTIME", heap_allocator());
+			if (wasm_runtime == nullptr || wasm_runtime[0] == 0) {
+				wasm_runtime = "wasmtime";
+			}
+			program = wasm_runtime;
+			honor_path = true;
+			array_add(&run_args_cstring, alloc_cstring(heap_allocator(), make_string_c(wasm_runtime)));
+			if (gb_strcmp(wasm_runtime, "wasmtime") == 0) {
+				array_add(&run_args_cstring, alloc_cstring(heap_allocator(), str_lit("run")));
+			}
+			// Extra runtime flags, e.g. `--preload env=host.wasm` (space separated)
+			char const *runtime_flags = gb_get_env("ODIN_WASM_RUNTIME_FLAGS", heap_allocator());
+			if (runtime_flags != nullptr) {
+				String flags = make_string_c(runtime_flags);
+				while (flags.len > 0) {
+					isize n = 0;
+					while (n < flags.len && flags.text[n] != ' ') n++;
+					if (n > 0) {
+						array_add(&run_args_cstring, alloc_cstring(heap_allocator(), substring(flags, 0, n)));
+					}
+					flags = substring(flags, gb_min(n+1, flags.len), flags.len);
+				}
+			}
+		}
 		array_add(&run_args_cstring, exe_name_cstring);
 		for_array(i, run_args) {
 			array_add(&run_args_cstring, alloc_cstring(heap_allocator(), run_args[i]));
 		}
 		array_add(&run_args_cstring, NULL);
 
-		int subprocess_res = run_subprocess(exe_name_cstring, run_args_cstring.data);
+		int subprocess_res = run_subprocess(program, run_args_cstring.data, honor_path);
 #endif
 		if (subprocess_res) {
 			gb_exit(subprocess_res);

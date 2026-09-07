@@ -16,8 +16,13 @@ gb_internal void    wb_close_scope(wbProcedure *p);
 gb_internal wbAddr  wb_add_variable(wbProcedure *p, Entity *e, Ast *init_expr = nullptr);
 gb_internal void    wb_emit_epilogue(wbProcedure *p);
 gb_internal wbValue wb_emit_conv(wbProcedure *p, wbValue v, Type *dst);
+gb_internal wbValue wb_emit_byte_swap(wbProcedure *p, wbValue x, Type *type);
+gb_internal wbValue wb_emit_to_platform_endian(wbProcedure *p, wbValue x);
+gb_internal wbValue wb_emit_from_platform_endian(wbProcedure *p, wbValue x, Type *type);
 gb_internal wbValue wb_value_copy(wbProcedure *p, wbValue v);
 gb_internal wbProcedure *wb_procedure_for_entity(wbModule *m, Entity *e);
+gb_internal void wb_build_test_main_body(wbProcedure *p);
+gb_internal void wb_emit_call_no_args(wbProcedure *p, Entity *e);
 gb_internal u32 wb_data_alloc(wbModule *m, i64 size, i64 align);
 gb_internal u32     wb_table_index(wbModule *m, wbProcedure *p);
 gb_internal wbProcedure *wb_hasher_proc_for_type(wbModule *m, Type *type);
@@ -428,6 +433,8 @@ gb_internal wbProcedure *wb_alloc_procedure(wbModule *m, String name) {
 	array_init(&p->scopes,       m->allocator);
 	array_init(&p->context_stack, m->allocator);
 	map_init(&p->variables);
+	map_init(&p->selector_values);
+	map_init(&p->selector_addrs);
 	ptr_set_init(&p->addressed);
 	wb_buffer_init(&p->prologue, m->allocator, 16);
 	wb_buffer_init(&p->code, m->allocator);
@@ -473,7 +480,10 @@ gb_internal wbProcedure *wb_procedure_for_entity(wbModule *m, Entity *e) {
 		array_add(&p->results, vt);
 	}
 
-	if (p->is_foreign) {
+	if (p->is_foreign && string_starts_with(p->name, str_lit("llvm."))) {
+		// LLVM intrinsics are lowered at the call site (wb_build_llvm_intrinsic_call)
+		p->is_llvm_intrinsic = true;
+	} else if (p->is_foreign) {
 		// Mirrors lb_set_wasm_procedure_import_attributes: the module name is the
 		// foreign import path and the link name has the form "module..name".
 		String module_name = str_lit("env");
@@ -1196,6 +1206,7 @@ gb_internal void wb_write_le(u8 *dst, u64 bits, i64 size) {
 }
 
 gb_internal void wb_write_const_data(wbModule *m, Type *type, ExactValue const &value, u8 *dst);
+gb_internal i64  wb_compound_lit_elem_count(Slice<Ast *> const &elems, i64 min_value = 0);
 gb_internal wbValue wb_value_copy(wbProcedure *p, wbValue v);
 gb_internal i32  wb_union_tag_offset(Type *ut);
 gb_internal bool wb_union_has_tag(Type *ut);
@@ -1359,6 +1370,20 @@ gb_internal void wb_write_const_data(wbModule *m, Type *type, ExactValue const &
 		dst[0] = value.value_bool ? 1 : 0;
 		return;
 	case ExactValue_Integer:
+	case ExactValue_Float:
+		if (is_type_different_to_arch_endianness(type)) {
+			// endian-specific scalar: the platform bytes, reversed
+			wb_write_const_data(m, integer_endian_type_to_platform_type(type), value, dst);
+			for (i64 i = 0; i < size/2; i++) {
+				u8 tmp = dst[i];
+				dst[i] = dst[size-1-i];
+				dst[size-1-i] = tmp;
+			}
+			return;
+		}
+		if (value.kind == ExactValue_Float) {
+			goto write_float;
+		}
 		if (is_type_float(core_type(type)) || is_type_complex(type) || is_type_quaternion(type)) {
 			ExactValue f = exact_value_to_float(value);
 			wb_write_const_data(m, type, f, dst);
@@ -1388,7 +1413,7 @@ gb_internal void wb_write_const_data(wbModule *m, Type *type, ExactValue const &
 		wb_write_const_data(m, ft, exact_value_float(value.value_quaternion->real), dst + 3*fs);
 		return;
 	}
-	case ExactValue_Float:
+	write_float:
 		if (is_type_complex(type) || is_type_quaternion(type)) {
 			// real scalar promoted to a complex/quaternion constant
 			Type *ft = base_complex_elem_type(type);
@@ -1442,6 +1467,11 @@ gb_internal void wb_write_const_data(wbModule *m, Type *type, ExactValue const &
 			wb_write_le(dst + type_offset_of(bt, 1, nullptr), cast(u64)s.len, build_context.int_size);
 		} else if (is_type_array(bt) && s.len == size) {
 			gb_memmove(dst, s.text, s.len);
+		} else if (is_type_slice(bt)) {
+			// `#load` data: the bytes reinterpreted as the element type
+			u32 data = s.len > 0 ? wb_intern_string_bytes(m, s) : 0;
+			wb_write_le(dst, data, build_context.ptr_size);
+			wb_write_le(dst + type_offset_of(bt, 1, nullptr), cast(u64)(s.len / type_size_of(bt->Slice.elem)), build_context.int_size);
 		}
 		return;
 	}
@@ -1449,6 +1479,9 @@ gb_internal void wb_write_const_data(wbModule *m, Type *type, ExactValue const &
 		Ast *node = value.value_compound;
 		GB_ASSERT(node->kind == Ast_CompoundLit);
 		ast_node(cl, CompoundLit, node);
+		if (cl->elems.count == 0) {
+			return; // zero value
+		}
 		switch (bt->kind) {
 		case Type_Struct: {
 			if (is_type_soa_struct(bt)) {
@@ -1492,16 +1525,35 @@ gb_internal void wb_write_const_data(wbModule *m, Type *type, ExactValue const &
 		case Type_Array:
 		case Type_EnumeratedArray:
 		case Type_SimdVector:
-		case Type_Matrix: {
+		case Type_Matrix:
+		case Type_FixedCapacityDynamicArray: {
 			Type *et = nullptr;
 			switch (bt->kind) {
 			case Type_Array:           et = bt->Array.elem;           break;
 			case Type_SimdVector:      et = bt->SimdVector.elem;      break;
 			case Type_EnumeratedArray: et = bt->EnumeratedArray.elem; break;
 			case Type_Matrix:          et = bt->Matrix.elem;          break;
+			case Type_FixedCapacityDynamicArray: et = bt->FixedCapacityDynamicArray.elem; break;
 			default: break;
 			}
 			i64 elem_size = type_size_of(et);
+			if (bt->kind == Type_FixedCapacityDynamicArray) {
+				// [dynamic; N]T{...}: {data: [N]T, len: int}
+				i64 capacity = bt->FixedCapacityDynamicArray.capacity;
+				i64 count = 0;
+				if (are_types_identical(node->tav.type, et)) {
+					// a literal of the element type is splat across the array
+					for (i64 k = 0; k < capacity; k++) {
+						wb_write_const_data(m, et, value, dst + k*elem_size);
+					}
+					count = capacity;
+				} else {
+					wb_write_const_data(m, alloc_type_array(et, capacity), value, dst);
+					count = wb_compound_lit_elem_count(cl->elems);
+				}
+				wb_write_le(dst + type_offset_of(bt, 1, nullptr), cast(u64)count, build_context.int_size);
+				return;
+			}
 			i64 index = 0;
 			i64 min_value = bt->kind == Type_EnumeratedArray ? exact_value_to_i64(*bt->EnumeratedArray.min_value) : 0;
 			// matrix literals list their elements in row-major order
@@ -1623,10 +1675,13 @@ gb_internal bool wb_can_serialize_const(Type *type, ExactValue const &value) {
 		return is_type_quaternion(bt);
 	case ExactValue_String:
 	case ExactValue_String16:
-		return is_type_string(type) || is_type_cstring(type) || is_type_string16(type) || is_type_cstring16(type) || is_type_array(bt);
+		return is_type_string(type) || is_type_cstring(type) || is_type_string16(type) || is_type_cstring16(type) || is_type_array(bt) || is_type_slice(bt);
 	case ExactValue_Procedure:
 		return is_type_proc(bt);
 	case ExactValue_Compound:
+		if (value.value_compound->CompoundLit.elems.count == 0) {
+			return true; // `{}` is the zero value of any type
+		}
 		switch (bt->kind) {
 		case Type_Struct: case Type_Array: case Type_EnumeratedArray: case Type_Slice: case Type_SimdVector: case Type_Matrix:
 			break;
@@ -1734,6 +1789,33 @@ gb_internal wbValue wb_const(wbProcedure *p, Ast *node, Type *type, ExactValue c
 		}
 		return wb_value_memory(WB_NO_LOCAL, cast(i32)wb_const_data_addr(p->module, type, value), type);
 	}
+	if (is_type_different_to_arch_endianness(type) && (value.kind == ExactValue_Integer || value.kind == ExactValue_Float)) {
+		// endian-specific scalar: the platform constant, byte swapped
+		wbValue platform = wb_const(p, node, integer_endian_type_to_platform_type(type), value);
+		if (platform.kind == wbValue_Invalid) {
+			return platform;
+		}
+		if (vt == wbValType_f32 || vt == wbValType_f64) {
+			return wb_emit_byte_swap(p, platform, type);
+		}
+		i64 size = type_size_of(type);
+		u64 bits = cast(u64)platform.i;
+		u64 swapped = 0;
+		for (i64 i = 0; i < size; i++) {
+			swapped |= ((bits >> (8*i)) & 0xff) << (8*(size-1-i));
+		}
+		platform.i = cast(i64)swapped;
+		platform.type = type;
+		if (vt == wbValType_i32) {
+			if (size == 2) {
+				platform.i = wb_type_is_signed(type) ? cast(i16)platform.i : cast(u16)platform.i;
+			} else {
+				platform.i = cast(i32)platform.i;
+			}
+		}
+		return platform;
+	}
+
 	wbValue v = {};
 	v.kind = wbValue_Const;
 	v.vt   = vt;
@@ -1782,6 +1864,13 @@ gb_internal wbValue wb_const(wbProcedure *p, Ast *node, Type *type, ExactValue c
 		// nil
 		v.i = 0;
 		break;
+	case ExactValue_Compound:
+		if (value.value_compound->CompoundLit.elems.count == 0) {
+			v.i = 0; // `{}`
+			break;
+		}
+		wb_unsupported(p, node, "constant value kind");
+		return wb_value_invalid();
 	case ExactValue_Procedure: {
 		u32 index = 0;
 		if (!wb_const_procedure_index(p->module, p->name, value.value_procedure, &index)) {
@@ -2002,6 +2091,9 @@ gb_internal void wb_build_procedure(wbProcedure *p) {
 	case wbProcGen_Equal:
 		wb_build_equal_body(p);
 		break;
+	case wbProcGen_TestMain:
+		wb_build_test_main_body(p);
+		break;
 	}
 	wb_close_scope(p);
 
@@ -2023,6 +2115,72 @@ gb_internal void wb_emit_call_no_args(wbProcedure *p, Entity *e) {
 		wb_push_context_ptr(p, wb_context_addr(p));
 	}
 	wb_call(p, callee);
+}
+
+// `odin test` has no user entry point (the runtime's `_start` is compiled out
+// with ODIN_TEST), so the backend supplies one, as lb_create_main_procedure does:
+// set up the arguments, run the runtime startup, hand the `@(test)` procedures
+// to testing.runner and exit with its verdict.
+gb_internal wbProcedure *wb_create_test_main(wbModule *m) {
+	Type *params  = alloc_type_tuple();
+	Type *results = alloc_type_tuple();
+	Type *proc_type = alloc_type_proc(nullptr, params, 0, results, 0, false, ProcCC_CDecl);
+
+	wbProcedure *p = wb_alloc_procedure(m, str_lit("_start"));
+	p->type      = proc_type;
+	p->gen       = wbProcGen_TestMain;
+	p->is_export = true;
+	wbFuncType ft = {};
+	wb_functype_of_proc(m, proc_type, &ft);
+	p->type_index = wb_add_functype(m, ft);
+	array_add(&m->procedures, p);
+	array_add(&m->work_queue, p);
+	return p;
+}
+
+gb_internal void wb_build_test_main_body(wbProcedure *p) {
+	wbModule *m = p->module;
+	CheckerInfo *info = m->info;
+
+	if (build_context.metrics.os == TargetOs_wasi) {
+		wb_emit_call_no_args(p, find_entity_in_pkg(info, str_lit("runtime"), str_lit("_wasi_setup_args")));
+	}
+	wb_emit_call_no_args(p, find_entity_in_pkg(info, str_lit("runtime"), str_lit("_startup_runtime")));
+
+	// []testing.Internal_Test{{pkg, name, p}, ...} in static storage
+	Type *t_test  = find_type_in_pkg(info, str_lit("testing"), str_lit("Internal_Test"));
+	Type *t_array = alloc_type_array(t_test, info->testing_procedures.count);
+	Type *t_slice = alloc_type_slice(t_test);
+	wbAddr tests = wb_addr_memory(WB_NO_LOCAL, cast(i32)wb_data_alloc(m, type_size_of(t_array), type_align_of(t_array)), t_array);
+	i64 test_size = type_size_of(t_test);
+	for_array(i, info->testing_procedures) {
+		Entity *e = info->testing_procedures[i];
+		String pkg_name = e->pkg != nullptr ? e->pkg->name : String{};
+		wbAddr dst = wb_addr_offset(tests, i*test_size, t_test);
+		for (isize field = 0; field < 3; field++) {
+			Type *ft = nullptr;
+			i64 offset = type_offset_of(t_test, field, &ft);
+			wbAddr fa = wb_addr_offset(dst, offset, ft);
+			switch (field) {
+			case 0: wb_addr_store(p, fa, wb_const(p, nullptr, t_string, exact_value_string(pkg_name)));        break;
+			case 1: wb_addr_store(p, fa, wb_const(p, nullptr, t_string, exact_value_string(e->token.string))); break;
+			case 2: wb_addr_store(p, fa, wb_value_const_int(ft, wb_table_index(m, wb_procedure_for_entity(m, e)))); break;
+			}
+		}
+	}
+	wbAddr slice = wb_add_temp(p, t_slice);
+	wb_addr_store(p, wb_addr_offset(slice, 0, t_rawptr), wb_addr_get_ptr(p, tests, t_rawptr));
+	wb_addr_store(p, wb_addr_offset(slice, build_context.int_size, t_int), wb_value_const_int(t_int, info->testing_procedures.count));
+
+	Entity *runner = find_entity_in_pkg(info, str_lit("testing"), str_lit("runner"));
+	auto args = array_make<wbValue>(temporary_allocator(), 1);
+	args[0] = wb_value_memory(slice.index, slice.offset, t_slice);
+	wbValue ok = wb_emit_call(p, base_type(runner->type), wb_procedure_for_entity(m, runner), wb_value_invalid(), args);
+
+	Entity *exit = find_entity_in_pkg(info, str_lit("runtime"), str_lit("exit"));
+	auto exit_args = array_make<wbValue>(temporary_allocator(), 1);
+	exit_args[0] = wb_emit_conv(p, wb_emit_arith(p, nullptr, Token_Xor, wb_emit_conv(p, ok, t_int), wb_value_const_int(t_int, 1), t_int, t_int), t_int);
+	wb_emit_call(p, base_type(exit->type), wb_procedure_for_entity(m, exit), wb_value_invalid(), exit_args);
 }
 
 // Stores the pending non-constant global initializers, in declaration
@@ -2077,6 +2235,7 @@ gb_internal void wb_module_init(wbModule *m, CheckerInfo *info) {
 	array_add(&m->table, cast(wbProcedure *)nullptr); // index 0 is nil
 	map_init(&m->procedure_map);
 	map_init(&m->globals);
+	string_map_init(&m->libm_imports, 16);
 	string_map_init(&m->string_bytes, 64);
 	string_map_init(&m->string_values, 64);
 	string_map_init(&m->string16_values, 16);
@@ -2170,6 +2329,10 @@ gb_internal bool wb_generate_code(CheckerInfo *info) {
 			continue;
 		}
 		wb_procedure_for_entity(m, e);
+	}
+
+	if (build_context.command_kind == Command_test) {
+		wb_create_test_main(m);
 	}
 
 	TIME_SECTION("wasm backend: procedures");

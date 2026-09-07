@@ -361,9 +361,19 @@ gb_internal void wb_build_value_decl(wbProcedure *p, AstValueDecl *vd, Ast *node
 
 	// Evaluate initializers before declaring the new variables
 	// (`x: T = ---` is simply zero initialized here)
-	bool is_uninit = vd->values.count == 1 && unparen_expr(vd->values[0])->kind == Ast_Uninit;
+	bool has_uninit = false;
+	for (Ast *value : vd->values) {
+		if (unparen_expr(value)->kind == Ast_Uninit) {
+			has_uninit = true;
+		}
+	}
 	auto values = array_make<wbValue>(temporary_allocator(), 0, vd->names.count);
-	if (!is_static && !is_uninit) {
+	if (!is_static && has_uninit && vd->values.count == vd->names.count) {
+		// `a, b: T = ---, f()`: each value is single valued
+		for (Ast *value : vd->values) {
+			array_add(&values, unparen_expr(value)->kind == Ast_Uninit ? wb_value_invalid() : wb_build_expr(p, value));
+		}
+	} else if (!is_static && !has_uninit) {
 		wb_build_expr_list(p, vd->values, &values);
 	}
 	if (values.count != 0 && values.count != vd->names.count) {
@@ -384,7 +394,7 @@ gb_internal void wb_build_value_decl(wbProcedure *p, AstValueDecl *vd, Ast *node
 			continue;
 		}
 		wbAddr addr = wb_add_variable(p, e);
-		if (values.count > 0) {
+		if (values.count > 0 && values[i].kind != wbValue_Invalid) {
 			wb_addr_store(p, addr, values[i]);
 		} else {
 			// Zero initialize (the declaration may be re-executed inside a loop)
@@ -655,6 +665,10 @@ gb_internal void wb_build_range_indexed(wbProcedure *p, AstRangeStmt *rs, Ast *n
 	case Type_DynamicArray:
 		elem_type = bt->DynamicArray.elem;
 		break;
+	case Type_FixedCapacityDynamicArray:
+		count = wb_emit_load(p, base.index, base.offset + cast(i32)type_offset_of(bt, 1, nullptr), t_int);
+		elem_type = bt->FixedCapacityDynamicArray.elem;
+		break;
 	case Type_Basic:
 		if (is_type_string(bt) && !is_type_cstring(bt)) {
 			is_string = true;
@@ -670,7 +684,7 @@ gb_internal void wb_build_range_indexed(wbProcedure *p, AstRangeStmt *rs, Ast *n
 	// Element base pointer for slice-like types
 	u32 data_local = base.index;
 	i32 data_offset = base.offset;
-	if (bt->kind != Type_Array && bt->kind != Type_EnumeratedArray) {
+	if (bt->kind != Type_Array && bt->kind != Type_EnumeratedArray && bt->kind != Type_FixedCapacityDynamicArray) {
 		wbValue s = wb_value_memory(base.index, base.offset, bt);
 		wbValue data = wb_emit_slice_data(p, s);
 		count = wb_emit_slice_len(p, s);
@@ -928,8 +942,10 @@ gb_internal void wb_build_range_bit_set(wbProcedure *p, AstRangeStmt *rs, Ast *n
 	wbValType vt = wide ? wbValType_i64 : wb_valtype_of(mask_type);
 	i64 bits = 8*type_size_of(mask_type);
 
-	// remaining = set & all_set_mask
+	// remaining = set & all_set_mask (iterated as the platform integer)
 	set.type = mask_type;
+	set = wb_emit_to_platform_endian(p, set);
+	mask_type = set.type;
 	wbValue masked = wb_emit_arith(p, node, Token_And, set, wb_const(p, node, mask_type, exact_bit_set_all_set_mask(bt)), mask_type, mask_type);
 	if (masked.kind == wbValue_Invalid) {
 		return;
@@ -1076,6 +1092,7 @@ gb_internal void wb_build_range_stmt(wbProcedure *p, AstRangeStmt *rs, Ast *node
 		case Type_EnumeratedArray:
 		case Type_Slice:
 		case Type_DynamicArray:
+		case Type_FixedCapacityDynamicArray:
 			wb_build_range_indexed(p, rs, node, val0, val1);
 			break;
 		case Type_BitSet:
@@ -1192,9 +1209,8 @@ gb_internal void wb_build_unroll_range_stmt(wbProcedure *p, AstUnrollRangeStmt *
 			data_local = data.index;
 			break;
 		}
-		case Type_Array: {
-			elem_type = bt->Array.elem;
-			count = wb_value_const_int(t_int, bt->Array.count);
+		case Type_Array:
+		case Type_FixedCapacityDynamicArray: {
 			wbValue v = wb_build_expr(p, expr);
 			if (v.kind == wbValue_Invalid) {
 				return;
@@ -1202,6 +1218,13 @@ gb_internal void wb_build_unroll_range_stmt(wbProcedure *p, AstUnrollRangeStmt *
 			wbAddr base = wb_value_to_addr(p, wb_value_copy(p, v));
 			if (base.kind != wbAddr_Memory) {
 				return;
+			}
+			if (bt->kind == Type_Array) {
+				elem_type = bt->Array.elem;
+				count = wb_value_const_int(t_int, bt->Array.count);
+			} else {
+				elem_type = bt->FixedCapacityDynamicArray.elem;
+				count = wb_emit_load(p, base.index, base.offset + cast(i32)type_offset_of(bt, 1, nullptr), t_int);
 			}
 			data_local = base.index;
 			data_offset = base.offset;
@@ -1674,6 +1697,16 @@ gb_internal void wb_mark_addressed_root(wbProcedure *p, Ast *expr) {
 			Ast *base = expr->IndexExpr.expr;
 			Type *t = type_of_expr(base);
 			if (t == nullptr || !is_type_array(base_type(t))) {
+				return;
+			}
+			expr = base;
+			break;
+		}
+		case Ast_TypeAssertion: {
+			// `&u.(T)` points into the union
+			Ast *base = expr->TypeAssertion.expr;
+			Type *t = type_of_expr(base);
+			if (t == nullptr || is_type_pointer(t)) {
 				return;
 			}
 			expr = base;

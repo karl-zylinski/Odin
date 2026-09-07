@@ -29,6 +29,14 @@ mkdir -p "$OUT"
 failures=0
 total=0
 
+# Host procedures (`env` module) for the math intrinsics LLVM cannot lower to
+# wasm (`llvm.sin.f64` becomes an import of `env.sin`, ...). Both builds import
+# the same implementations, so their accuracy does not matter.
+HOST_ENV="$OUT/host_env.wasm"
+if ! "$ODIN" build host_env -target:"$TARGET" -backend:wasm -build-mode:dll -no-entry-point -out:"$HOST_ENV"; then
+	echo "FAIL host_env: build failed"; exit 1
+fi
+
 check() {
 	local name=$1; shift
 	local expected=$1; shift
@@ -50,6 +58,7 @@ invoke() {
 for pkg in */; do
 	pkg=${pkg%/}
 	[ "$pkg" = "$(basename "$OUT")" ] && continue
+	[ "$pkg" = "host_env" ] && continue
 	ls "$pkg"/*.odin >/dev/null 2>&1 || continue
 
 	if [ ! -f "$pkg/calls.txt" ]; then
@@ -62,8 +71,8 @@ for pkg in */; do
 		if ! "$ODIN" build "$pkg" -target:"$WASI_TARGET" -backend:wasm -out:"$new"; then
 			echo "FAIL $pkg: wasm backend build failed"; failures=$((failures+1)); total=$((total+1)); continue
 		fi
-		expected=$(wasmtime run "$ref" 2>&1)
-		actual=$(wasmtime run "$new" 2>&1)
+		expected=$(wasmtime run --preload env="$HOST_ENV" "$ref" 2>&1)
+		actual=$(wasmtime run --preload env="$HOST_ENV" "$new" 2>&1)
 		total=$((total+1))
 		if [ "$expected" != "$actual" ]; then
 			echo "FAIL $pkg: output differs"

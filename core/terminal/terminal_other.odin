@@ -1,5 +1,5 @@
 #+private
-#+build js
+#+build js, wasi
 package terminal
 
 _is_terminal :: proc "contextless" (handle: any) -> bool {
