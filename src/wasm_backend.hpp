@@ -344,10 +344,15 @@ struct wbLabel {
 	isize scope_index;    // scope depth when the construct was entered (for defers)
 };
 
+struct wbProcedure;
+// A `defer` statement, or a call to a `@(deferred_*)` procedure (stmt == nullptr)
 struct wbDefer {
 	Ast * stmt;
 	isize scope_index;
 	isize context_stack_count; // context_stack.count when the defer was registered
+	wbProcedure *   proc;      // deferred procedure and its arguments, kept in fresh storage
+	Type *          proc_type;
+	Array<wbValue>  proc_args;
 };
 
 // A `context` value visible in the current procedure (see wb_context_addr)

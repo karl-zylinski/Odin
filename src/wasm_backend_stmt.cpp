@@ -23,7 +23,16 @@ gb_internal void wb_emit_defers_down_to(wbProcedure *p, isize first) {
 		p->context_stack.count = d.context_stack_count;
 
 		wb_open_scope(p);
-		wb_build_stmt(p, d.stmt);
+		if (d.stmt != nullptr) {
+			wb_build_stmt(p, d.stmt);
+		} else {
+			auto args = array_make<wbValue>(temporary_allocator(), 0, d.proc_args.count);
+			for (wbValue const &v : d.proc_args) {
+				// aggregates are passed as a pointer to a caller-owned copy
+				array_add(&args, v.kind == wbValue_Memory ? wb_value_copy(p, v) : v);
+			}
+			wb_emit_call(p, d.proc_type, d.proc, wb_value_invalid(), args);
+		}
 		wb_close_scope(p);
 
 		p->context_stack.count = d.context_stack_count;
@@ -38,9 +47,9 @@ gb_internal void wb_close_scope(wbProcedure *p) {
 	isize marker = array_pop(&p->scopes);
 	wb_emit_defers_down_to(p, marker);
 	p->defers.count = marker;
-	// `context` values created in this scope go out of scope
-	isize scope_index = p->scopes.count;
-	while (p->context_stack.count > 0 && p->context_stack[p->context_stack.count-1].scope_index >= scope_index) {
+	// `context` values created in this scope (depth scopes.count before the pop) go out of scope
+	isize depth = p->scopes.count;
+	while (p->context_stack.count > 0 && p->context_stack[p->context_stack.count-1].scope_index > depth) {
 		p->context_stack.count -= 1;
 	}
 }
@@ -244,12 +253,15 @@ gb_internal void wb_build_return_stmt(wbProcedure *p, AstReturnStmt *rs, Ast *no
 		return;
 	}
 	bool has_defers = p->defers.count > 0;
+	// `return b, a` with named results a, b: the values are stored back into
+	// the named results, so they must not alias them
+	bool stores_named = rs->results.count != 0 && p->result_addrs.count > 0 && result_count > 1;
 	for_array(i, values) {
 		values[i] = wb_emit_conv(p, values[i], tuple->variables[i]->type);
 		if (values[i].kind == wbValue_Invalid) {
 			return;
 		}
-		if (has_defers || rs->results.count == 0 || values[i].kind == wbValue_Memory) {
+		if (has_defers || stores_named || rs->results.count == 0 || values[i].kind == wbValue_Memory) {
 			values[i] = wb_value_fresh(p, values[i]);
 		}
 	}
@@ -1096,6 +1108,204 @@ gb_internal void wb_build_range_stmt(wbProcedure *p, AstRangeStmt *rs, Ast *node
 	wb_close_scope(p);
 }
 
+// `#unroll for`: the loop is expanded at compile time, so the body is emitted
+// once per iteration with the loop variables bound to constants (or to the
+// loaded element). The checker rejects `break`/`continue` inside the body, so
+// no label is pushed.
+gb_internal void wb_build_unroll_range_stmt(wbProcedure *p, AstUnrollRangeStmt *rs, Ast *node) {
+	wb_open_scope(p);
+	defer (wb_close_scope(p));
+
+	if (rs->init != nullptr) {
+		wb_build_stmt(p, rs->init);
+	}
+	Ast *val0 = wb_strip_and_prefix(rs->val0);
+	Ast *val1 = wb_strip_and_prefix(rs->val1);
+	Type *val0_type = val0 != nullptr && !is_blank_ident(val0) ? type_of_expr(val0) : nullptr;
+	Type *val1_type = val1 != nullptr && !is_blank_ident(val1) ? type_of_expr(val1) : nullptr;
+
+	auto const_val = [&](Type *type, ExactValue const &value) -> wbValue {
+		return type != nullptr ? wb_const(p, node, type, value) : wb_value_invalid();
+	};
+	// One expansion of the body, with its own scope for the loop variables
+	auto emit_body = [&](wbValue v0, wbValue v1) {
+		wb_open_scope(p);
+		if (val0_type != nullptr) wb_store_range_val(p, val0, wb_emit_conv(p, v0, val0_type));
+		if (val1_type != nullptr) wb_store_range_val(p, val1, wb_emit_conv(p, v1, val1_type));
+		wb_build_stmt(p, rs->body);
+		wb_close_scope(p);
+	};
+
+	Ast *expr = unparen_expr(rs->expr);
+	TypeAndValue tav = type_and_value_of_expr(expr);
+
+	if (is_ast_range(expr)) {
+		// `1..<4` / `1..=4`: both bounds are constant
+		ast_node(be, BinaryExpr, expr);
+		TokenKind op = be->op.kind == Token_RangeHalf ? Token_Lt : Token_LtEq;
+		ExactValue index = exact_value_i64(0);
+		for (ExactValue value = be->left->tav.value;
+		     compare_exact_values(op, value, be->right->tav.value);
+		     value = exact_value_increment_one(value), index = exact_value_increment_one(index)) {
+			emit_body(const_val(val0_type, value), const_val(val1_type, index));
+		}
+		return;
+	}
+
+	if (tav.mode == Addressing_Type) {
+		// `for value, index in Enum_Type`
+		Type *bt = base_type(type_deref(tav.type));
+		GB_ASSERT(bt->kind == Type_Enum);
+		for_array(i, bt->Enum.fields) {
+			Entity *f = bt->Enum.fields[i];
+			GB_ASSERT(f->kind == Entity_Constant);
+			emit_body(const_val(val0_type, f->Constant.value), const_val(val1_type, exact_value_i64(i)));
+		}
+		return;
+	}
+
+	Type *bt = base_type(tav.type);
+
+	if (rs->args.count != 0) {
+		// `#unroll(N)`: the length is only known at runtime, so the loop keeps
+		// N expansions of the body per iteration and a second loop walks the
+		// remaining elements one at a time:
+		//   i := 0
+		//   for ; i+N <= len(x); i += N { body }
+		//   for ; i < len(x);   i += 1 { body }
+		i64 unroll_count = exact_value_to_i64(rs->args[0]->tav.value);
+
+		u32 data_local = 0;
+		i32 data_offset = 0;
+		Type *elem_type = nullptr;
+		wbValue count = {};
+		switch (bt->kind) {
+		case Type_Slice:
+		case Type_DynamicArray: {
+			elem_type = bt->kind == Type_Slice ? bt->Slice.elem : bt->DynamicArray.elem;
+			wbValue s = wb_build_expr(p, expr);
+			if (s.kind == wbValue_Invalid) {
+				return;
+			}
+			wbValue data = wb_emit_slice_data(p, s);
+			count = wb_emit_slice_len(p, s);
+			data_local = data.index;
+			break;
+		}
+		case Type_Array: {
+			elem_type = bt->Array.elem;
+			count = wb_value_const_int(t_int, bt->Array.count);
+			wbValue v = wb_build_expr(p, expr);
+			if (v.kind == wbValue_Invalid) {
+				return;
+			}
+			wbAddr base = wb_value_to_addr(p, wb_value_copy(p, v));
+			if (base.kind != wbAddr_Memory) {
+				return;
+			}
+			data_local = base.index;
+			data_offset = base.offset;
+			break;
+		}
+		default:
+			wb_unsupported_type(p, node, tav.type);
+			return;
+		}
+		count = wb_value_to_local(p, count);
+
+		wbValue index = wb_value_local(wb_add_local(p, wbValType_i32), wbValType_i32, t_int);
+		wb_i32_const(p, 0);
+		wb_local_set(p, index.index);
+
+		// Emits one expansion of the body for the element at `index`, then increments it
+		auto emit_element = [&]() {
+			wbAddr elem = wb_emit_elem_addr(p, data_local, data_offset, index, elem_type);
+			emit_body(val0_type != nullptr ? wb_addr_load(p, elem) : wb_value_invalid(), index);
+			wb_local_get(p, index.index);
+			wb_i32_const(p, 1);
+			wb_op(p, wbOp_i32_add);
+			wb_local_set(p, index.index);
+		};
+
+		u32 done_depth = wb_open_block(p);
+		u32 tail_depth = unroll_count > 1 ? wb_open_block(p) : done_depth;
+		u32 loop_depth = wb_open_loop(p);
+
+		wb_local_get(p, index.index);
+		wb_i32_const(p, cast(i32)unroll_count);
+		wb_op(p, wbOp_i32_add);
+		wb_push(p, count);
+		wb_op(p, wbOp_i32_gt_s);
+		wb_br_if(p, tail_depth);
+
+		for (i64 i = 0; i < unroll_count; i++) {
+			emit_element();
+		}
+		wb_br(p, loop_depth);
+		wb_close(p); // loop
+
+		if (unroll_count > 1) {
+			wb_close(p); // tail
+			u32 tail_loop_depth = wb_open_loop(p);
+			wb_local_get(p, index.index);
+			wb_push(p, count);
+			wb_op(p, wbOp_i32_ge_s);
+			wb_br_if(p, done_depth);
+			emit_element();
+			wb_br(p, tail_loop_depth);
+			wb_close(p); // tail loop
+		}
+		wb_close(p); // done
+		return;
+	}
+
+	switch (bt->kind) {
+	case Type_Basic: {
+		// a constant string: the rune and its byte offset
+		GB_ASSERT(tav.value.kind == ExactValue_String);
+		String str = tav.value.value_string;
+		isize offset = 0;
+		do {
+			Rune codepoint = 0;
+			isize width = utf8_decode(str.text+offset, str.len-offset, &codepoint);
+			emit_body(const_val(val0_type, exact_value_i64(codepoint)), const_val(val1_type, exact_value_i64(offset)));
+			offset += width;
+		} while (offset < str.len);
+		return;
+	}
+	case Type_Array:
+	case Type_EnumeratedArray: {
+		bool is_enumerated = bt->kind == Type_EnumeratedArray;
+		i64 count      = is_enumerated ? bt->EnumeratedArray.count : bt->Array.count;
+		Type *elem     = is_enumerated ? bt->EnumeratedArray.elem  : bt->Array.elem;
+		i64 index_min  = is_enumerated ? exact_value_to_i64(*bt->EnumeratedArray.min_value) : 0;
+		if (count == 0) {
+			return;
+		}
+		wbValue v = wb_build_expr(p, expr);
+		if (v.kind == wbValue_Invalid) {
+			return;
+		}
+		wbAddr src = wb_value_to_addr(p, wb_value_copy(p, v));
+		if (src.kind != wbAddr_Memory) {
+			return;
+		}
+		i64 elem_size = type_size_of(elem);
+		for (i64 i = 0; i < count; i++) {
+			wbValue value = {};
+			if (val0_type != nullptr) {
+				value = wb_addr_load(p, wb_addr_offset(src, i*elem_size, elem));
+			}
+			emit_body(value, const_val(val1_type, exact_value_i64(index_min + i)));
+		}
+		return;
+	}
+	default:
+		break;
+	}
+	wb_unsupported_type(p, node, tav.type);
+}
+
 gb_internal void wb_build_switch_stmt(wbProcedure *p, AstSwitchStmt *ss, Ast *node) {
 	// block $exit
 	//   block $body_{n-1} ... block $body_0
@@ -1400,6 +1610,10 @@ gb_internal void wb_build_stmt(wbProcedure *p, Ast *node) {
 		wb_build_range_stmt(p, rs, node);
 	case_end;
 
+	case_ast_node(rs, UnrollRangeStmt, node);
+		wb_build_unroll_range_stmt(p, rs, node);
+	case_end;
+
 	case_ast_node(ss, SwitchStmt, node);
 		wb_build_switch_stmt(p, ss, node);
 	case_end;
@@ -1499,10 +1713,19 @@ gb_internal void wb_prescan_addressed(wbProcedure *p, Ast *node) {
 		wb_prescan_addressed(p, node->SliceExpr.high);
 		break;
 	case Ast_DerefExpr:    wb_prescan_addressed(p, node->DerefExpr.expr); break;
-	case Ast_CallExpr:
+	case Ast_CallExpr: {
 		wb_prescan_addressed(p, node->CallExpr.proc);
 		for (Ast *arg : node->CallExpr.args) wb_prescan_addressed(p, arg);
+		// `@(deferred_in_by_ptr)` procedures receive the addresses of the arguments
+		Entity *e = entity_of_node(node->CallExpr.proc);
+		if (e != nullptr && e->kind == Entity_Procedure && entity_has_deferred_procedure(e)) {
+			DeferredProcedureKind kind = e->Procedure.deferred_procedure.kind;
+			if (kind == DeferredProcedure_in_by_ptr || kind == DeferredProcedure_in_out_by_ptr) {
+				for (Ast *arg : node->CallExpr.args) wb_mark_addressed_root(p, arg);
+			}
+		}
 		break;
+	}
 	case Ast_FieldValue:   wb_prescan_addressed(p, node->FieldValue.value); break;
 	case Ast_CompoundLit:
 		for (Ast *elem : node->CompoundLit.elems) wb_prescan_addressed(p, elem);
@@ -1556,6 +1779,11 @@ gb_internal void wb_prescan_addressed(wbProcedure *p, Ast *node) {
 		wb_prescan_addressed(p, node->RangeStmt.init);
 		wb_prescan_addressed(p, node->RangeStmt.expr);
 		wb_prescan_addressed(p, node->RangeStmt.body);
+		break;
+	case Ast_UnrollRangeStmt:
+		wb_prescan_addressed(p, node->UnrollRangeStmt.init);
+		wb_prescan_addressed(p, node->UnrollRangeStmt.expr);
+		wb_prescan_addressed(p, node->UnrollRangeStmt.body);
 		break;
 	case Ast_SwitchStmt:
 		wb_prescan_addressed(p, node->SwitchStmt.init);

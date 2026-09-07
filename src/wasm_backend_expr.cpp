@@ -1576,12 +1576,46 @@ gb_internal void wb_build_compound_lit(wbProcedure *p, Ast *expr, wbAddr dst) {
 		Type *et = bt->Slice.elem;
 		i64 count = gb_max(cl->max_count, cast(i64)cl->elems.count);
 		Type *array_type = alloc_type_array(et, count);
-		wbAddr backing = wb_add_temp(p, array_type);
+		wbAddr backing = wb_add_temp_or_static(p, array_type);
 		wb_addr_zero(p, backing);
 		wb_build_compound_lit_array_elems(p, expr, cl->elems, backing, et);
 		wbValue data = wb_addr_get_ptr(p, backing, alloc_type_multi_pointer(et));
 		wb_emit_store(p, dst.index, dst.offset, data, t_rawptr);
 		wb_emit_store(p, dst.index, dst.offset + cast(i32)build_context.int_size, wb_value_const_int(t_int, count), t_int);
+		return;
+	}
+	case Type_DynamicArray: {
+		// reserve, fill a backing array on the stack, then append it in one go
+		String proc_name = p->entity != nullptr ? p->entity->token.string : p->name;
+		TokenPos pos = ast_token(expr).pos;
+		Type *et = bt->DynamicArray.elem;
+		wbValue size  = wb_value_const_int(t_int, type_size_of(et));
+		wbValue align = wb_value_const_int(t_int, type_align_of(et));
+		i64 count = gb_max(cl->max_count, cast(i64)cl->elems.count);
+		{
+			auto args = array_make<wbValue>(temporary_allocator(), 5);
+			args[0] = wb_addr_get_ptr(p, dst, t_rawptr);
+			args[1] = size;
+			args[2] = align;
+			args[3] = wb_value_const_int(t_int, count);
+			args[4] = wb_source_code_location(p, proc_name, pos);
+			wb_emit_runtime_call(p, "__dynamic_array_reserve", args);
+		}
+
+		wbAddr items = wb_add_temp(p, alloc_type_array(et, count));
+		wb_addr_zero(p, items);
+		wb_build_compound_lit_array_elems(p, expr, cl->elems, items, et);
+
+		{
+			auto args = array_make<wbValue>(temporary_allocator(), 6);
+			args[0] = wb_addr_get_ptr(p, dst, t_rawptr);
+			args[1] = size;
+			args[2] = align;
+			args[3] = wb_addr_get_ptr(p, items, t_rawptr);
+			args[4] = wb_value_const_int(t_int, count);
+			args[5] = wb_source_code_location(p, proc_name, pos);
+			wb_emit_runtime_call(p, "__dynamic_array_append", args);
+		}
 		return;
 	}
 	case Type_Map: {
@@ -1669,7 +1703,21 @@ gb_internal wbValue wb_build_unary_expr(wbProcedure *p, Ast *expr) {
 	if (ue->op.kind == Token_And) {
 		// &x
 		Ast *inner = unparen_expr(ue->expr);
-		wbAddr addr = wb_build_addr(p, inner);
+		wbAddr addr = {};
+		if (inner->kind == Ast_CompoundLit && wb_is_startup_proc(p)) {
+			// `x := &T{...}` at file scope: the literal must outlive the
+			// initializer, so it gets static storage (lb_add_global_generated_from_procedure)
+			Type *lit_type = type_of_expr(inner);
+			addr = wb_add_temp_or_static(p, lit_type);
+			TypeAndValue tav = type_and_value_of_expr(inner);
+			if (tav.value.kind != ExactValue_Invalid) {
+				wb_addr_store(p, addr, wb_const(p, inner, lit_type, tav.value));
+			} else {
+				wb_build_compound_lit(p, inner, addr);
+			}
+		} else {
+			addr = wb_build_addr(p, inner);
+		}
 		if (addr.kind == wbAddr_Invalid) {
 			return wb_value_invalid();
 		}
@@ -2983,7 +3031,13 @@ gb_internal wbValue wb_build_builtin_call(wbProcedure *p, Ast *expr, BuiltinProc
 	wbValType vt = type != nullptr ? wb_valtype_of(type) : wbValType_Invalid;
 	Slice<Ast *> const &args = ce->args;
 
+	if (id >= BuiltinProc_atomic_type_is_lock_free && id <= BuiltinProc_atomic_compare_exchange_weak_explicit) {
+		return wb_build_atomic_call(p, expr, id);
+	}
+
 	switch (id) {
+	case BuiltinProc_cpu_relax:
+		return wb_value_invalid();
 	case BuiltinProc_len:
 	case BuiltinProc_cap: {
 		Type *at = base_type(type_of_expr(args[0]));
@@ -3022,10 +3076,35 @@ gb_internal wbValue wb_build_builtin_call(wbProcedure *p, Ast *expr, BuiltinProc
 		}
 		break;
 	}
+	case BuiltinProc_swizzle: {
+		// swizzle(a, i, j, ...): copy the selected elements into a temporary.
+		// `#simd[N]T` is laid out like `[N]T` (see wasm_backend_simd.cpp), so
+		// both kinds of vector are handled the same way.
+		wbValue v = wb_build_expr(p, args[0]);
+		if (v.kind == wbValue_Invalid || args.count == 1) {
+			return v;
+		}
+		wbAddr src = wb_value_to_addr(p, v);
+		Type *at = base_type(src.type);
+		Type *elem = at->kind == Type_SimdVector ? at->SimdVector.elem : at->Array.elem;
+		i64 elem_size = type_size_of(elem);
+		wbAddr res = wb_add_temp(p, type);
+		for (isize i = 1; i < args.count; i++) {
+			i64 index = exact_value_to_i64(args[i]->tav.value);
+			wb_emit_copy(p, res.index, res.offset + cast(i32)((i-1)*elem_size),
+			             src.index, src.offset + cast(i32)(index*elem_size), elem_size);
+		}
+		return wb_value_memory(res.index, res.offset, type);
+	}
+
 	case BuiltinProc_soa_zip:
 		return wb_build_soa_zip(p, expr);
 	case BuiltinProc_soa_unzip:
 		return wb_build_soa_unzip(p, expr);
+	case BuiltinProc_type_equal_proc:
+		return wb_value_const_int(type, wb_table_index(p->module, wb_equal_proc_for_type(p->module, args[0]->tav.type)));
+	case BuiltinProc_type_hasher_proc:
+		return wb_value_const_int(type, wb_table_index(p->module, wb_hasher_proc_for_type(p->module, args[0]->tav.type)));
 	case BuiltinProc_type_map_info:
 		return wb_value_const_int(type, wb_map_info_addr(p->module, args[0]->tav.type));
 	case BuiltinProc_type_map_cell_info:
@@ -3695,6 +3774,114 @@ gb_internal wbValue wb_build_variadic_slice(wbProcedure *p, Type *slice_type, Sl
 
 gb_internal wbValue wb_build_call_expr_internal(wbProcedure *p, Ast *expr);
 
+// Registers the call to the `@(deferred_*)` procedure of `e` for the end of
+// the current scope. `in_args` are the call's arguments (one per parameter),
+// `result` its value (lb_add_defer_proc).
+gb_internal void wb_add_defer_proc(wbProcedure *p, Ast *expr, Entity *e, Array<wbValue> const &in_args, wbValue result) {
+	ast_node(ce, CallExpr, expr);
+	DeferredProcedureKind kind = e->Procedure.deferred_procedure.kind;
+	Entity *deferred_entity = e->Procedure.deferred_procedure.entity;
+	wbProcedure *deferred = wb_procedure_for_entity(p->module, deferred_entity);
+	if (deferred == nullptr) {
+		return;
+	}
+	Type *pt = base_type(deferred_entity->type);
+
+	bool by_ptr = false;
+	bool use_in = false, use_out = false;
+	switch (kind) {
+	case DeferredProcedure_none:                             break;
+	case DeferredProcedure_in_by_ptr:     by_ptr = true;     /*fallthrough*/
+	case DeferredProcedure_in:            use_in = true;     break;
+	case DeferredProcedure_out_by_ptr:    by_ptr = true;     /*fallthrough*/
+	case DeferredProcedure_out:           use_out = true;    break;
+	case DeferredProcedure_in_out_by_ptr: by_ptr = true;     /*fallthrough*/
+	case DeferredProcedure_in_out:        use_in = use_out = true; break;
+	}
+
+	// The expressions the in-arguments came from, for `by_ptr` (nullptr if unknown)
+	auto values = array_make<wbValue>(permanent_allocator(), 0, in_args.count+4);
+	auto exprs  = array_make<Ast *>(temporary_allocator(), 0, in_args.count+4);
+	if (use_in) {
+		Type *ct = base_type(e->type);
+		isize variadic_index = ct->Proc.variadic ? ct->Proc.variadic_index : ct->Proc.params->Tuple.variables.count;
+		Slice<Ast *> const &positional = ce->split_args->positional;
+		bool positional_map = true; // positional[i] corresponds to parameter i
+		for (Ast *arg : positional) {
+			if (is_type_tuple(type_of_expr(arg))) {
+				positional_map = false;
+			}
+		}
+		for_array(i, in_args) {
+			wbValue const &v = in_args[i];
+			if (v.kind == wbValue_Invalid) {
+				continue;
+			}
+			Ast *arg = nullptr;
+			if (positional_map && i < variadic_index && i < positional.count) {
+				arg = positional[i];
+			}
+			array_add(&values, v);
+			array_add(&exprs, arg);
+		}
+	}
+	if (use_out && result.kind != wbValue_Invalid) {
+		if (is_type_tuple(result.type)) {
+			for_array(i, result.type->Tuple.variables) {
+				array_add(&values, wb_tuple_field(p, result, i));
+			}
+		} else {
+			array_add(&values, result);
+		}
+	}
+
+	// The values must survive until the end of the scope, so they are copied
+	// into storage nothing else writes to.
+	isize param_index = 0;
+	for_array(i, values) {
+		wbValue v = values[i];
+		Type *param_type = nullptr;
+		while (param_index < pt->Proc.params->Tuple.variables.count) {
+			Entity *param = pt->Proc.params->Tuple.variables[param_index++];
+			if (param->kind == Entity_Variable) {
+				param_type = param->type;
+				break;
+			}
+		}
+		if (param_type == nullptr) {
+			break;
+		}
+		if (by_ptr) {
+			// An addressable argument is passed by its own address, so that
+			// the deferred procedure sees later changes to it (lb_address_from_load_or_generate_local)
+			Ast *arg = i < exprs.count ? exprs[i] : nullptr;
+			wbAddr src = {};
+			if (arg != nullptr && arg->tav.mode == Addressing_Variable && !wb_expr_has_call(arg) &&
+			    are_types_identical(type_of_expr(arg), v.type)) {
+				src = wb_build_addr(p, arg);
+				if (src.kind != wbAddr_Local && src.kind != wbAddr_Memory) {
+					src = {};
+				}
+			}
+			if (src.kind == wbAddr_Invalid) {
+				src = wb_add_temp(p, v.type);
+				wb_addr_store(p, src, v);
+			}
+			values[i] = wb_value_fresh(p, wb_emit_conv(p, wb_addr_get_ptr(p, src, alloc_type_pointer(v.type)), param_type));
+		} else {
+			values[i] = wb_value_fresh(p, wb_emit_conv(p, v, param_type));
+		}
+	}
+
+	wbDefer d = {};
+	d.scope_index = p->scopes.count;
+	d.context_stack_count = p->context_stack.count;
+	d.proc = deferred;
+	d.proc_type = pt;
+	d.proc_args = values;
+	array_add(&p->defers, d);
+}
+
 gb_internal wbValue wb_build_call_expr(wbProcedure *p, Ast *expr) {
 	ast_node(ce, CallExpr, expr);
 	wbValue res = wb_build_call_expr_internal(p, expr);
@@ -3737,6 +3924,10 @@ gb_internal wbValue wb_build_call_expr_internal(wbProcedure *p, Ast *expr) {
 	// Direct call if the callee is a known procedure, otherwise through the table
 	Entity *e = entity_of_node(ce->proc);
 	wbProcedure *callee = nullptr;
+	if (e != nullptr && (e->flags & EntityFlag_Disabled)) {
+		// `@(disabled=true)` procedure: the call is removed
+		return wb_value_invalid();
+	}
 	wbValue proc_value = {};
 	if (e != nullptr && e->kind == Entity_Procedure) {
 		callee = wb_procedure_for_entity(p->module, e);
@@ -3882,7 +4073,12 @@ gb_internal wbValue wb_build_call_expr_internal(wbProcedure *p, Ast *expr) {
 		}
 		array_add(&final_args, v);
 	}
-	return wb_emit_call(p, pt, callee, proc_value, final_args);
+	wbValue result = wb_emit_call(p, pt, callee, proc_value, final_args);
+
+	if (e != nullptr && e->kind == Entity_Procedure && entity_has_deferred_procedure(e)) {
+		wb_add_defer_proc(p, expr, e, args, result);
+	}
+	return result;
 }
 
 // or_else / or_return

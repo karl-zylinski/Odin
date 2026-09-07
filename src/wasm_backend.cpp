@@ -18,11 +18,15 @@ gb_internal void    wb_emit_epilogue(wbProcedure *p);
 gb_internal wbValue wb_emit_conv(wbProcedure *p, wbValue v, Type *dst);
 gb_internal wbValue wb_value_copy(wbProcedure *p, wbValue v);
 gb_internal wbProcedure *wb_procedure_for_entity(wbModule *m, Entity *e);
+gb_internal u32 wb_data_alloc(wbModule *m, i64 size, i64 align);
 gb_internal u32     wb_table_index(wbModule *m, wbProcedure *p);
+gb_internal wbProcedure *wb_hasher_proc_for_type(wbModule *m, Type *type);
+gb_internal wbProcedure *wb_equal_proc_for_type(wbModule *m, Type *type);
 gb_internal void    wb_build_compound_lit(wbProcedure *p, Ast *expr, wbAddr dst);
 gb_internal void    wb_prescan_addressed(wbProcedure *p, Ast *node);
 gb_internal void    wb_emit_global_inits(wbProcedure *p);
 gb_internal void    wb_emit_call_no_args(wbProcedure *p, Entity *e);
+gb_internal wbValue wb_emit_call(wbProcedure *p, Type *pt, wbProcedure *callee, wbValue proc_value, Array<wbValue> const &args);
 gb_internal wbAddr  wb_context_addr(wbProcedure *p);
 gb_internal wbAddr  wb_context_for_write(wbProcedure *p);
 gb_internal void    wb_push_context_ptr(wbProcedure *p, wbAddr ctx);
@@ -50,6 +54,7 @@ gb_internal wbValue wb_soa_len(wbProcedure *p, wbAddr soa);
 gb_internal wbValue wb_soa_cap(wbProcedure *p, wbAddr soa);
 gb_internal wbValue wb_build_soa_slice_expr(wbProcedure *p, Ast *expr);
 gb_internal wbValue wb_build_soa_zip(wbProcedure *p, Ast *expr);
+gb_internal wbValue wb_build_atomic_call(wbProcedure *p, Ast *expr, BuiltinProcId id);
 gb_internal wbValue wb_build_soa_unzip(wbProcedure *p, Ast *expr);
 gb_internal void    wb_build_range_soa(wbProcedure *p, AstRangeStmt *rs, Ast *node, Ast *val0, Ast *val1);
 
@@ -723,6 +728,21 @@ gb_internal wbAddr wb_addr_local(u32 index, Type *type) {
 gb_internal wbAddr wb_add_temp(wbProcedure *p, Type *type) {
 	i32 offset = wb_alloc_slot(p, type_size_of(type), type_align_of(type));
 	return wb_addr_memory(p->fp_local, offset, type);
+}
+
+// True for the procedures that run the global variable initializers
+gb_internal bool wb_is_startup_proc(wbProcedure *p) {
+	return p == p->module->startup || p == p->module->startup_runtime;
+}
+
+// Frame storage, or static storage in a startup procedure (where a value
+// referenced by a global initializer must outlive the procedure)
+gb_internal wbAddr wb_add_temp_or_static(wbProcedure *p, Type *type) {
+	if (wb_is_startup_proc(p)) {
+		u32 addr = wb_data_alloc(p->module, type_size_of(type), type_align_of(type));
+		return wb_addr_memory(WB_NO_LOCAL, cast(i32)addr, type);
+	}
+	return wb_add_temp(p, type);
 }
 
 // Memory access
@@ -1845,6 +1865,7 @@ gb_internal void wb_push_context_ptr(wbProcedure *p, wbAddr ctx) {
 #include "wasm_backend_map.cpp"
 #include "wasm_backend_stmt.cpp"
 #include "wasm_backend_soa.cpp"
+#include "wasm_backend_atomic.cpp"
 
 // Procedure bodies
 
