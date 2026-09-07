@@ -3970,6 +3970,33 @@ gb_internal wbValue wb_build_builtin_call_internal(wbProcedure *p, Ast *expr, Bu
 	case BuiltinProc_wasm_memory_size:
 		wb_op_idx(p, wbOp_memory_size, 0);
 		return wb_pop_to_local(p, wbValType_i32, type);
+	case BuiltinProc_wasm_memory_atomic_wait32: {
+		// Single threaded: nobody can change the value or notify, so the wait
+		// either fails the comparison (1) or times out (2)
+		wbValue ptr = wb_build_expr(p, args[0]);
+		if (ptr.kind == wbValue_Invalid) return ptr;
+		if (wb_expr_has_call(args[1]) || wb_expr_has_call(args[2])) ptr = wb_value_fresh(p, ptr);
+		wbValue expected = wb_emit_conv(p, wb_build_expr(p, args[1]), t_u32);
+		if (expected.kind == wbValue_Invalid) return expected;
+		if (wb_expr_has_call(args[2])) expected = wb_value_fresh(p, expected);
+		wbValue timeout = wb_build_expr(p, args[2]); // evaluated for its side effects only
+		if (timeout.kind == wbValue_Invalid) return timeout;
+		wb_push(p, wb_value_const_int(t_u32, 2));
+		wb_push(p, wb_value_const_int(t_u32, 1));
+		wb_push(p, wb_addr_load(p, wb_addr_from_pointer(p, ptr, t_u32)));
+		wb_push(p, expected);
+		wb_op(p, wbOp_i32_eq);
+		wb_op(p, wbOp_select);
+		return wb_pop_to_local(p, wbValType_i32, type);
+	}
+	case BuiltinProc_wasm_memory_atomic_notify32: {
+		// Single threaded: there are never any waiters to wake
+		for (Ast *arg : args) {
+			wbValue v = wb_build_expr(p, arg);
+			if (v.kind == wbValue_Invalid) return v;
+		}
+		return wb_const(p, expr, type, exact_value_u64(0));
+	}
 	case BuiltinProc_count_ones:
 	case BuiltinProc_count_trailing_zeros:
 	case BuiltinProc_count_leading_zeros: {

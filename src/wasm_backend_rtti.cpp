@@ -305,7 +305,9 @@ gb_internal Type *wb_rtti_write_variant(wbModule *m, Type *t, u8 *dst) {
 			wb_rtti_int(dst, st, 1, align_formula(t->Union.variant_block_size, union_tag_size(t)));
 			wb_rtti_int(dst, st, 2, wb_rtti_type_info_ptr(m, union_tag_type(t)));
 		}
-		// TODO(wasm): field 3 `equal` for comparable-but-not-simple unions
+		if (is_type_comparable(t) && !is_type_simple_compare(t)) {
+			wb_rtti_int(dst, st, 3, wb_table_index(m, wb_equal_proc_for_type(m, t)));
+		}
 		wb_rtti_int(dst, st, 4, t->Union.custom_align != 0);
 		wb_rtti_int(dst, st, 5, t->Union.kind == UnionType_no_nil);
 		wb_rtti_int(dst, st, 6, t->Union.kind == UnionType_shared_nil);
@@ -319,7 +321,9 @@ gb_internal Type *wb_rtti_write_variant(wbModule *m, Type *t, u8 *dst) {
 		if (t->Struct.is_all_or_none) flags |= 1<<2;
 		if (t->Struct.custom_align)   flags |= 1<<3;
 		wb_rtti_int(dst, st, 6, flags);
-		// TODO(wasm): field 10 `equal` for comparable-but-not-simple structs
+		if (is_type_comparable(t) && !is_type_simple_compare(t)) {
+			wb_rtti_int(dst, st, 10, wb_table_index(m, wb_equal_proc_for_type(m, t)));
+		}
 		if (t->Struct.soa_kind != StructSoa_None) {
 			wb_rtti_int(dst, st, 7, t->Struct.soa_kind);
 			wb_rtti_int(dst, st, 8, t->Struct.soa_count);
