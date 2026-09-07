@@ -53,6 +53,10 @@ gb_internal wbProcedure *wb_hasher_proc_for_type(wbModule *m, Type *type) {
 // `proc "contextless" (a, b: rawptr) -> bool`
 gb_internal wbProcedure *wb_equal_proc_for_type(wbModule *m, Type *type) {
 	type = base_type(type);
+	if (type->kind == Type_Matrix) {
+		// padding-free: compare the stored elements
+		type = alloc_type_array(type->Matrix.elem, matrix_type_total_internal_elems(type));
+	}
 	GB_ASSERT(t_equal_proc != nullptr);
 	return wb_gen_proc_for_type(m, "__$equal", type, t_equal_proc, wbProcGen_Equal);
 }
@@ -216,7 +220,7 @@ gb_internal wbValue wb_emit_equal_at(wbProcedure *p, Type *type, wbValue lhs, wb
 		wbValue r = wb_addr_load(p, wb_addr_memory(rhs.index, 0, type));
 		return wb_emit_arith(p, nullptr, Token_CmpEq, l, r, type, t_bool);
 	}
-	if ((is_type_string(bt) && !is_type_cstring(bt)) || is_type_simple_compare(type)) {
+	if ((is_type_string(bt) && !is_type_cstring(bt)) || is_type_simple_compare(type) || is_type_complex(bt) || is_type_quaternion(bt)) {
 		wbValue l = wb_value_memory(lhs.index, 0, type);
 		wbValue r = wb_value_memory(rhs.index, 0, type);
 		return wb_emit_aggregate_compare(p, nullptr, Token_CmpEq, l, r, type, t_bool);

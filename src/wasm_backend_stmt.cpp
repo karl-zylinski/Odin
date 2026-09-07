@@ -189,11 +189,15 @@ gb_internal void wb_build_assign_stmt(wbProcedure *p, AstAssignStmt *as, Ast *no
 	GB_ASSERT(as->lhs.count == 1 && as->rhs.count == 1);
 	Ast *lhs = as->lhs[0];
 	TokenKind op = cast(TokenKind)(as->op.kind - Token_AddEq + Token_Add);
-	if (as->op.kind == Token_CmpAndEq || as->op.kind == Token_CmpOrEq) {
-		wb_unsupported(p, node, "'&&=' / '||=' assignment");
+	Type *type = type_of_expr(lhs);
+	if (op == Token_CmpAnd || op == Token_CmpOr) {
+		wbValue res = wb_emit_logical_binary(p, node, op, lhs, as->rhs[0], type);
+		wbAddr addr = wb_build_addr(p, lhs);
+		if (addr.kind != wbAddr_Invalid) {
+			wb_addr_store(p, addr, res);
+		}
 		return;
 	}
-	Type *type = type_of_expr(lhs);
 	if (wb_lhs_is_context(lhs)) {
 		wb_context_for_write(p);
 	}
@@ -206,7 +210,8 @@ gb_internal void wb_build_assign_stmt(wbProcedure *p, AstAssignStmt *as, Ast *no
 		left = wb_value_fresh(p, left);
 	}
 	wbValue right = wb_build_expr(p, as->rhs[0]);
-	if (op != Token_Shl && op != Token_Shr) {
+	if (op != Token_Shl && op != Token_Shr && !is_type_matrix(right.type)) {
+		// (`array *= matrix` keeps the matrix operand as is)
 		right = wb_emit_conv(p, right, type);
 	}
 	wbValue res = wb_emit_arith(p, node, op, left, right, type, type);
@@ -621,10 +626,16 @@ gb_internal void wb_build_range_indexed(wbProcedure *p, AstRangeStmt *rs, Ast *n
 		return;
 	}
 
+	i64 index_min = 0; // enumerated arrays: index value of the first element
 	switch (bt->kind) {
 	case Type_Array:
 		count = wb_value_const_int(t_int, bt->Array.count);
 		elem_type = bt->Array.elem;
+		break;
+	case Type_EnumeratedArray:
+		count = wb_value_const_int(t_int, bt->EnumeratedArray.count);
+		elem_type = bt->EnumeratedArray.elem;
+		index_min = exact_value_to_i64(*bt->EnumeratedArray.min_value);
 		break;
 	case Type_Slice:
 		elem_type = bt->Slice.elem;
@@ -647,7 +658,7 @@ gb_internal void wb_build_range_indexed(wbProcedure *p, AstRangeStmt *rs, Ast *n
 	// Element base pointer for slice-like types
 	u32 data_local = base.index;
 	i32 data_offset = base.offset;
-	if (bt->kind != Type_Array) {
+	if (bt->kind != Type_Array && bt->kind != Type_EnumeratedArray) {
 		wbValue s = wb_value_memory(base.index, base.offset, bt);
 		wbValue data = wb_emit_slice_data(p, s);
 		count = wb_emit_slice_len(p, s);
@@ -736,7 +747,18 @@ gb_internal void wb_build_range_indexed(wbProcedure *p, AstRangeStmt *rs, Ast *n
 				wb_store_range_val(p, val0, wb_addr_load(p, elem));
 			}
 		}
-		wb_store_range_val(p, val1, wb_value_local(index, wbValType_i32, t_int));
+		if (bt->kind == Type_EnumeratedArray && val1 != nullptr && !is_blank_ident(val1)) {
+			// the index is an enum value: index + min_value
+			wb_local_get(p, index);
+			if (index_min != 0) {
+				wb_i32_const(p, cast(i32)index_min);
+				wb_op(p, wbOp_i32_add);
+			}
+			wbValue idx = wb_pop_to_local(p, wbValType_i32, t_int);
+			wb_store_range_val(p, val1, wb_emit_conv(p, idx, type_of_expr(val1)));
+		} else {
+			wb_store_range_val(p, val1, wb_value_local(index, wbValType_i32, t_int));
+		}
 	}
 
 	u32 continue_depth = wb_open_block(p);
@@ -758,6 +780,73 @@ gb_internal void wb_build_range_indexed(wbProcedure *p, AstRangeStmt *rs, Ast *n
 		wb_op(p, wbOp_i32_eqz);
 		wb_br_if(p, break_depth);
 	}
+	wb_br(p, loop_depth);
+	wb_close(p); // loop
+	wb_close(p); // break
+}
+
+// `for value, index in Enum_Type`: iterates a constant table of the enum values
+gb_internal void wb_build_range_enum(wbProcedure *p, AstRangeStmt *rs, Ast *node, Type *enum_type, Ast *val0, Ast *val1) {
+	Type *bt = base_type(enum_type);
+	GB_ASSERT(bt->kind == Type_Enum);
+	isize count = bt->Enum.fields.count;
+	Type *elem = wb_is_int128(bt) ? nullptr : (type_size_of(bt) > 4 ? t_i64 : t_i32);
+	if (elem == nullptr) {
+		wb_unsupported_type(p, node, enum_type);
+		return;
+	}
+
+	// The values in the data segment (in declaration order)
+	i64 elem_size = type_size_of(elem);
+	u8 *bytes = gb_alloc_array(temporary_allocator(), u8, count*elem_size);
+	for_array(i, bt->Enum.fields) {
+		Entity *f = bt->Enum.fields[i];
+		GB_ASSERT(f->kind == Entity_Constant);
+		i64 v = exact_value_to_i64(f->Constant.value);
+		gb_memmove(bytes + i*elem_size, &v, elem_size);
+	}
+	u32 table = wb_data_alloc(p->module, count*elem_size, elem_size);
+	wb_data_write(p->module, table, bytes, count*elem_size);
+
+	u32 index = wb_add_local(p, wbValType_i32);
+	if (rs->reverse) {
+		wb_i32_const(p, cast(i32)count - 1);
+	} else {
+		wb_i32_const(p, 0);
+	}
+	wb_local_set(p, index);
+
+	u32 break_depth = wb_open_block(p);
+	u32 loop_depth  = wb_open_loop(p);
+
+	wb_local_get(p, index);
+	if (rs->reverse) {
+		wb_i32_const(p, 0);
+		wb_op(p, wbOp_i32_lt_s);
+	} else {
+		wb_i32_const(p, cast(i32)count);
+		wb_op(p, wbOp_i32_ge_s);
+	}
+	wb_br_if(p, break_depth);
+
+	wb_open_scope(p);
+	wbAddr elem_addr = wb_emit_elem_addr(p, WB_NO_LOCAL, cast(i32)table, wb_value_local(index, wbValType_i32, t_int), elem);
+	wbValue v = wb_addr_load(p, elem_addr);
+	v.type = enum_type;
+	wb_store_range_val(p, val0, v);
+	wb_store_range_val(p, val1, wb_value_local(index, wbValType_i32, t_int));
+
+	u32 continue_depth = wb_open_block(p);
+	wb_push_label(p, rs->label, break_depth, continue_depth, true);
+	wb_build_stmt(p, rs->body);
+	wb_pop_label(p);
+	wb_close(p); // continue
+	wb_close_scope(p);
+
+	wb_local_get(p, index);
+	wb_i32_const(p, 1);
+	wb_op(p, rs->reverse ? wbOp_i32_sub : wbOp_i32_add);
+	wb_local_set(p, index);
 	wb_br(p, loop_depth);
 	wb_close(p); // loop
 	wb_close(p); // break
@@ -957,7 +1046,12 @@ gb_internal void wb_build_range_stmt(wbProcedure *p, AstRangeStmt *rs, Ast *node
 	if (is_ast_range(expr)) {
 		wb_build_range_interval(p, rs, node, val0, val1);
 	} else if (tv.mode == Addressing_Type) {
-		wb_unsupported(p, node, "range over a type");
+		Type *t = type_deref(tv.type);
+		if (is_type_enum(t)) {
+			wb_build_range_enum(p, rs, node, t, val0, val1);
+		} else {
+			wb_unsupported(p, node, "range over a type");
+		}
 	} else if (tv.type != nullptr && base_type(tv.type)->kind == Type_Tuple) {
 		wb_build_range_tuple(p, rs, node, base_type(tv.type));
 	} else {
@@ -967,6 +1061,7 @@ gb_internal void wb_build_range_stmt(wbProcedure *p, AstRangeStmt *rs, Ast *node
 		}
 		switch (bt->kind) {
 		case Type_Array:
+		case Type_EnumeratedArray:
 		case Type_Slice:
 		case Type_DynamicArray:
 			wb_build_range_indexed(p, rs, node, val0, val1);
@@ -976,6 +1071,13 @@ gb_internal void wb_build_range_stmt(wbProcedure *p, AstRangeStmt *rs, Ast *node
 			break;
 		case Type_Map:
 			wb_build_range_map(p, rs, node, val0, val1);
+			break;
+		case Type_Struct:
+			if (is_type_soa_struct(bt)) {
+				wb_build_range_soa(p, rs, node, val0, val1);
+			} else {
+				wb_unsupported_type(p, node, tv.type);
+			}
 			break;
 		case Type_Basic:
 			if (is_type_string(bt) && !is_type_cstring(bt)) {
@@ -1234,8 +1336,32 @@ gb_internal void wb_build_type_switch_stmt(wbProcedure *p, AstTypeSwitchStmt *ss
 
 gb_internal void wb_build_stmt(wbProcedure *p, Ast *node) {
 	p->curr_stmt = node;
+
+	u16 prev_state_flags = p->state_flags;
+	defer (p->state_flags = prev_state_flags);
+	if (node->state_flags != 0) {
+		u16 in = node->state_flags;
+		u16 out = p->state_flags;
+		if (in & StateFlag_bounds_check) {
+			out |= StateFlag_bounds_check;
+			out &= ~StateFlag_no_bounds_check;
+		} else if (in & StateFlag_no_bounds_check) {
+			out |= StateFlag_no_bounds_check;
+			out &= ~StateFlag_bounds_check;
+		}
+		if (in & StateFlag_no_type_assert) {
+			out |= StateFlag_no_type_assert;
+			out &= ~StateFlag_type_assert;
+		} else if (in & StateFlag_type_assert) {
+			out |= StateFlag_type_assert;
+			out &= ~StateFlag_no_type_assert;
+		}
+		p->state_flags = out;
+	}
+
 	switch (node->kind) {
 	case Ast_EmptyStmt:
+	case Ast_UsingStmt: // resolved by the checker: the names refer to fields of the parent
 		break;
 
 	case_ast_node(bs, BlockStmt, node);

@@ -306,6 +306,9 @@ enum wbAddrKind : u8 {
 	wbAddr_Local,  // scalar variable in wasm local `index`
 	wbAddr_Memory, // local[index] + offset (absolute if index == WB_NO_LOCAL)
 	wbAddr_Map,    // map element: local[index] points at the map, the key is at frame offset `offset`
+	wbAddr_Swizzle, // `v.xyz` of an array at local[index] + offset; `type` is the swizzled array type
+	wbAddr_BitField, // bits [bit_offset, bit_offset+bit_size) of the bit_field at local[index] + offset; `type` is the field type
+	wbAddr_SoaVariable, // element `soa_index` of the #soa container at local[index] + offset; `type` is the element type
 };
 
 // An addressable location
@@ -315,6 +318,14 @@ struct wbAddr {
 	u32        index;
 	i32        offset;
 	Type *     map_type; // wbAddr_Map only
+	u8         swizzle_count;      // wbAddr_Swizzle only
+	u8         swizzle_indices[4]; // wbAddr_Swizzle only
+	u8         bit_size;           // wbAddr_BitField only
+	i32        bit_offset;         // wbAddr_BitField only
+	bool       bit_field_in_local; // wbAddr_BitField only: the backing value is held in local[index] instead of memory
+	Type *     soa_type;           // wbAddr_SoaVariable (and a wbAddr_Swizzle of an #soa element): the container type
+	wbValue    soa_index;          // wbAddr_SoaVariable only: index of the element
+	Ast *      soa_index_expr;     // wbAddr_SoaVariable only: for the bounds check (nullptr once checked)
 };
 
 struct wbLocal {
@@ -381,6 +392,7 @@ struct wbProcedure {
 	wbProcGen  gen;
 	Type *     gen_type;    // the type a hasher/equal procedure is generated for
 	Ast *      curr_stmt;   // statement being lowered (for #caller_location of implicit runtime calls)
+	u16        state_flags; // #no_bounds_check / #no_type_assert etc. of the enclosing statements
 	String     import_module;
 	String     import_name;
 

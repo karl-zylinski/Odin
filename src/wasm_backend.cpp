@@ -16,6 +16,7 @@ gb_internal void    wb_close_scope(wbProcedure *p);
 gb_internal wbAddr  wb_add_variable(wbProcedure *p, Entity *e, Ast *init_expr = nullptr);
 gb_internal void    wb_emit_epilogue(wbProcedure *p);
 gb_internal wbValue wb_emit_conv(wbProcedure *p, wbValue v, Type *dst);
+gb_internal wbValue wb_value_copy(wbProcedure *p, wbValue v);
 gb_internal wbProcedure *wb_procedure_for_entity(wbModule *m, Entity *e);
 gb_internal u32     wb_table_index(wbModule *m, wbProcedure *p);
 gb_internal void    wb_build_compound_lit(wbProcedure *p, Ast *expr, wbAddr dst);
@@ -30,6 +31,27 @@ gb_internal void    wb_build_equal_body(wbProcedure *p);
 gb_internal wbValue wb_map_load(wbProcedure *p, wbAddr addr);
 gb_internal void    wb_map_set(wbProcedure *p, wbAddr addr, wbValue v);
 gb_internal wbValue wb_map_get_ptr(wbProcedure *p, wbAddr addr, Type *ptr_type);
+gb_internal wbValue wb_soa_load(wbProcedure *p, wbAddr addr);
+gb_internal void    wb_soa_store(wbProcedure *p, wbAddr addr, wbValue v);
+gb_internal wbValue wb_soa_get_ptr(wbProcedure *p, wbAddr addr, Type *ptr_type);
+gb_internal wbValue wb_soa_swizzle_load(wbProcedure *p, wbAddr addr);
+gb_internal void    wb_soa_swizzle_store(wbProcedure *p, wbAddr addr, wbValue v);
+gb_internal wbAddr  wb_addr_soa_variable(wbAddr soa, wbValue index, Ast *index_expr);
+gb_internal wbAddr  wb_addr_soa_variable_from_soa_ptr(wbProcedure *p, wbValue soa_ptr);
+gb_internal wbAddr  wb_soa_field_addr(wbProcedure *p, Ast *expr, wbAddr addr, Selection const &sel);
+gb_internal wbAddr  wb_soa_swizzle_addr(wbProcedure *p, wbAddr addr, Type *type, u8 count, u8 const *indices);
+gb_internal wbAddr  wb_soa_field_elem_addr(wbProcedure *p, wbAddr soa, wbValue field, wbValue index);
+gb_internal wbAddr  wb_soa_container(wbAddr addr);
+gb_internal isize   wb_soa_field_count(Type *soa_type);
+gb_internal i64     wb_soa_elem_field_offset(Type *elem_type, isize i, Type **field_type);
+gb_internal wbAddr  wb_soa_container_of_expr(wbProcedure *p, Ast *expr);
+gb_internal wbAddr  wb_soa_elem_index_addr(wbProcedure *p, wbAddr addr, wbValue index, Ast *index_expr);
+gb_internal wbValue wb_soa_len(wbProcedure *p, wbAddr soa);
+gb_internal wbValue wb_soa_cap(wbProcedure *p, wbAddr soa);
+gb_internal wbValue wb_build_soa_slice_expr(wbProcedure *p, Ast *expr);
+gb_internal wbValue wb_build_soa_zip(wbProcedure *p, Ast *expr);
+gb_internal wbValue wb_build_soa_unzip(wbProcedure *p, Ast *expr);
+gb_internal void    wb_build_range_soa(wbProcedure *p, AstRangeStmt *rs, Ast *node, Ast *val0, Ast *val1);
 
 // Diagnostics
 
@@ -804,6 +826,131 @@ gb_internal void wb_emit_zero(wbProcedure *p, u32 base, i32 offset, i64 size) {
 
 // Addresses
 
+// Bit-field fields are accessed byte by byte: byte `b` of the bytes covering the field holds
+// field bits [8*b - shift, 8*b - shift + 8) where shift = bit_offset % 8.
+gb_internal void wb_emit_bit_field_shift(wbProcedure *p, i64 s) {
+	if (s > 0) {
+		wb_i64_const(p, s);
+		wb_op(p, wbOp_i64_shl);
+	} else if (s < 0) {
+		wb_i64_const(p, -s);
+		wb_op(p, wbOp_i64_shr_u);
+	}
+}
+
+gb_internal wbValue wb_addr_load_bit_field(wbProcedure *p, wbAddr addr) {
+	Type *ct = core_type(addr.type);
+	wbValType vt = wb_valtype_of(ct);
+	if (vt != wbValType_i32 && vt != wbValType_i64) {
+		wb_unsupported_type(p, p->curr_stmt, addr.type);
+		return wb_value_invalid();
+	}
+	i64 bit_size = addr.bit_size;
+	i64 shift    = addr.bit_offset % 8;
+	i64 start    = addr.bit_offset / 8;
+	i64 nbytes   = (shift + bit_size + 7) / 8;
+
+	if (addr.bit_field_in_local) {
+		// backing value held in a register
+		wb_local_get(p, addr.index);
+		if (p->locals[addr.index].vt == wbValType_i32) {
+			wb_op(p, wbOp_i64_extend_i32_u);
+		}
+		wb_emit_bit_field_shift(p, -addr.bit_offset);
+	} else {
+		u32 acc = wb_add_local(p, wbValType_i64);
+		wb_i64_const(p, 0);
+		wb_local_set(p, acc);
+		for (i64 b = 0; b < nbytes; b++) {
+			wb_local_get(p, acc);
+			wb_push_address(p, addr.index, addr.offset + cast(i32)(start + b));
+			wb_memarg(p, wbOp_i64_load8_u, 0, 1);
+			wb_emit_bit_field_shift(p, 8*b - shift);
+			wb_op(p, wbOp_i64_or);
+			wb_local_set(p, acc);
+		}
+		wb_local_get(p, acc);
+	}
+	if (bit_size < 64) {
+		if (is_type_unsigned(ct) || is_type_boolean(ct)) {
+			wb_i64_const(p, cast(i64)((1ull << bit_size) - 1));
+			wb_op(p, wbOp_i64_and);
+		} else {
+			// sign extension
+			wb_i64_const(p, 64 - bit_size);
+			wb_op(p, wbOp_i64_shl);
+			wb_i64_const(p, 64 - bit_size);
+			wb_op(p, wbOp_i64_shr_s);
+		}
+	}
+	if (vt == wbValType_i32) {
+		wb_op(p, wbOp_i32_wrap_i64);
+	}
+	return wb_pop_to_local(p, vt, addr.type);
+}
+
+gb_internal void wb_addr_store_bit_field(wbProcedure *p, wbAddr addr, wbValue v) {
+	Type *ct = core_type(addr.type);
+	wbValType vt = wb_valtype_of(ct);
+	if (vt != wbValType_i32 && vt != wbValType_i64) {
+		wb_unsupported_type(p, p->curr_stmt, addr.type);
+		return;
+	}
+	i64 bit_size = addr.bit_size;
+	i64 shift    = addr.bit_offset % 8;
+	i64 start    = addr.bit_offset / 8;
+	i64 nbytes   = (shift + bit_size + 7) / 8;
+
+	wb_push(p, v);
+	if (vt == wbValType_i32) {
+		wb_op(p, wbOp_i64_extend_i32_u);
+	}
+	u32 val = wb_add_local(p, wbValType_i64);
+	wb_local_set(p, val);
+
+	if (addr.bit_field_in_local) {
+		// backing = (backing & ~(mask << off)) | ((val & mask) << off)
+		wbValType bvt = p->locals[addr.index].vt;
+		u64 mask = bit_size >= 64 ? ~0ull : (1ull << bit_size) - 1;
+		wb_local_get(p, addr.index);
+		if (bvt == wbValType_i32) {
+			wb_op(p, wbOp_i64_extend_i32_u);
+		}
+		wb_i64_const(p, cast(i64)~(mask << addr.bit_offset));
+		wb_op(p, wbOp_i64_and);
+		wb_local_get(p, val);
+		wb_i64_const(p, cast(i64)mask);
+		wb_op(p, wbOp_i64_and);
+		wb_emit_bit_field_shift(p, addr.bit_offset);
+		wb_op(p, wbOp_i64_or);
+		if (bvt == wbValType_i32) {
+			wb_op(p, wbOp_i32_wrap_i64);
+		}
+		wb_local_set(p, addr.index);
+		return;
+	}
+
+	for (i64 b = 0; b < nbytes; b++) {
+		i64 byte_bit = 8*(start + b);
+		i64 lo = gb_max(cast(i64)addr.bit_offset, byte_bit);
+		i64 hi = gb_min(cast(i64)addr.bit_offset + bit_size, byte_bit + 8);
+		i32 mask = cast(i32)(((1 << (hi - lo)) - 1) << (lo - byte_bit));
+		// byte = (byte & ~mask) | ((val >> (8*b - shift)) & mask)
+		wb_push_address(p, addr.index, addr.offset + cast(i32)(start + b));
+		wb_push_address(p, addr.index, addr.offset + cast(i32)(start + b));
+		wb_memarg(p, wbOp_i32_load8_u, 0, 1);
+		wb_i32_const(p, ~mask & 0xff);
+		wb_op(p, wbOp_i32_and);
+		wb_local_get(p, val);
+		wb_emit_bit_field_shift(p, shift - 8*b);
+		wb_op(p, wbOp_i32_wrap_i64);
+		wb_i32_const(p, mask);
+		wb_op(p, wbOp_i32_and);
+		wb_op(p, wbOp_i32_or);
+		wb_memarg(p, wbOp_i32_store8, 0, 1);
+	}
+}
+
 gb_internal wbValue wb_addr_load(wbProcedure *p, wbAddr addr) {
 	switch (addr.kind) {
 	case wbAddr_Local:
@@ -815,6 +962,23 @@ gb_internal wbValue wb_addr_load(wbProcedure *p, wbAddr addr) {
 		return wb_value_memory(addr.index, addr.offset, addr.type);
 	case wbAddr_Map:
 		return wb_map_load(p, addr);
+	case wbAddr_SoaVariable:
+		return wb_soa_load(p, addr);
+	case wbAddr_Swizzle: {
+		if (addr.soa_type != nullptr) {
+			return wb_soa_swizzle_load(p, addr);
+		}
+		// gather the selected elements into a temporary
+		Type *elem = base_type(addr.type)->Array.elem;
+		i64 elem_size = type_size_of(elem);
+		wbAddr tmp = wb_add_temp(p, addr.type);
+		for (u8 i = 0; i < addr.swizzle_count; i++) {
+			wb_emit_copy(p, tmp.index, tmp.offset + cast(i32)(i*elem_size), addr.index, addr.offset + cast(i32)(addr.swizzle_indices[i]*elem_size), elem_size);
+		}
+		return wb_value_memory(tmp.index, tmp.offset, addr.type);
+	}
+	case wbAddr_BitField:
+		return wb_addr_load_bit_field(p, addr);
 	default:
 		return wb_value_invalid();
 	}
@@ -842,6 +1006,26 @@ gb_internal void wb_addr_store(wbProcedure *p, wbAddr addr, wbValue v) {
 		break;
 	case wbAddr_Map:
 		wb_map_set(p, addr, v);
+		break;
+	case wbAddr_SoaVariable:
+		wb_soa_store(p, addr, v);
+		break;
+	case wbAddr_Swizzle: {
+		if (addr.soa_type != nullptr) {
+			wb_soa_swizzle_store(p, addr, v);
+			break;
+		}
+		// scatter the elements of `v` (copied first: `v.xy = v.yx` must work)
+		Type *elem = base_type(addr.type)->Array.elem;
+		i64 elem_size = type_size_of(elem);
+		v = wb_value_copy(p, v);
+		for (u8 i = 0; i < addr.swizzle_count; i++) {
+			wb_emit_copy(p, addr.index, addr.offset + cast(i32)(addr.swizzle_indices[i]*elem_size), v.index, v.offset + cast(i32)(i*elem_size), elem_size);
+		}
+		break;
+	}
+	case wbAddr_BitField:
+		wb_addr_store_bit_field(p, addr, v);
 		break;
 	default:
 		break;
@@ -872,10 +1056,13 @@ gb_internal void wb_addr_zero(wbProcedure *p, wbAddr addr) {
 			wb_emit_zero(p, addr.index, addr.offset, type_size_of(addr.type));
 		}
 		break;
-	case wbAddr_Map: {
+	case wbAddr_Map:
+	case wbAddr_Swizzle:
+	case wbAddr_BitField:
+	case wbAddr_SoaVariable: {
 		wbAddr zero = wb_add_temp(p, addr.type);
 		wb_addr_zero(p, zero);
-		wb_map_set(p, addr, wb_addr_load(p, zero));
+		wb_addr_store(p, addr, wb_addr_load(p, zero));
 		break;
 	}
 	default:
@@ -891,6 +1078,14 @@ gb_internal wbValue wb_addr_get_ptr(wbProcedure *p, wbAddr addr, Type *ptr_type 
 	if (addr.kind == wbAddr_Map) {
 		// nil when the key is absent
 		return wb_map_get_ptr(p, addr, ptr_type);
+	}
+	if (addr.kind == wbAddr_SoaVariable) {
+		return wb_soa_get_ptr(p, addr, ptr_type);
+	}
+	if (addr.kind == wbAddr_Swizzle || addr.kind == wbAddr_BitField) {
+		// the swizzled elements are not contiguous / the bits are not addressable: the pointer is to a copy
+		wbValue v = wb_addr_load(p, addr);
+		return wb_addr_get_ptr(p, wb_addr_memory(v.index, v.offset, v.type), ptr_type);
 	}
 	if (addr.kind != wbAddr_Memory) {
 		if (addr.kind == wbAddr_Local) {
@@ -981,6 +1176,9 @@ gb_internal void wb_write_le(u8 *dst, u64 bits, i64 size) {
 }
 
 gb_internal void wb_write_const_data(wbModule *m, Type *type, ExactValue const &value, u8 *dst);
+gb_internal wbValue wb_value_copy(wbProcedure *p, wbValue v);
+gb_internal i32  wb_union_tag_offset(Type *ut);
+gb_internal bool wb_union_has_tag(Type *ut);
 
 // A NUL-terminated UTF-16 copy of a string in the data segment, deduplicated
 // by its UTF-8 source
@@ -1072,12 +1270,61 @@ gb_internal void wb_write_const_data(wbModule *m, Type *type, ExactValue const &
 	Type *bt = base_type(type);
 	i64 size = type_size_of(type);
 
-	if (bt->kind == Type_SimdVector && value.kind != ExactValue_Compound && value.kind != ExactValue_Invalid) {
-		// a scalar constant of a vector type is splat across the lanes
-		Type *et = bt->SimdVector.elem;
+	if ((bt->kind == Type_SimdVector || bt->kind == Type_Array || bt->kind == Type_EnumeratedArray) &&
+	    value.kind != ExactValue_Compound && value.kind != ExactValue_Invalid && value.kind != ExactValue_String) {
+		// a scalar constant of a vector/array type is splat across the elements
+		Type *et = nullptr;
+		i64 count = 0;
+		switch (bt->kind) {
+		case Type_SimdVector:      et = bt->SimdVector.elem;      count = bt->SimdVector.count;      break;
+		case Type_Array:           et = bt->Array.elem;           count = bt->Array.count;           break;
+		case Type_EnumeratedArray: et = bt->EnumeratedArray.elem; count = bt->EnumeratedArray.count; break;
+		default: break;
+		}
 		i64 elem_size = type_size_of(et);
-		for (i64 i = 0; i < bt->SimdVector.count; i++) {
+		for (i64 i = 0; i < count; i++) {
 			wb_write_const_data(m, et, value, dst + i*elem_size);
+		}
+		return;
+	}
+
+	if (bt->kind == Type_Matrix && value.kind != ExactValue_Compound && value.kind != ExactValue_Invalid) {
+		// a scalar constant of a matrix type is the scaled identity matrix
+		Type *et = bt->Matrix.elem;
+		i64 elem_size = type_size_of(et);
+		i64 n = gb_min(bt->Matrix.row_count, bt->Matrix.column_count);
+		for (i64 i = 0; i < n; i++) {
+			wb_write_const_data(m, et, value, dst + matrix_indices_to_offset(bt, i, i)*elem_size);
+		}
+		return;
+	}
+
+	if (bt->kind == Type_Union && value.kind != ExactValue_Invalid) {
+		// Constant union value: the variant's data followed by its tag
+		ExactValue v = value;
+		if (v.kind == ExactValue_Variant) {
+			v = v.value_variant->tav.value;
+		}
+		Type *variant_type = v.variant_type;
+		if (v.kind == ExactValue_Compound) {
+			ast_node(cl, CompoundLit, v.value_compound);
+			if (variant_type == nullptr || are_types_identical(variant_type, type)) {
+				GB_ASSERT(cl->elems.count == 0);
+				return; // nil
+			}
+		}
+		if (variant_type == nullptr && bt->Union.variants.count == 1) {
+			variant_type = bt->Union.variants[0];
+		}
+		GB_ASSERT_MSG(variant_type != nullptr, "%s :: %s", type_to_string(type), exact_value_to_string(value));
+		if (variant_type == t_untyped_nil) {
+			return;
+		}
+		wb_write_const_data(m, variant_type, v, dst);
+		if (wb_union_has_tag(bt)) {
+			i64 tag_index = union_variant_index_checked(bt, variant_type);
+			GB_ASSERT(tag_index >= 0);
+			wb_write_le(dst + wb_union_tag_offset(bt), cast(u64)tag_index, union_tag_size(bt));
 		}
 		return;
 	}
@@ -1184,6 +1431,26 @@ gb_internal void wb_write_const_data(wbModule *m, Type *type, ExactValue const &
 		ast_node(cl, CompoundLit, node);
 		switch (bt->kind) {
 		case Type_Struct: {
+			if (is_type_soa_struct(bt)) {
+				// #soa[N]T{...}: written as the [N]T literal, then transposed into the per-field arrays
+				Type *elem_type = bt->Struct.soa_elem;
+				i64 count = bt->Struct.soa_count;
+				i64 elem_size = type_size_of(elem_type);
+				u8 *aos = gb_alloc_array(temporary_allocator(), u8, count*elem_size);
+				gb_zero_size(aos, count*elem_size);
+				wb_write_const_data(m, alloc_type_array(elem_type, count), value, aos);
+				isize n = wb_soa_field_count(bt);
+				for (isize f = 0; f < n; f++) {
+					Type *ft = nullptr;
+					i64 field_offset = wb_soa_elem_field_offset(elem_type, f, &ft);
+					i64 field_size   = type_size_of(ft);
+					i64 array_offset = type_offset_of(bt, f, nullptr);
+					for (i64 k = 0; k < count; k++) {
+						gb_memmove(dst + array_offset + k*field_size, aos + k*elem_size + field_offset, field_size);
+					}
+				}
+				return;
+			}
 			for_array(i, cl->elems) {
 				Ast *elem = cl->elems[i];
 				i64 index = cast(i64)i;
@@ -1204,11 +1471,26 @@ gb_internal void wb_write_const_data(wbModule *m, Type *type, ExactValue const &
 		}
 		case Type_Array:
 		case Type_EnumeratedArray:
-		case Type_SimdVector: {
-			Type *et = bt->kind == Type_Array ? bt->Array.elem : bt->kind == Type_SimdVector ? bt->SimdVector.elem : bt->EnumeratedArray.elem;
+		case Type_SimdVector:
+		case Type_Matrix: {
+			Type *et = nullptr;
+			switch (bt->kind) {
+			case Type_Array:           et = bt->Array.elem;           break;
+			case Type_SimdVector:      et = bt->SimdVector.elem;      break;
+			case Type_EnumeratedArray: et = bt->EnumeratedArray.elem; break;
+			case Type_Matrix:          et = bt->Matrix.elem;          break;
+			default: break;
+			}
 			i64 elem_size = type_size_of(et);
 			i64 index = 0;
 			i64 min_value = bt->kind == Type_EnumeratedArray ? exact_value_to_i64(*bt->EnumeratedArray.min_value) : 0;
+			// matrix literals list their elements in row-major order
+			auto elem_offset = [&](i64 k) -> i64 {
+				if (bt->kind == Type_Matrix) {
+					k = matrix_row_major_index_to_offset(bt, k);
+				}
+				return k*elem_size;
+			};
 			for (Ast *elem : cl->elems) {
 				if (elem->kind == Ast_FieldValue) {
 					ast_node(fv, FieldValue, elem);
@@ -1221,17 +1503,17 @@ gb_internal void wb_write_const_data(wbModule *m, Type *type, ExactValue const &
 							hi += 1;
 						}
 						for (i64 k = lo; k < hi; k++) {
-							wb_write_const_data(m, et, tav.value, dst + k*elem_size);
+							wb_write_const_data(m, et, tav.value, dst + elem_offset(k));
 						}
 						index = hi;
 					} else {
 						index = exact_value_to_i64(fv->field->tav.value) - min_value;
-						wb_write_const_data(m, et, tav.value, dst + index*elem_size);
+						wb_write_const_data(m, et, tav.value, dst + elem_offset(index));
 						index++;
 					}
 				} else {
 					TypeAndValue tav = type_and_value_of_expr(elem);
-					wb_write_const_data(m, et, tav.value, dst + index*elem_size);
+					wb_write_const_data(m, et, tav.value, dst + elem_offset(index));
 					index++;
 				}
 			}
@@ -1291,6 +1573,19 @@ gb_internal bool wb_can_serialize_const(Type *type, ExactValue const &value) {
 		return true;
 	}
 	Type *bt = base_type(type);
+	if (bt->kind == Type_Union) {
+		ExactValue v = value;
+		if (v.kind == ExactValue_Variant) {
+			v = v.value_variant->tav.value;
+		}
+		if (v.kind == ExactValue_Compound && (v.variant_type == nullptr || are_types_identical(v.variant_type, type))) {
+			return true; // nil
+		}
+		if (v.variant_type == nullptr) {
+			return bt->Union.variants.count == 1 && wb_can_serialize_const(bt->Union.variants[0], v);
+		}
+		return wb_can_serialize_const(v.variant_type, v);
+	}
 	switch (value.kind) {
 	case ExactValue_Bool:
 	case ExactValue_Integer:
@@ -1298,7 +1593,10 @@ gb_internal bool wb_can_serialize_const(Type *type, ExactValue const &value) {
 	case ExactValue_Pointer:
 	case ExactValue_Typeid:
 		return wb_is_scalar(type) || is_type_complex(bt) || is_type_quaternion(bt) || type_size_of(type) == 16 ||
-		       (bt->kind == Type_SimdVector && wb_is_scalar(bt->SimdVector.elem));
+		       (bt->kind == Type_SimdVector && wb_is_scalar(bt->SimdVector.elem)) ||
+		       (bt->kind == Type_Array && wb_is_scalar(bt->Array.elem)) ||
+		       (bt->kind == Type_EnumeratedArray && wb_is_scalar(bt->EnumeratedArray.elem)) ||
+		       (bt->kind == Type_Matrix && wb_is_scalar(bt->Matrix.elem));
 	case ExactValue_Complex:
 		return is_type_complex(bt) || is_type_quaternion(bt);
 	case ExactValue_Quaternion:
@@ -1310,7 +1608,7 @@ gb_internal bool wb_can_serialize_const(Type *type, ExactValue const &value) {
 		return is_type_proc(bt);
 	case ExactValue_Compound:
 		switch (bt->kind) {
-		case Type_Struct: case Type_Array: case Type_EnumeratedArray: case Type_Slice: case Type_SimdVector:
+		case Type_Struct: case Type_Array: case Type_EnumeratedArray: case Type_Slice: case Type_SimdVector: case Type_Matrix:
 			break;
 		default:
 			return false;
@@ -1332,6 +1630,10 @@ gb_internal bool wb_can_serialize_const(Type *type, ExactValue const &value) {
 						et = bt->EnumeratedArray.elem;
 					} else if (bt->kind == Type_Slice) {
 						et = bt->Slice.elem;
+					} else if (bt->kind == Type_Matrix) {
+						et = bt->Matrix.elem;
+					} else if (is_type_soa_struct(bt)) {
+						et = bt->Struct.soa_elem;
 					} else {
 						et = default_type(et);
 					}
@@ -1542,6 +1844,7 @@ gb_internal void wb_push_context_ptr(wbProcedure *p, wbAddr ctx) {
 #include "wasm_backend_simd.cpp"
 #include "wasm_backend_map.cpp"
 #include "wasm_backend_stmt.cpp"
+#include "wasm_backend_soa.cpp"
 
 // Procedure bodies
 
@@ -1642,11 +1945,16 @@ gb_internal void wb_build_procedure(wbProcedure *p) {
 		}
 	}
 
-	// Named results are ordinary variables, zero initialized
+	// Named results are ordinary variables, zero initialized unless they
+	// have a default value (`-> (x: int = 1)`)
 	if (pt->Proc.has_named_results && pt->Proc.results != nullptr) {
 		for (Entity *e : pt->Proc.results->Tuple.variables) {
 			wbAddr addr = wb_add_variable(p, e);
-			wb_addr_zero(p, addr);
+			if (e->kind == Entity_Variable && e->Variable.param_value.kind != ParameterValue_Invalid) {
+				wb_addr_store(p, addr, wb_build_param_value(p, nullptr, e->type, e->Variable.param_value));
+			} else {
+				wb_addr_zero(p, addr);
+			}
 			array_add(&p->result_addrs, addr);
 		}
 	}
