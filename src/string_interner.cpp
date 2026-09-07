@@ -58,7 +58,12 @@ gb_internal void *string_interner_thread_local_arena_alloc(StringInternerThreadL
 
 gb_internal void init_string_interner() {
 	StaticArena arena = {};
+#if defined(GB_SYSTEM_WASI)
+	// No virtual memory to reserve from: the arena is a real allocation
+	static_arena_init(&arena, 1<<26, STATIC_ARENA_DEFAULT_COMMIT_BLOCK_SIZE);
+#else
 	static_arena_init(&arena, 1<<30, STATIC_ARENA_DEFAULT_COMMIT_BLOCK_SIZE);
+#endif
 
 	StringInterner *interner = cast(StringInterner *)static_arena_alloc(&arena, gb_size_of(StringInterner), STRING_INTERN_CACHE_LINE);
 	interner->arena = arena;

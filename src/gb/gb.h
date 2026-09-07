@@ -90,11 +90,21 @@ extern "C" {
 	#else
 		#error This UNIX operating system is not supported
 	#endif
+#elif defined(__wasi__)
+	// WASI: wasi-libc is close enough to a Unix libc that the Unix code paths
+	// are used, with the pieces WASI lacks (threads, processes, mmap) patched
+	// out under GB_SYSTEM_WASI
+	#ifndef GB_SYSTEM_UNIX
+	#define GB_SYSTEM_UNIX 1
+	#endif
+	#ifndef GB_SYSTEM_WASI
+	#define GB_SYSTEM_WASI 1
+	#endif
 #else
 	#error This operating system is not supported
 #endif
 
-#if defined(GB_SYSTEM_UNIX)
+#if defined(GB_SYSTEM_UNIX) && !defined(GB_SYSTEM_WASI)
 #include <sys/wait.h>
 #endif
 
@@ -143,6 +153,14 @@ extern "C" {
 #elif defined(__riscv)
 	#ifndef GB_CPU_RISCV
 	#define GB_CPU_RISCV 1
+	#endif
+	#ifndef GB_CACHE_LINE_SIZE
+	#define GB_CACHE_LINE_SIZE 64
+	#endif
+
+#elif defined(__wasm__)
+	#ifndef GB_CPU_WASM
+	#define GB_CPU_WASM 1
 	#endif
 	#ifndef GB_CACHE_LINE_SIZE
 	#define GB_CACHE_LINE_SIZE 64
@@ -206,7 +224,9 @@ extern "C" {
 
 	#include <intrin.h>
 #else
-	#include <dlfcn.h>
+	#if !defined(GB_SYSTEM_WASI)
+		#include <dlfcn.h>
+	#endif
 	#include <errno.h>
 	#include <fcntl.h>
 	#include <pthread.h>
@@ -214,8 +234,10 @@ extern "C" {
 	#define _IOSC11_SOURCE
 	#endif
 	#include <stdlib.h> // NOTE(bill): malloc on linux
-	#include <sys/mman.h>
-	#if !defined(GB_SYSTEM_OSX) && !defined(__FreeBSD__) && !defined(__OpenBSD__) && !defined(__NetBSD__)
+	#if !defined(GB_SYSTEM_WASI)
+		#include <sys/mman.h>
+	#endif
+	#if !defined(GB_SYSTEM_OSX) && !defined(__FreeBSD__) && !defined(__OpenBSD__) && !defined(__NetBSD__) && !defined(GB_SYSTEM_WASI)
 		#include <sys/sendfile.h>
 	#endif
 	#include <sys/stat.h>
@@ -255,6 +277,61 @@ extern "C" {
 	#include <stdio.h>
 	#include <pthread_np.h>
 	#define lseek64 lseek
+#endif
+
+#if defined(GB_SYSTEM_WASI)
+	#include <stdio.h>
+	#define lseek64 lseek
+
+	// NOTE: wasi-libc's realpath walks the path from `/` and fails as soon as a parent
+	// directory lies outside the preopened directories. There are no symlinks to resolve
+	// in the sandbox, so a lexical normalization followed by a stat is enough.
+	static char *gb__wasi_realpath(char const *path, char *resolved) {
+		char buf[4096];
+		char out[4096];
+		size_t o = 0;
+		if (path[0] != '/') {
+			size_t l;
+			if (!getcwd(buf, sizeof(buf))) return NULL;
+			l = strlen(buf);
+			if (l+1+strlen(path)+1 > sizeof(buf)) return NULL;
+			if (l == 0 || buf[l-1] != '/') buf[l++] = '/';
+			strcpy(buf+l, path);
+		} else {
+			if (strlen(path)+1 > sizeof(buf)) return NULL;
+			strcpy(buf, path);
+		}
+		out[o++] = '/';
+		for (char *p = buf; *p; ) {
+			char *start;
+			size_t n;
+			while (*p == '/') p++;
+			if (!*p) break;
+			start = p;
+			while (*p && *p != '/') p++;
+			n = p-start;
+			if (n == 1 && start[0] == '.') continue;
+			if (n == 2 && start[0] == '.' && start[1] == '.') {
+				while (o > 1 && out[o-1] != '/') o--;
+				if (o > 1) o--;
+				continue;
+			}
+			if (o > 1) out[o++] = '/';
+			memcpy(out+o, start, n);
+			o += n;
+		}
+		out[o] = 0;
+		{
+			struct stat st;
+			if (stat(out, &st) != 0) return NULL;
+		}
+		if (resolved) {
+			strcpy(resolved, out);
+			return resolved;
+		}
+		return strdup(out);
+	}
+	#define realpath gb__wasi_realpath
 #endif
 
 #if defined(GB_SYSTEM_NETBSD)
@@ -829,7 +906,7 @@ typedef struct gbAffinity {
 	isize thread_count;
 	isize threads_per_core;
 } gbAffinity;
-#elif defined(GB_SYSTEM_NETBSD)
+#elif defined(GB_SYSTEM_NETBSD) || defined(GB_SYSTEM_WASI)
 typedef struct gbAffinity {
 	b32 is_accurate;
 	isize core_count;
@@ -2574,6 +2651,10 @@ gb_inline void *gb_memcopy(void *dest, void const *source, isize n) {
 	for (isize i = 0; i < n; i++) {
 		*d++ = *s++;
 	}
+#elif defined(GB_CPU_WASM)
+	// NOTE: The generic fallback below drops the tail when `dest` is misaligned and n < 32.
+	// wasi-libc's memcpy lowers to memory.copy, so just use that.
+	memcpy(dest, source, n);
 #else
 	u8 *d = cast(u8 *)dest;
 	u8 const *s = cast(u8 const *)source;
@@ -3034,6 +3115,8 @@ gb_inline u32 gb_thread_current_id(void) {
 	thread_id = pthread_getthreadid_np();
 #elif defined(GB_SYSTEM_NETBSD)
 	thread_id = (u32)_lwp_self();
+#elif defined(GB_SYSTEM_WASI)
+	thread_id = 1; // single threaded
 #else
 	#error Unsupported architecture for gb_thread_current_id()
 #endif
@@ -3307,6 +3390,28 @@ void gb_affinity_init(gbAffinity *a) {
 	a->is_accurate      = a->core_count > 0;
 	a->core_count       = a->is_accurate ? a->core_count : 1;
 	a->thread_count     = a->core_count;
+}
+
+void gb_affinity_destroy(gbAffinity *a) {
+	gb_unused(a);
+}
+
+b32 gb_affinity_set(gbAffinity *a, isize core, isize thread_index) {
+	return true;
+}
+
+isize gb_affinity_thread_count_for_core(gbAffinity *a, isize core) {
+	GB_ASSERT(0 <= core && core < a->core_count);
+	return a->threads_per_core;
+}
+
+#elif defined(GB_SYSTEM_WASI)
+// Single threaded: one core, one thread
+void gb_affinity_init(gbAffinity *a) {
+	a->core_count       = 1;
+	a->threads_per_core = 1;
+	a->is_accurate      = true;
+	a->thread_count     = 1;
 }
 
 void gb_affinity_destroy(gbAffinity *a) {
@@ -5097,8 +5202,19 @@ u64 gb_murmur64_seed(void const *data_, isize len, u64 seed) {
 	}
 
 	gb_internal GB_FILE_READ_AT_PROC(gb__posix_file_read) {
+	#if defined(GB_SYSTEM_WASI)
+		// NOTE: pread under WASI returns at most 64 KiB per call
+		isize res = 0;
+		while (res < size) {
+			isize n = pread(fd.i, cast(u8 *)buffer+res, size-res, offset+res);
+			if (n < 0) return false;
+			if (n == 0) break;
+			res += n;
+		}
+	#else
 		isize res = pread(fd.i, buffer, size, offset);
 		if (res < 0) return false;
+	#endif
 		if (bytes_read) *bytes_read = res;
 		return true;
 	}
@@ -6341,7 +6457,7 @@ gb_no_inline isize gb_snprintf_va(char *text, isize max_len, char const *fmt, va
 		f64 result;
 
 		// IMPORTANT TODO(bill): THIS IS A HACK
-		clock_gettime(1 /*CLOCK_MONOTONIC*/, &t);
+		clock_gettime(CLOCK_MONOTONIC, &t);
 		result = t.tv_sec + 1.0e-9 * t.tv_nsec;
 		return result;
 #endif

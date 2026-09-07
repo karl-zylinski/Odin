@@ -16,6 +16,9 @@ gb_global ThreadPool global_thread_pool;
 gb_internal void init_global_thread_pool(void) {
 	isize thread_count = gb_max(build_context.thread_count, 1);
 	isize worker_count = thread_count; // +1
+#if defined(GB_SYSTEM_WASI)
+	worker_count = 0; // single threaded: the main thread runs every task
+#endif
 	thread_pool_init(&global_thread_pool, worker_count, "ThreadPoolWorker");
 }
 gb_internal bool thread_pool_add_task(WorkerTaskProc *proc, void *data) {
@@ -60,6 +63,8 @@ gb_global Timings global_timings = {0};
 #if defined(ODIN_NO_LLVM)
 	#if !defined(GB_SYSTEM_WINDOWS)
 	#include <signal.h>
+	#endif
+	#if !defined(GB_SYSTEM_WINDOWS) && !defined(GB_SYSTEM_WASI)
 	#include <sys/resource.h>
 	#endif
 #elif defined(GB_SYSTEM_WINDOWS)
@@ -172,6 +177,7 @@ gb_internal i32 system_exec_command_line_app_internal(bool exit_on_err, char con
 	char **argv = command_line_to_spawn_argv(cmd_line, &argc);
 
 	exit_code = run_subprocess(argv[0], cast(const char**)(argv), true);
+	#if !defined(GB_SYSTEM_WASI)
 	if (exit_on_err && WIFSIGNALED(exit_code)) {
 		struct rlimit limit = { 0, 0, };
 		setrlimit(RLIMIT_CORE, &limit);
@@ -180,6 +186,7 @@ gb_internal i32 system_exec_command_line_app_internal(bool exit_on_err, char con
 	if (WIFEXITED(exit_code)) {
 		exit_code = WEXITSTATUS(exit_code);
 	}
+	#endif
 #endif
 
 	if (exit_on_err && exit_code) {
@@ -197,7 +204,7 @@ gb_internal i32 system_exec_command_line_app(char const *name, char const *fmt, 
 	return exit_code;
 }
 
-#if !defined(GB_SYSTEM_WINDOWS)
+#if !defined(GB_SYSTEM_WINDOWS) && !defined(GB_SYSTEM_WASI)
 #include <spawn.h>
 extern char **environ;
 #endif
@@ -268,6 +275,12 @@ int run_subprocess(String const &exe_name, wchar_t *after_double_dash_raw) {
 
 	return exit_code;
 }
+#elif defined(GB_SYSTEM_WASI)
+// WASI has no processes: nothing external (linkers, assemblers, ...) can be run
+int run_subprocess(const char *name, const char **args, bool honor_path) {
+	gb_printf_err("Cannot run '%s': subprocesses are not available on this platform\n", name);
+	return -1;
+}
 #else
 int run_subprocess(const char *name, const char **args, bool honor_path) {
 	pid_t pid;
@@ -315,6 +328,9 @@ int run_subprocess(const char *name, const char **args, bool honor_path) {
 
 gb_internal bool system_exec_command_line_app_output(char const *command, gbString *output) {
 	GB_ASSERT(output);
+#if defined(GB_SYSTEM_WASI)
+	return false;
+#else
 
 	u8 buffer[256];
 	FILE *stream;
@@ -338,6 +354,7 @@ gb_internal bool system_exec_command_line_app_output(char const *command, gbStri
 	}
 
 	return true;
+#endif
 }
 
 gb_internal Array<String> setup_args(int argc, char const **argv, isize *double_dash_pos, wchar_t **after_double_dash_raw) {

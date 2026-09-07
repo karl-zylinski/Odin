@@ -553,6 +553,8 @@ gb_internal u32 thread_current_id(void) {
 	thread_id = pthread_getthreadid_np();
 #elif defined(GB_SYSTEM_NETBSD)
 	thread_id = (u32)_lwp_self();
+#elif defined(GB_SYSTEM_WASI)
+	thread_id = 1; // single threaded
 #else
 	#error Unsupported architecture for thread_current_id()
 #endif
@@ -577,6 +579,8 @@ gb_internal gb_inline void yield_thread(void) {
 #elif defined(GB_CPU_RISCV)
 	// I guess?
 	__asm__ volatile ("nop" : : : "memory");
+#elif defined(GB_CPU_WASM)
+	// nothing to yield to
 #else
 #error Unknown architecture
 #endif
@@ -754,6 +758,21 @@ gb_internal void futex_wait(Futex *addr, Footex val) {
 			}
 		}
 	}
+}
+
+#elif defined(GB_SYSTEM_WASI)
+
+// Single threaded: there is never another thread to wake or to wait for
+gb_internal void futex_signal(Futex *addr) {
+	gb_unused(addr);
+}
+
+gb_internal void futex_broadcast(Futex *addr) {
+	gb_unused(addr);
+}
+
+gb_internal void futex_wait(Futex *addr, Footex val) {
+	GB_ASSERT_MSG(*addr != val, "futex wait with no other thread to change the value");
 }
 
 #elif defined(GB_SYSTEM_FREEBSD)

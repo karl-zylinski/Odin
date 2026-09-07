@@ -269,6 +269,47 @@ gb_internal bool  platform_virtual_memory_commit_internal(void *data, isize comm
 		}
 		return true;
 	}
+#elif defined(GB_SYSTEM_WASI)
+	// WebAssembly has no virtual memory: blocks are zeroed heap allocations
+	// that are committed from the start, and the guard pages stay accessible
+	gb_internal void platform_virtual_memory_init(void) {
+		global_platform_memory_block_sentinel.prev = &global_platform_memory_block_sentinel;
+		global_platform_memory_block_sentinel.next = &global_platform_memory_block_sentinel;
+	}
+
+	gb_internal void *platform_virtual_memory_alloc_internal(isize total_size, bool commit) {
+		void *mem = calloc(1, total_size);
+		if (mem == nullptr) {
+			gb_printf_err("Out of memory, oh no...\n");
+			gb_printf_err("Requested: %lld bytes\n", cast(long long)total_size);
+			gb_printf_err("Total Usage: %lld bytes\n", cast(long long)global_platform_memory_total_usage);
+			GB_ASSERT_MSG(mem != nullptr, "Out of memory, oh no...");
+		}
+		return mem;
+	}
+
+	gb_internal PlatformMemoryBlock *platform_virtual_memory_alloc(isize total_size, bool commit) {
+		PlatformMemoryBlock *pmblock = cast(PlatformMemoryBlock *)platform_virtual_memory_alloc_internal(total_size, commit);
+		global_platform_memory_total_usage.fetch_add(total_size);
+		return pmblock;
+	}
+	gb_internal PlatformMemoryBlock *platform_virtual_memory_alloc_uncommited(isize total_size) {
+		return platform_virtual_memory_alloc(total_size, false);
+	}
+	gb_internal void platform_virtual_memory_free(PlatformMemoryBlock *block) {
+		global_platform_memory_total_usage.fetch_sub(block->total_size);
+		free(block);
+	}
+	gb_internal void platform_virtual_memory_protect(void *memory, isize size) {
+		gb_unused(memory);
+		gb_unused(size);
+	}
+
+	gb_internal bool platform_virtual_memory_commit_internal(void *data, isize commit_amount) {
+		gb_unused(data);
+		gb_unused(commit_amount);
+		return true;
+	}
 #else
 	#if !defined(MAP_ANONYMOUS) && defined(MAP_ANON)
 	#define MAP_ANONYMOUS MAP_ANON
