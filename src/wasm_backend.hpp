@@ -395,7 +395,9 @@ struct wbProcedure {
 	bool       is_foreign;
 	bool       is_llvm_intrinsic; // foreign `llvm.*` procedure, lowered at the call site
 	bool       is_export;
+	bool       is_raw_body;  // linked from an object file: `code` holds the complete function body
 	bool       failed;
+	wbProcedure *alias;      // foreign procedure resolved to a defined function by the linker
 	wbProcGen  gen;
 	Type *     gen_type;    // the type a hasher/equal procedure is generated for
 	Ast *      curr_stmt;   // statement being lowered (for #caller_location of implicit runtime calls)
@@ -435,6 +437,8 @@ struct wbGlobalInit {
 	Ast *   init_expr;
 };
 
+struct wbObject;
+
 struct wbModule {
 	CheckerInfo *info;
 	gbAllocator  allocator;
@@ -445,6 +449,8 @@ struct wbModule {
 	PtrMap<Entity *, wbProcedure *> procedure_map;
 	Array<wbProcedure *>  work_queue; // procedures whose bodies still need lowering
 	Array<wbProcedure *>  table;      // function table, index 0 is reserved for nil
+	Array<wbObject *>     objects;    // linked object files (wasm_backend_link.cpp)
+	Array<wbProcedure *>  aliased;    // foreign procedures resolved to defined functions
 	wbProcedure *         startup;    // runs non-constant global initializers (wasm start function, only without an entry point)
 	wbProcedure *         startup_runtime; // `__$startup_runtime`, generated when referenced
 	wbProcedure *         cleanup_runtime; // `__$cleanup_runtime`, generated when referenced

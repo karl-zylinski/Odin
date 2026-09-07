@@ -371,10 +371,23 @@ gb_internal bool wb_functype_of_foreign(wbModule *m, Type *pt, wbFuncType *ft) {
 	array_init(&ft->results, m->allocator);
 	ProcCallingConvention cc = pt->Proc.calling_convention;
 
+	if (pt->Proc.result_count > 1) {
+		return false;
+	}
+	// An aggregate result is returned through a pointer passed as the first
+	// parameter (the C ABI's sret), as for Odin procedures
+	if (pt->Proc.result_count == 1 && wb_uses_sret(pt)) {
+		array_add(&ft->params, wbValType_i32);
+	}
+
 	if (pt->Proc.params != nullptr) {
-		for (Entity *e : pt->Proc.params->Tuple.variables) {
+		for_array(i, pt->Proc.params->Tuple.variables) {
+			Entity *e = pt->Proc.params->Tuple.variables[i];
 			if (e->kind != Entity_Variable) {
 				continue;
+			}
+			if (pt->Proc.c_vararg && pt->Proc.variadic && i == pt->Proc.variadic_index) {
+				continue; // the C variadic arguments are passed through the buffer pointer below
 			}
 			auto leaves = array_make<wbAbiLeaf>(temporary_allocator(), 0, 8);
 			if (wb_abi_flatten(e->type, cc, 0, &leaves)) {
@@ -386,13 +399,15 @@ gb_internal bool wb_functype_of_foreign(wbModule *m, Type *pt, wbFuncType *ft) {
 			}
 		}
 	}
+	if (pt->Proc.c_vararg) {
+		// LLVM's wasm ABI passes the variadic arguments in a stack buffer whose
+		// address is the final parameter
+		array_add(&ft->params, wbValType_i32);
+	}
 	if (cc == ProcCC_Odin) {
 		array_add(&ft->params, wbValType_i32); // context pointer
 	}
-	if (pt->Proc.result_count > 1) {
-		return false;
-	}
-	if (pt->Proc.result_count == 1) {
+	if (pt->Proc.result_count == 1 && !wb_uses_sret(pt)) {
 		Type *rt = wb_result_type(pt);
 		if (type_size_of(rt) == 0) {
 			// nothing
@@ -1955,6 +1970,7 @@ gb_internal void wb_push_context_ptr(wbProcedure *p, wbAddr ctx) {
 #include "wasm_backend_stmt.cpp"
 #include "wasm_backend_soa.cpp"
 #include "wasm_backend_atomic.cpp"
+#include "wasm_backend_link.cpp"
 
 // Procedure bodies
 
@@ -2233,6 +2249,8 @@ gb_internal void wb_module_init(wbModule *m, CheckerInfo *info) {
 	array_init(&m->work_queue, m->allocator);
 	array_init(&m->table,      m->allocator);
 	array_add(&m->table, cast(wbProcedure *)nullptr); // index 0 is nil
+	array_init(&m->objects,    m->allocator);
+	array_init(&m->aliased,    m->allocator);
 	map_init(&m->procedure_map);
 	map_init(&m->globals);
 	string_map_init(&m->libm_imports, 16);
@@ -2335,6 +2353,12 @@ gb_internal bool wb_generate_code(CheckerInfo *info) {
 		wb_create_test_main(m);
 	}
 
+	TIME_SECTION("wasm backend: link");
+	wb_link_load_objects(m);
+	if (m->error_count > 0) {
+		return false;
+	}
+
 	TIME_SECTION("wasm backend: procedures");
 	bool startup_runtime_built = false;
 	bool cleanup_runtime_built = false;
@@ -2378,6 +2402,11 @@ gb_internal bool wb_generate_code(CheckerInfo *info) {
 		return false;
 	}
 
+	wb_link_resolve_imports(m);
+	if (m->error_count > 0) {
+		return false;
+	}
+
 	TIME_SECTION("wasm backend: write");
 	u32 index = 0;
 	for (wbProcedure *p : m->imports) {
@@ -2385,6 +2414,10 @@ gb_internal bool wb_generate_code(CheckerInfo *info) {
 	}
 	for (wbProcedure *p : m->procedures) {
 		p->func_index = index++;
+	}
+	wb_link_apply_relocs(m);
+	if (m->error_count > 0) {
+		return false;
 	}
 	for (wbProcedure *p : m->procedures) {
 		wb_patch_call_relocs(p);

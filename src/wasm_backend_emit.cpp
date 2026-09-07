@@ -225,6 +225,10 @@ gb_internal void wb_write_functype(wbBuffer *b, wbFuncType const &ft) {
 }
 
 gb_internal void wb_write_procedure_body(wbBuffer *b, wbProcedure *p) {
+	if (p->is_raw_body) {
+		wb_sized(b, &p->code);
+		return;
+	}
 	wbBuffer body = {};
 	wb_buffer_init(&body, heap_allocator(), p->code.data.count + 32);
 

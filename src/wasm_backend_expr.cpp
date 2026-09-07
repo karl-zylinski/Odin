@@ -570,6 +570,22 @@ gb_internal wbValue wb_emit_conv(wbProcedure *p, wbValue v, Type *dst) {
 		}
 		return wb_value_memory(tmp.index, tmp.offset, dst);
 	}
+	if (is_type_array(dst) && is_type_array(src)) {
+		// [N]A -> [N]B: element by element
+		Type *bs = base_type(src);
+		Type *bd = base_type(dst);
+		if (bs->Array.count == bd->Array.count && !are_types_identical(bs->Array.elem, bd->Array.elem)) {
+			wbAddr sa = wb_value_to_addr(p, v);
+			wbAddr tmp = wb_add_temp(p, dst);
+			i64 ses = type_size_of(bs->Array.elem);
+			i64 des = type_size_of(bd->Array.elem);
+			for (i64 i = 0; i < bd->Array.count; i++) {
+				wbValue e = wb_addr_load(p, wb_addr_offset(sa, i * ses, bs->Array.elem));
+				wb_addr_store(p, wb_addr_offset(tmp, i * des, bd->Array.elem), wb_emit_conv(p, e, bd->Array.elem));
+			}
+			return wb_value_memory(tmp.index, tmp.offset, dst);
+		}
+	}
 	if (is_type_matrix(dst) && !is_type_matrix(src) && svt != wbValType_Invalid) {
 		// scalar -> square matrix: the scaled identity
 		Type *bt = base_type(dst);
@@ -4286,7 +4302,7 @@ gb_internal void wb_push_foreign_arg(wbProcedure *p, wbValue v, Type *param_type
 gb_internal wbValue wb_emit_call(wbProcedure *p, Type *pt, wbProcedure *callee, wbValue proc_value, Array<wbValue> const &args) {
 	pt = base_type(pt);
 	bool foreign = callee != nullptr && callee->is_foreign;
-	bool sret = !foreign && wb_uses_sret(pt);
+	bool sret = wb_uses_sret(pt);
 
 	wbAddr ctx = {};
 	if (wb_is_odin_cc(pt)) {
@@ -4298,15 +4314,20 @@ gb_internal wbValue wb_emit_call(wbProcedure *p, Type *pt, wbProcedure *callee, 
 		result_addr = wb_add_temp(p, pt->Proc.results);
 		wb_push_address(p, result_addr.index, result_addr.offset);
 	}
-	if (foreign) {
+	if (foreign && pt->Proc.params != nullptr) {
 		isize arg_index = 0;
-		for (Entity *param : pt->Proc.params->Tuple.variables) {
+		for_array(i, pt->Proc.params->Tuple.variables) {
+			Entity *param = pt->Proc.params->Tuple.variables[i];
 			if (param->kind != Entity_Variable) {
+				continue;
+			}
+			if (pt->Proc.c_vararg && pt->Proc.variadic && i == pt->Proc.variadic_index) {
+				wb_push(p, args[arg_index++]); // pointer to the C variadic argument buffer
 				continue;
 			}
 			wb_push_foreign_arg(p, args[arg_index++], param->type, pt->Proc.calling_convention);
 		}
-	} else {
+	} else if (!foreign) {
 		for (wbValue const &v : args) {
 			wb_push(p, v);
 		}
@@ -4336,6 +4357,49 @@ gb_internal wbValue wb_emit_call(wbProcedure *p, Type *pt, wbProcedure *callee, 
 		return wb_pop_to_local(p, vt, rt);
 	}
 	return wb_value_invalid();
+}
+
+// Converts an argument of a `#c_vararg` procedure to the type C's default
+// argument promotions give it (lb_emit_c_vararg). `type` is the variadic
+// element type, or the argument's own type for `..any`.
+gb_internal wbValue wb_emit_c_vararg(wbProcedure *p, wbValue v, Type *type) {
+	if (is_type_untyped_nil(type)) {
+		return wb_value_const_int(t_rawptr, 0);
+	}
+	Type *core = core_type(type);
+	if (core->kind == Type_BitSet) {
+		core = core_type(bit_set_to_int(core));
+		v = wb_emit_transmute(p, v, core);
+	}
+	return wb_emit_conv(p, v, c_vararg_promote_type(core));
+}
+
+// Stores the extra arguments of a `#c_vararg` call in a stack buffer, as
+// LLVM's wasm ABI does, and returns its address (null when there are none).
+// The callee reads them back with `va_arg`: each at its natural alignment,
+// but at least 4 bytes wide and 4 byte aligned.
+gb_internal wbValue wb_build_c_vararg_buffer(wbProcedure *p, Ast *expr, Slice<wbValue> const &values) {
+	if (values.count == 0) {
+		return wb_value_const_int(t_rawptr, 0);
+	}
+	auto offsets = array_make<i64>(temporary_allocator(), values.count);
+	i64 size = 0;
+	for_array(i, values) {
+		Type *t = values[i].type;
+		if (!wb_abi_is_basic(t)) {
+			wb_unsupported(p, expr, "aggregate C variadic argument");
+			return wb_value_invalid();
+		}
+		i64 align = gb_max(type_align_of(t), 4);
+		size = align_formula(size, align);
+		offsets[i] = size;
+		size += gb_max(type_size_of(t), 4);
+	}
+	i32 base = wb_alloc_slot(p, size, 16);
+	for_array(i, values) {
+		wb_emit_store(p, p->fp_local, base + cast(i32)offsets[i], values[i], values[i].type);
+	}
+	return wb_addr_get_ptr(p, wb_addr_memory(p->fp_local, base, t_u8), t_rawptr);
 }
 
 // Builds a slice over a stack array holding the extra arguments of a variadic call
@@ -4385,7 +4449,7 @@ gb_internal void wb_add_defer_proc(wbProcedure *p, Ast *expr, Entity *e, Array<w
 	auto exprs  = array_make<Ast *>(temporary_allocator(), 0, in_args.count+4);
 	if (use_in) {
 		Type *ct = base_type(e->type);
-		isize variadic_index = ct->Proc.variadic ? ct->Proc.variadic_index : ct->Proc.params->Tuple.variables.count;
+		isize variadic_index = ct->Proc.variadic ? ct->Proc.variadic_index : (ct->Proc.params ? ct->Proc.params->Tuple.variables.count : 0);
 		Slice<Ast *> const &positional = ce->split_args->positional;
 		bool positional_map = true; // positional[i] corresponds to parameter i
 		for (Ast *arg : positional) {
@@ -4497,10 +4561,7 @@ gb_internal wbValue wb_build_call_expr_internal(wbProcedure *p, Ast *expr) {
 		wb_unsupported(p, expr, "call of non-procedure");
 		return wb_value_invalid();
 	}
-	if (pt->Proc.c_vararg) {
-		wb_unsupported(p, expr, "C variadic procedure call");
-		return wb_value_invalid();
-	}
+	bool c_vararg = pt->Proc.c_vararg;
 
 	// Direct call if the callee is a known procedure, otherwise through the table
 	Entity *e = entity_of_node(ce->proc);
@@ -4521,6 +4582,10 @@ gb_internal wbValue wb_build_call_expr_internal(wbProcedure *p, Ast *expr) {
 			return proc_value;
 		}
 		proc_value = wb_value_fresh(p, proc_value);
+	}
+	if (c_vararg && (callee == nullptr || !callee->is_foreign)) {
+		wb_unsupported(p, expr, "indirect C variadic procedure call");
+		return wb_value_invalid();
 	}
 
 	GB_ASSERT(ce->split_args != nullptr);
@@ -4557,7 +4622,12 @@ gb_internal wbValue wb_build_call_expr_internal(wbProcedure *p, Ast *expr) {
 					wb_unsupported(p, positional[i], "argument count");
 					return wb_value_invalid();
 				}
-				wbValue v = wb_emit_conv(p, wb_tuple_field(p, tuple, j), param_type);
+				wbValue v = wb_tuple_field(p, tuple, j);
+				if (c_vararg && index >= variadic_index) {
+					v = wb_emit_c_vararg(p, v, is_type_any(elem_type) ? v.type : elem_type);
+				} else {
+					v = wb_emit_conv(p, v, param_type);
+				}
 				array_add(&values, later_call[i] ? wb_value_fresh(p, v) : v);
 			}
 			continue;
@@ -4577,7 +4647,15 @@ gb_internal wbValue wb_build_call_expr_internal(wbProcedure *p, Ast *expr) {
 			wb_unsupported(p, positional[i], "argument count");
 			return wb_value_invalid();
 		}
-		wbValue v = wb_emit_conv(p, wb_build_expr(p, positional[i]), param_type);
+		wbValue v = wb_build_expr(p, positional[i]);
+		if (v.kind == wbValue_Invalid) {
+			return v;
+		}
+		if (c_vararg && index >= variadic_index) {
+			v = wb_emit_c_vararg(p, v, is_type_any(elem_type) ? type_of_expr(positional[i]) : elem_type);
+		} else {
+			v = wb_emit_conv(p, v, param_type);
+		}
 		if (v.kind == wbValue_Invalid) {
 			return v;
 		}
@@ -4594,7 +4672,18 @@ gb_internal wbValue wb_build_call_expr_internal(wbProcedure *p, Ast *expr) {
 		args[i] = values[i];
 		arg_set[i] = true;
 	}
-	if (variadic) {
+	if (variadic && c_vararg) {
+		if (vari_expand) {
+			wb_unsupported(p, expr, "expanded C variadic arguments");
+			return wb_value_invalid();
+		}
+		wbValue buffer = wb_build_c_vararg_buffer(p, expr, slice(slice_from_array(values), variadic_index, values.count));
+		if (buffer.kind == wbValue_Invalid) {
+			return buffer;
+		}
+		args[variadic_index] = buffer;
+		arg_set[variadic_index] = true;
+	} else if (variadic) {
 		wbValue slice_value = {};
 		if (values.count <= variadic_index) {
 			ExactValue nil_value = {};
@@ -4614,6 +4703,10 @@ gb_internal wbValue wb_build_call_expr_internal(wbProcedure *p, Ast *expr) {
 		isize index = lookup_procedure_parameter(pt, name);
 		if (index < 0) {
 			wb_unsupported(p, arg, "named argument");
+			return wb_value_invalid();
+		}
+		if (c_vararg && variadic && index == variadic_index) {
+			wb_unsupported(p, arg, "named C variadic argument");
 			return wb_value_invalid();
 		}
 		Type *param_type = pt->Proc.params->Tuple.variables[index]->type;
