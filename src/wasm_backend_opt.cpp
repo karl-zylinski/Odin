@@ -3025,6 +3025,30 @@ gb_internal void wb_inline_body(wbProcedure *p, wbProcedure *c) {
 	wb_close(p);
 }
 
+// The procedure `c` only forwards its parameters to (a generated hasher
+// wrapping the runtime's, say), nullptr otherwise
+gb_internal wbProcedure *wb_inline_forward_target(wbProcedure *c) {
+	if (c->is_raw_body || c->failed || c->is_foreign || c->alias != nullptr || c->instrs.count != cast(isize)c->param_count + 2) {
+		return nullptr;
+	}
+	for (u32 j = 0; j < c->param_count; j++) {
+		wbInstr const &in = c->instrs[j];
+		if (in.kind != wbInstr_Local || in.op != wbOp_local_get || in.imm != j) return nullptr;
+	}
+	wbInstr const &call = c->instrs[c->param_count];
+	wbInstr const &last = c->instrs[c->param_count+1];
+	if (call.kind != wbInstr_Call || (last.kind != wbInstr_End && last.kind != wbInstr_Return)) return nullptr;
+	wbProcedure *t = c->call_relocs[call.imm].target;
+	if (t == nullptr || t == c || t->param_count != c->param_count || t->results.count != c->results.count) return nullptr;
+	for_array(i, t->results) {
+		if (t->results[i] != c->results[i]) return nullptr;
+	}
+	for (u32 j = 0; j < c->param_count; j++) {
+		if (t->locals[j].vt != c->locals[j].vt) return nullptr;
+	}
+	return t;
+}
+
 // Inlines the eligible calls of `p`. Returns true when the body changed.
 gb_internal bool wb_inline_calls(wbProcedure *p) {
 	if (p->is_raw_body || p->failed || p->instrs.count == 0 || p->body == nullptr) {
@@ -3052,6 +3076,15 @@ gb_internal bool wb_inline_calls(wbProcedure *p) {
 		bool in_loop = false;
 		for (bool l : is_loop) in_loop |= l;
 		wbProcedure *c = p->call_relocs[in.imm].target;
+		// A call through a forwarder goes straight to its target
+		for (int hops = 0; c != nullptr && hops < 4; hops++) {
+			wbProcedure *t = wb_inline_forward_target(c);
+			if (t == nullptr) break;
+			p->call_relocs[in.imm].target = t;
+			if (c->call_sites > 0) c->call_sites--;
+			t->call_sites++;
+			c = t;
+		}
 		if (!wb_inline_candidate(p, c, in_loop) || growth + c->instrs.count > WB_INLINE_MAX_GROWTH) {
 			continue;
 		}
