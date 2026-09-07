@@ -105,8 +105,144 @@ gb_internal wbValue wb_emit_min_max(wbProcedure *p, wbValue a, wbValue b, Type *
 	return wb_pop_to_local(p, vt, type);
 }
 
+// A mask lane is set when its lowest bit is set: LLVM truncates the whole mask
+// vector to <N x i1>, which keeps bit 0 of every lane
+gb_internal wbValue wb_simd_mask_lane(wbProcedure *p, wbAddr mask, i64 i, Type *melem) {
+	wb_push(p, wb_simd_lane_load(p, mask, i));
+	if (wb_valtype_of(melem) == wbValType_i64) {
+		wb_i64_const(p, 1);
+		wb_op(p, wbOp_i64_and);
+		wb_op(p, wbOp_i32_wrap_i64);
+	} else {
+		wb_i32_const(p, 1);
+		wb_op(p, wbOp_i32_and);
+	}
+	return wb_pop_to_local(p, wbValType_i32, t_bool);
+}
+
+// `simd_gather`/`simd_scatter` and the masked load/store family
+//
+// All six take (ptr, values, mask) and touch memory only for the set lanes;
+// the ones that produce a vector keep `values` in the lanes that are not set.
+// `simd_masked_expand_load`/`simd_masked_compress_store` address a packed
+// buffer, so their memory index only advances on a set lane.
+gb_internal wbValue wb_build_simd_memory_builtin(wbProcedure *p, Ast *expr, BuiltinProcId id) {
+	ast_node(ce, CallExpr, expr);
+	Slice<Ast *> const &args = ce->args;
+
+	Type *val_type  = type_of_expr(args[1]);
+	Type *mask_type = type_of_expr(args[2]);
+	Type *bvt = base_type(val_type);
+	GB_ASSERT(bvt->kind == Type_SimdVector);
+	Type *elem  = bvt->SimdVector.elem;
+	i64   count = bvt->SimdVector.count;
+	Type *melem = base_type(mask_type)->SimdVector.elem;
+	if (wb_valtype_of(elem) == wbValType_Invalid) {
+		wb_unsupported_type(p, expr, val_type);
+		return wb_value_invalid();
+	}
+
+	bool ptr_per_lane = id == BuiltinProc_simd_gather || id == BuiltinProc_simd_scatter;
+
+	wbAddr ptrs = {}; // #simd[N]rawptr, one address per lane
+	wbAddr base = {}; // a single contiguous buffer
+	if (ptr_per_lane) {
+		ptrs = wb_simd_arg(p, args[0], type_of_expr(args[0]));
+		if (ptrs.kind == wbAddr_Invalid) {
+			return wb_value_invalid();
+		}
+	} else {
+		wbValue ptr = wb_build_expr(p, args[0]);
+		if (ptr.kind == wbValue_Invalid) {
+			return wb_value_invalid();
+		}
+		if (wb_expr_has_call(args[1]) || wb_expr_has_call(args[2])) {
+			ptr = wb_value_fresh(p, ptr);
+		}
+		base = wb_addr_from_pointer(p, ptr, elem);
+	}
+	wbAddr val  = wb_simd_arg(p, args[1], val_type);
+	wbAddr mask = wb_simd_arg(p, args[2], mask_type);
+	if (val.kind == wbAddr_Invalid || mask.kind == wbAddr_Invalid) {
+		return wb_value_invalid();
+	}
+
+	bool produces_value = id == BuiltinProc_simd_gather ||
+	                      id == BuiltinProc_simd_masked_load ||
+	                      id == BuiltinProc_simd_masked_expand_load;
+	wbAddr res = {};
+	if (produces_value) {
+		res = wb_add_temp(p, val_type);
+	}
+
+	// the index into the packed buffer of expand/compress
+	u32 packed = WB_NO_LOCAL;
+	if (id == BuiltinProc_simd_masked_expand_load || id == BuiltinProc_simd_masked_compress_store) {
+		packed = wb_add_local(p, wbValType_i32);
+		wb_i32_const(p, 0);
+		wb_local_set(p, packed);
+	}
+
+	i64 elem_size = type_size_of(elem);
+	for (i64 i = 0; i < count; i++) {
+		if (produces_value) {
+			wb_simd_lane_store(p, res, i, wb_simd_lane_load(p, val, i));
+		}
+		wb_push(p, wb_simd_mask_lane(p, mask, i, melem));
+		wb_open_if(p);
+		switch (id) {
+		case BuiltinProc_simd_gather:
+			wb_simd_lane_store(p, res, i, wb_addr_load(p, wb_addr_from_pointer(p, wb_simd_lane_load(p, ptrs, i), elem)));
+			break;
+		case BuiltinProc_simd_scatter:
+			wb_addr_store(p, wb_addr_from_pointer(p, wb_simd_lane_load(p, ptrs, i), elem), wb_simd_lane_load(p, val, i));
+			break;
+		case BuiltinProc_simd_masked_load:
+			wb_simd_lane_store(p, res, i, wb_addr_load(p, wb_addr_offset(base, i*elem_size, elem)));
+			break;
+		case BuiltinProc_simd_masked_store:
+			wb_addr_store(p, wb_addr_offset(base, i*elem_size, elem), wb_simd_lane_load(p, val, i));
+			break;
+		case BuiltinProc_simd_masked_expand_load:
+		case BuiltinProc_simd_masked_compress_store: {
+			wbAddr slot = wb_emit_elem_addr(p, base.index, base.offset, wb_value_local(packed, wbValType_i32, t_i32), elem);
+			if (id == BuiltinProc_simd_masked_expand_load) {
+				wb_simd_lane_store(p, res, i, wb_addr_load(p, slot));
+			} else {
+				wb_addr_store(p, slot, wb_simd_lane_load(p, val, i));
+			}
+			wb_local_get(p, packed);
+			wb_i32_const(p, 1);
+			wb_op(p, wbOp_i32_add);
+			wb_local_set(p, packed);
+			break;
+		}
+		default:
+			break;
+		}
+		wb_close(p);
+	}
+	if (produces_value) {
+		return wb_value_memory(res.index, res.offset, val_type);
+	}
+	return wb_value_invalid();
+}
+
 gb_internal wbValue wb_build_simd_builtin(wbProcedure *p, Ast *expr, BuiltinProcId id) {
 	ast_node(ce, CallExpr, expr);
+	switch (id) {
+	case BuiltinProc_simd_gather:
+	case BuiltinProc_simd_scatter:
+	case BuiltinProc_simd_masked_load:
+	case BuiltinProc_simd_masked_store:
+	case BuiltinProc_simd_masked_expand_load:
+	case BuiltinProc_simd_masked_compress_store:
+		// these take pointers, so the vector type is not the type of the
+		// first argument nor of the result (which may be nothing at all)
+		return wb_build_simd_memory_builtin(p, expr, id);
+	default:
+		break;
+	}
 	Type *type = expr->tav.type;
 	if (type != nullptr && is_type_untyped(type)) {
 		type = default_type(type);
@@ -439,6 +575,336 @@ gb_internal wbValue wb_build_simd_builtin(wbProcedure *p, Ast *expr, BuiltinProc
 		v = wb_value_copy(p, v);
 		v.type = type;
 		return v;
+	}
+
+	case BuiltinProc_simd_approx_recip:
+	case BuiltinProc_simd_approx_recip_sqrt: {
+		// exact 1/x and 1/sqrt(x). Only an approximation is promised, and LLVM
+		// takes that liberty: a reciprocal estimate instruction on x86, and a
+		// fast inverse square root for f64 lanes anywhere. Dividing is within
+		// the contract and is what LLVM does for f32 lanes off x86 as well.
+		wbAddr a = wb_simd_arg(p, args[0], vt);
+		if (a.kind == wbAddr_Invalid) {
+			return wb_value_invalid();
+		}
+		wbValType evt = wb_valtype_of(elem);
+		if (evt != wbValType_f32 && evt != wbValType_f64) {
+			wb_unsupported(p, expr, "simd builtin procedure on this lane type");
+			return wb_value_invalid();
+		}
+		wbValue one = wb_emit_conv(p, wb_value_const_int(t_int, 1), elem);
+		wbAddr res = wb_add_temp(p, type);
+		for (i64 i = 0; i < count; i++) {
+			wbValue x = wb_simd_lane_load(p, a, i);
+			if (id == BuiltinProc_simd_approx_recip_sqrt) {
+				wb_push(p, x);
+				wb_op(p, evt == wbValType_f64 ? wbOp_f64_sqrt : wbOp_f32_sqrt);
+				x = wb_pop_to_local(p, evt, elem);
+			}
+			wb_simd_lane_store(p, res, i, wb_emit_arith(p, expr, Token_Quo, one, x, elem, elem));
+		}
+		return wb_value_memory(res.index, res.offset, type);
+	}
+
+	case BuiltinProc_simd_saturating_add:
+	case BuiltinProc_simd_saturating_sub: {
+		// wrapping arithmetic followed by an overflow test; an overflowing lane
+		// takes the nearest end of the lane type's range
+		wbAddr a = wb_simd_arg(p, args[0], vt);
+		wbAddr b = wb_simd_arg(p, args[1], vt);
+		if (a.kind == wbAddr_Invalid || b.kind == wbAddr_Invalid) {
+			return wb_value_invalid();
+		}
+		bool is_add = id == BuiltinProc_simd_saturating_add;
+		bool is_signed = wb_type_is_signed(elem);
+		wbValType evt = wb_valtype_of(elem);
+		i64 bits = 8*type_size_of(elem);
+		i64 umax = bits >= 64 ? cast(i64)0xffffffffffffffffull : cast(i64)((cast(u64)1<<bits) - 1);
+		i64 smax = bits >= 64 ? cast(i64)0x7fffffffffffffffull : (cast(i64)1<<(bits-1)) - 1;
+		i64 smin = bits >= 64 ? cast(i64)0x8000000000000000ull : -(cast(i64)1<<(bits-1));
+		wbValue zero = wb_value_const_int(elem, 0);
+		wbAddr res = wb_add_temp(p, type);
+		for (i64 i = 0; i < count; i++) {
+			wbValue x = wb_value_to_local(p, wb_simd_lane_load(p, a, i));
+			wbValue y = wb_value_to_local(p, wb_simd_lane_load(p, b, i));
+			wbValue r = wb_value_to_local(p, wb_emit_arith(p, expr, is_add ? Token_Add : Token_Sub, x, y, elem, elem));
+			wbValue over = {};
+			wbValue sat  = {};
+			if (is_signed) {
+				// the sign of the result went the wrong way
+				wbValue l = wb_emit_arith(p, expr, Token_Xor, x, r, elem, elem);
+				wbValue m = is_add ? wb_emit_arith(p, expr, Token_Xor, y, r, elem, elem)
+				                   : wb_emit_arith(p, expr, Token_Xor, x, y, elem, elem);
+				wbValue bad = wb_emit_arith(p, expr, Token_And, l, m, elem, elem);
+				over = wb_emit_arith(p, expr, Token_Lt, bad, zero, elem, t_bool);
+				// select(min, max, x < 0)
+				wb_push(p, wb_value_const_int(elem, smin));
+				wb_push(p, wb_value_const_int(elem, smax));
+				wb_push(p, wb_emit_arith(p, expr, Token_Lt, x, zero, elem, t_bool));
+				wb_op(p, wbOp_select);
+				sat = wb_pop_to_local(p, evt, elem);
+			} else {
+				over = is_add ? wb_emit_arith(p, expr, Token_Lt, r, x, elem, t_bool)
+				              : wb_emit_arith(p, expr, Token_Lt, x, y, elem, t_bool);
+				sat = wb_value_const_int(elem, is_add ? umax : 0);
+			}
+			if (over.kind == wbValue_Invalid) {
+				return over;
+			}
+			wb_push(p, sat);
+			wb_push(p, r);
+			wb_push(p, over);
+			wb_op(p, wbOp_select);
+			wb_simd_lane_store(p, res, i, wb_pop_to_local(p, evt, elem));
+		}
+		return wb_value_memory(res.index, res.offset, type);
+	}
+
+	case BuiltinProc_simd_extract_lsbs:
+	case BuiltinProc_simd_extract_msbs: {
+		// a bit_set holding the lowest / highest bit of every lane
+		wbAddr a = wb_simd_arg(p, args[0], vt);
+		if (a.kind == wbAddr_Invalid) {
+			return wb_value_invalid();
+		}
+		wbValType rvt = wb_valtype_of(type);
+		if (rvt != wbValType_i32 && rvt != wbValType_i64) {
+			wb_unsupported_type(p, expr, type);
+			return wb_value_invalid();
+		}
+		i64 bits = 8*type_size_of(elem);
+		// boolean lanes are tested as the unsigned integer of the same width
+		Type *ielem = elem;
+		if (!is_type_integer(ielem)) {
+			switch (type_size_of(elem)) {
+			case 1:  ielem = t_u8;  break;
+			case 2:  ielem = t_u16; break;
+			case 4:  ielem = t_u32; break;
+			default: ielem = t_u64; break;
+			}
+		}
+		i64 bit = 1;
+		if (id == BuiltinProc_simd_extract_msbs) {
+			bit = bits >= 64 ? cast(i64)0x8000000000000000ull : (cast(i64)1<<(bits-1));
+		}
+		wbValue mask = wb_value_const_int(ielem, bit);
+		wbValue zero = wb_value_const_int(ielem, 0);
+		u32 acc = wb_add_local(p, rvt);
+		if (rvt == wbValType_i64) wb_i64_const(p, 0); else wb_i32_const(p, 0);
+		wb_local_set(p, acc);
+		for (i64 i = 0; i < count; i++) {
+			wbValue x = wb_emit_arith(p, expr, Token_And, wb_simd_lane_load(p, a, i), mask, ielem, ielem);
+			wbValue set = wb_emit_arith(p, expr, Token_NotEq, x, zero, ielem, t_bool);
+			if (set.kind == wbValue_Invalid) {
+				return set;
+			}
+			wb_local_get(p, acc);
+			wb_push(p, set);
+			if (rvt == wbValType_i64) {
+				wb_op(p, wbOp_i64_extend_i32_u);
+				wb_i64_const(p, i);
+				wb_op(p, wbOp_i64_shl);
+				wb_op(p, wbOp_i64_or);
+			} else {
+				wb_i32_const(p, cast(i32)i);
+				wb_op(p, wbOp_i32_shl);
+				wb_op(p, wbOp_i32_or);
+			}
+			wb_local_set(p, acc);
+		}
+		return wb_value_local(acc, rvt, type);
+	}
+
+	case BuiltinProc_simd_interleave: {
+		// a riffle of every argument: result[i*n + j] == args[j][i]
+		i64 n = cast(i64)args.count;
+		wbAddr *srcs = gb_alloc_array(temporary_allocator(), wbAddr, n);
+		for (i64 j = 0; j < n; j++) {
+			srcs[j] = wb_simd_arg(p, args[j], vt);
+			if (srcs[j].kind == wbAddr_Invalid) {
+				return wb_value_invalid();
+			}
+		}
+		wbAddr res = wb_add_temp(p, type);
+		for (i64 i = 0; i < count; i++) {
+			for (i64 j = 0; j < n; j++) {
+				wb_simd_lane_store(p, res, i*n + j, wb_simd_lane_load(p, srcs[j], i));
+			}
+		}
+		return wb_value_memory(res.index, res.offset, type);
+	}
+	case BuiltinProc_simd_deinterleave: {
+		// the inverse: output `j` is the input strided by `n` starting at lane `j`
+		wbAddr a = wb_simd_arg(p, args[0], vt);
+		if (a.kind == wbAddr_Invalid) {
+			return wb_value_invalid();
+		}
+		TypeAndValue tav = type_and_value_of_expr(args[1]);
+		GB_ASSERT(tav.value.kind == ExactValue_Integer);
+		i64 n = exact_value_to_i64(tav.value);
+		i64 part = count / n;
+		bool is_tuple = base_type(type)->kind == Type_Tuple;
+		wbAddr res = wb_add_temp(p, type);
+		for (i64 j = 0; j < n; j++) {
+			wbAddr out = is_tuple ? wb_addr_field(res, j) : res;
+			for (i64 i = 0; i < part; i++) {
+				wb_simd_lane_store(p, out, i, wb_simd_lane_load(p, a, i*n + j));
+			}
+		}
+		return wb_value_memory(res.index, res.offset, type);
+	}
+
+	case BuiltinProc_simd_odd_even: {
+		// the odd lanes of `a` followed by the even lanes of `b`
+		wbAddr a = wb_simd_arg(p, args[0], vt);
+		wbAddr b = wb_simd_arg(p, args[1], vt);
+		if (a.kind == wbAddr_Invalid || b.kind == wbAddr_Invalid) {
+			return wb_value_invalid();
+		}
+		i64 half = count/2;
+		wbAddr res = wb_add_temp(p, type);
+		for (i64 i = 0; i < half; i++) {
+			wb_simd_lane_store(p, res, i,      wb_simd_lane_load(p, a, 2*i + 1));
+			wb_simd_lane_store(p, res, i+half, wb_simd_lane_load(p, b, 2*i));
+		}
+		return wb_value_memory(res.index, res.offset, type);
+	}
+	case BuiltinProc_simd_pairwise_add:
+	case BuiltinProc_simd_pairwise_sub: {
+		// {a0+a1, a2+a3, ..., b0+b1, b2+b3, ...}
+		wbAddr a = wb_simd_arg(p, args[0], vt);
+		wbAddr b = wb_simd_arg(p, args[1], vt);
+		if (a.kind == wbAddr_Invalid || b.kind == wbAddr_Invalid) {
+			return wb_value_invalid();
+		}
+		TokenKind op = id == BuiltinProc_simd_pairwise_add ? Token_Add : Token_Sub;
+		i64 half = count/2;
+		wbAddr res = wb_add_temp(p, type);
+		for (i64 i = 0; i < half; i++) {
+			wbValue x = wb_emit_arith(p, expr, op, wb_simd_lane_load(p, a, 2*i), wb_simd_lane_load(p, a, 2*i + 1), elem, elem);
+			wbValue y = wb_emit_arith(p, expr, op, wb_simd_lane_load(p, b, 2*i), wb_simd_lane_load(p, b, 2*i + 1), elem, elem);
+			if (x.kind == wbValue_Invalid || y.kind == wbValue_Invalid) {
+				return wb_value_invalid();
+			}
+			wb_simd_lane_store(p, res, i,      x);
+			wb_simd_lane_store(p, res, i+half, y);
+		}
+		return wb_value_memory(res.index, res.offset, type);
+	}
+
+	case BuiltinProc_simd_reduce_add_pairs:
+	case BuiltinProc_simd_reduce_mul_pairs: {
+		// a tree reduction that always combines adjacent lanes; the private copy
+		// of the argument is folded in place
+		wbAddr a = wb_simd_arg(p, args[0], vt);
+		if (a.kind == wbAddr_Invalid) {
+			return wb_value_invalid();
+		}
+		TokenKind op = id == BuiltinProc_simd_reduce_add_pairs ? Token_Add : Token_Mul;
+		for (i64 rem = count/2; rem >= 1; rem /= 2) {
+			for (i64 i = 0; i < rem; i++) {
+				wbValue x = wb_simd_lane_load(p, a, 2*i);
+				wbValue y = wb_simd_lane_load(p, a, 2*i + 1);
+				wbValue r = wb_emit_arith(p, expr, op, x, y, elem, elem);
+				if (r.kind == wbValue_Invalid) {
+					return r;
+				}
+				wb_simd_lane_store(p, a, i, r);
+			}
+		}
+		return wb_emit_conv(p, wb_simd_lane_load(p, a, 0), type);
+	}
+
+	case BuiltinProc_simd_sums_of_n: {
+		// the sums of every `n` consecutive lanes
+		wbAddr a = wb_simd_arg(p, args[0], vt);
+		if (a.kind == wbAddr_Invalid) {
+			return wb_value_invalid();
+		}
+		TypeAndValue tav = type_and_value_of_expr(args[1]);
+		GB_ASSERT(tav.value.kind == ExactValue_Integer);
+		i64 n = exact_value_to_i64(tav.value);
+		i64 result_count = count / n;
+		wbValType evt = wb_valtype_of(elem);
+		bool is_float = evt == wbValType_f32 || evt == wbValType_f64;
+		// LLVM only pairs the lanes up with a plain addition when a single one
+		// suffices, otherwise it reduces starting from a zero, which for floats
+		// is an observable difference (-0.0 + 0.0 == 0.0)
+		bool start_at_zero = is_float && !(n == 2 && result_count > 1);
+		wbAddr res = {};
+		if (result_count > 1) {
+			res = wb_add_temp(p, type);
+		}
+		wbValue acc = {};
+		for (i64 j = 0; j < result_count; j++) {
+			i64 i = 0;
+			if (start_at_zero) {
+				acc = wb_emit_conv(p, wb_value_const_int(t_int, 0), elem);
+			} else {
+				acc = wb_simd_lane_load(p, a, j*n);
+				i = 1;
+			}
+			for (; i < n; i++) {
+				acc = wb_emit_arith(p, expr, Token_Add, acc, wb_simd_lane_load(p, a, j*n + i), elem, elem);
+				if (acc.kind == wbValue_Invalid) {
+					return acc;
+				}
+			}
+			if (result_count > 1) {
+				wb_simd_lane_store(p, res, j, acc);
+			}
+		}
+		if (result_count > 1) {
+			return wb_value_memory(res.index, res.offset, type);
+		}
+		return wb_emit_conv(p, acc, type);
+	}
+
+	case BuiltinProc_simd_runtime_swizzle: {
+		wbAddr a = wb_simd_arg(p, args[0], vt);
+		wbAddr b = wb_simd_arg(p, args[1], vt);
+		if (a.kind == wbAddr_Invalid || b.kind == wbAddr_Invalid) {
+			return wb_value_invalid();
+		}
+		// LLVM lowers 16 lanes of bytes on a wasm target to `llvm.wasm.swizzle`,
+		// which reads the index as an unsigned byte and gives a zero for anything
+		// outside the table. Every other shape goes through its emulation, which
+		// masks the index down to the lane count instead.
+		bool is_table_lookup = type_size_of(elem) == 1 && count == 16;
+		wbValType evt = wb_valtype_of(elem);
+		wbAddr res = wb_add_temp(p, type);
+		for (i64 i = 0; i < count; i++) {
+			wbValue index = wb_simd_lane_load(p, b, i);
+			if (is_table_lookup) {
+				wb_push(p, index);
+				wb_i32_const(p, 0xff);
+				wb_op(p, wbOp_i32_and);
+				wbValue u = wb_pop_to_local(p, wbValType_i32, t_i32);
+				wb_push(p, u);
+				wb_i32_const(p, cast(i32)count);
+				wb_op(p, wbOp_i32_lt_u);
+				wbValue in_range = wb_pop_to_local(p, wbValType_i32, t_bool);
+				// the load is always in the table, the out of range lanes are
+				// selected away afterwards
+				wb_push(p, u);
+				wb_i32_const(p, cast(i32)(count-1));
+				wb_op(p, wbOp_i32_and);
+				wbValue safe = wb_pop_to_local(p, wbValType_i32, t_i32);
+				wbValue x = wb_addr_load(p, wb_emit_elem_addr(p, a.index, a.offset, safe, elem));
+				wb_push(p, x);
+				wb_i32_const(p, 0);
+				wb_push(p, in_range);
+				wb_op(p, wbOp_select);
+				wb_simd_lane_store(p, res, i, wb_pop_to_local(p, evt, elem));
+			} else {
+				wbValue m = wb_emit_arith(p, expr, Token_And, index, wb_value_const_int(elem, count-1), elem, elem);
+				if (m.kind == wbValue_Invalid) {
+					return m;
+				}
+				wb_simd_lane_store(p, res, i, wb_addr_load(p, wb_emit_elem_addr(p, a.index, a.offset, m, elem)));
+			}
+		}
+		return wb_value_memory(res.index, res.offset, type);
 	}
 
 	default:
