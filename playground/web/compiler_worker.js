@@ -9,10 +9,12 @@ let compilerModule = null;
 let rootFs = null;
 
 async function setup() {
-	const [moduleResponse, packResponse] = await Promise.all([fetch("odin.wasm"), fetch("odin_root.pack")]);
+	const [moduleResponse, packResponse] = await Promise.all([fetch("odin.wasm"), fetch("odin_root.pack.gz")]);
 	const compiled = WebAssembly.compileStreaming(moduleResponse);
+	// The pack is gzipped on disk so that it is small no matter how it is served
+	const unpacked = new Response(packResponse.body.pipeThrough(new DecompressionStream("gzip")));
 	rootFs = new WasiFileSystem();
-	rootFs.loadPack(await packResponse.arrayBuffer(), "/odin");
+	rootFs.loadPack(await unpacked.arrayBuffer(), "/odin");
 	compilerModule = await compiled;
 	postMessage({type: "ready"});
 }

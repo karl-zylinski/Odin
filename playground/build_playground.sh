@@ -10,5 +10,6 @@ DIST=playground/dist
 mkdir -p "$DIST"
 OUT="$DIST/odin.wasm" ./build_odin_wasi.sh release
 ./odin run playground/pack_root -- . "$DIST/odin_root.pack"
+gzip -9 -f "$DIST/odin_root.pack"
 cp core/sys/wasm/js/odin.js playground/web/* "$DIST/"
 echo "Playground built in $DIST. Serve it with e.g.: python3 -m http.server -d $DIST 8000"

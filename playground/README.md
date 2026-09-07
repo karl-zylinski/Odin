@@ -14,7 +14,7 @@ python3 -m http.server -d playground/dist 8000
 `playground/dist` then contains:
 
 - `odin.wasm`: the compiler
-- `odin_root.pack`: the `base`, `core` and `vendor` sources and the wasm objects vendor packages link against, packed by `playground/pack_root`. The compiler reads them from an in-memory file system, `ODIN_ROOT` is `/odin`.
+- `odin_root.pack.gz`: the `base`, `core` and `vendor` sources and the wasm objects vendor packages link against, packed by `playground/pack_root` and gzipped (37 MB becomes 6 MB). The compiler reads them from an in-memory file system, `ODIN_ROOT` is `/odin`.
 - `odin.js`, `index.html`, `playground.js`, `compiler_worker.js`, `wasi.js`: the page
 
 ## How it works
