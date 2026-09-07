@@ -567,6 +567,7 @@ struct BuildContext {
 	bool   no_crt;
 	bool   no_rpath;
 	bool   no_entry_point;
+	bool   wasm_lower_all;
 	bool   no_thread_local;
 	bool   cross_compiling;
 	bool   different_os;

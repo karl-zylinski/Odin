@@ -2965,6 +2965,20 @@ gb_internal void collect_testing_procedures_of_package(Checker *c, AstPackage *p
 	}
 }
 
+// Every non-polymorphic procedure of the initial package is a root under -wasm-lower-all
+gb_internal bool wasm_lower_all_root(AstPackage *init_package, Entity *e) {
+	if (e->kind != Entity_Procedure || e->pkg != init_package) {
+		return false;
+	}
+	if ((e->scope->flags & ScopeFlag_File) == 0) {
+		return false;
+	}
+	if (e->Procedure.is_foreign || e->type == nullptr || is_type_polymorphic(e->type)) {
+		return false;
+	}
+	return true;
+}
+
 gb_internal void generate_minimum_dependency_set_internal(Checker *c, Entity *start) {
 	// auto const &add_to_set = add_dependency_to_set;
 	auto const &add_to_set = add_dependency_to_set_threaded;
@@ -2995,6 +3009,14 @@ gb_internal void generate_minimum_dependency_set_internal(Checker *c, Entity *st
 	for (Entity *e; mpsc_dequeue(&c->info.required_global_variable_queue, &e); /**/) {
 		e->flags |= EntityFlag_Used;
 		add_to_set(c, e);
+	}
+
+	if (build_context.wasm_lower_all) {
+		for (Entity *e : c->info.entities) {
+			if (wasm_lower_all_root(c->info.init_package, e)) {
+				add_to_set(c, e);
+			}
+		}
 	}
 
 	for_array(i, c->info.entities) {

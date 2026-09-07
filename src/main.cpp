@@ -462,6 +462,7 @@ enum BuildFlagKind {
 	BuildFlag_NoCRT,
 	BuildFlag_NoRPath,
 	BuildFlag_NoEntryPoint,
+	BuildFlag_WasmLowerAll,
 	BuildFlag_Linker,
 	BuildFlag_UseSeparateModules,
 	BuildFlag_UseSingleModule,
@@ -725,6 +726,8 @@ gb_internal bool parse_build_flags(Array<String> args) {
 	add_flag(&build_flags, BuildFlag_NoCRT,                   str_lit("no-crt"),                    BuildFlagParam_None,    Command__does_build);
 	add_flag(&build_flags, BuildFlag_NoRPath,                 str_lit("no-rpath"),                  BuildFlagParam_None,    Command__does_build);
 	add_flag(&build_flags, BuildFlag_NoEntryPoint,            str_lit("no-entry-point"),            BuildFlagParam_None,    Command__does_check &~ Command_test);
+	// Undocumented: makes the wasm backend generate every procedure of the initial package, used to find unsupported code
+	add_flag(&build_flags, BuildFlag_WasmLowerAll,            str_lit("wasm-lower-all"),            BuildFlagParam_None,    Command__does_build);
 	add_flag(&build_flags, BuildFlag_Linker,                  str_lit("linker"),                    BuildFlagParam_String,  Command__does_build);
 	add_flag(&build_flags, BuildFlag_UseSeparateModules,      str_lit("use-separate-modules"),      BuildFlagParam_None,    Command__does_build);
 	add_flag(&build_flags, BuildFlag_UseSingleModule,         str_lit("use-single-module"),         BuildFlagParam_None,    Command__does_build);
@@ -1456,6 +1459,9 @@ gb_internal bool parse_build_flags(Array<String> args) {
 							break;
 						case BuildFlag_NoEntryPoint:
 							build_context.no_entry_point = true;
+							break;
+						case BuildFlag_WasmLowerAll:
+							build_context.wasm_lower_all = true;
 							break;
 						case BuildFlag_NoThreadLocal:
 							build_context.no_thread_local = true;
