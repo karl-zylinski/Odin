@@ -1163,6 +1163,18 @@ gb_internal wbAddr wb_addr_deep_field(wbProcedure *p, Ast *expr, wbAddr addr, Ty
 			addr.type = type;
 			continue;
 		}
+		if (is_type_quaternion(bt)) {
+			// q.x/y/z/w are the components in memory order (@QuaternionLayout), q.xyz the first three
+			Type *elem = base_complex_elem_type(bt);
+			if (index < 0) {
+				type = alloc_type_array(elem, 3);
+				addr = wb_addr_offset(addr, 0, type);
+			} else {
+				type = elem;
+				addr = wb_addr_offset(addr, index*type_size_of(elem), type);
+			}
+			continue;
+		}
 		switch (bt->kind) {
 		case Type_Struct:
 		case Type_Tuple:
@@ -1695,10 +1707,6 @@ gb_internal void wb_build_compound_lit(wbProcedure *p, Ast *expr, wbAddr dst) {
 
 	switch (bt->kind) {
 	case Type_Struct: {
-		if (bt->Struct.is_raw_union) {
-			wb_unsupported(p, expr, "raw union literal");
-			return;
-		}
 		if (is_type_soa_struct(bt)) {
 			wb_build_compound_lit_array_elems(p, expr, cl->elems, dst, bt->Struct.soa_elem);
 			return;
@@ -4303,14 +4311,17 @@ gb_internal wbValue wb_build_builtin_call_internal(wbProcedure *p, Ast *expr, Bu
 	return wb_value_invalid();
 }
 
-// Pushes one argument of a call to a foreign procedure using the LLVM wasm ABI
-gb_internal void wb_push_foreign_arg(wbProcedure *p, wbValue v, Type *param_type, ProcCallingConvention cc) {
+// Pushes one argument of a call as the wasm values wb_functype_of_proc gives the parameter
+gb_internal void wb_push_abi_arg(wbProcedure *p, wbValue v, Type *param_type, ProcCallingConvention cc) {
 	auto leaves = array_make<wbAbiLeaf>(temporary_allocator(), 0, 8);
 	if (!wb_abi_flatten(param_type, cc, 0, &leaves)) {
 		// indirect: pointer to the caller owned copy
 		GB_ASSERT(v.kind == wbValue_Memory);
 		wb_push_address(p, v.index, v.offset);
 		return;
+	}
+	if (leaves.count == 0) {
+		return; // zero sized
 	}
 	if (v.kind != wbValue_Memory) {
 		GB_ASSERT(leaves.count == 1);
@@ -4328,7 +4339,6 @@ gb_internal void wb_push_foreign_arg(wbProcedure *p, wbValue v, Type *param_type
 // owned storage. Returns the result (a Memory value for sret results).
 gb_internal wbValue wb_emit_call(wbProcedure *p, Type *pt, wbProcedure *callee, wbValue proc_value, Array<wbValue> const &args) {
 	pt = base_type(pt);
-	bool foreign = callee != nullptr && callee->is_foreign;
 	bool sret = wb_uses_sret(pt);
 
 	wbAddr ctx = {};
@@ -4341,7 +4351,7 @@ gb_internal wbValue wb_emit_call(wbProcedure *p, Type *pt, wbProcedure *callee, 
 		result_addr = wb_add_temp(p, pt->Proc.results);
 		wb_push_address(p, result_addr.index, result_addr.offset);
 	}
-	if (foreign && pt->Proc.params != nullptr) {
+	if (pt->Proc.params != nullptr) {
 		isize arg_index = 0;
 		for_array(i, pt->Proc.params->Tuple.variables) {
 			Entity *param = pt->Proc.params->Tuple.variables[i];
@@ -4352,11 +4362,7 @@ gb_internal wbValue wb_emit_call(wbProcedure *p, Type *pt, wbProcedure *callee, 
 				wb_push(p, args[arg_index++]); // pointer to the C variadic argument buffer
 				continue;
 			}
-			wb_push_foreign_arg(p, args[arg_index++], param->type, pt->Proc.calling_convention);
-		}
-	} else if (!foreign) {
-		for (wbValue const &v : args) {
-			wb_push(p, v);
+			wb_push_abi_arg(p, args[arg_index++], param->type, pt->Proc.calling_convention);
 		}
 	}
 	if (wb_is_odin_cc(pt)) {

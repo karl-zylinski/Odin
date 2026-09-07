@@ -239,47 +239,12 @@ gb_internal u32 wb_add_functype(wbModule *m, wbFuncType const &ft) {
 	return cast(u32)(m->types.count-1);
 }
 
-// Computes the wasm signature of an Odin procedure type (see the calling
-// convention description in wasm_backend.hpp).
-gb_internal void wb_functype_of_proc(wbModule *m, Type *pt, wbFuncType *ft) {
-	pt = base_type(pt);
-	GB_ASSERT(pt->kind == Type_Proc);
-	array_init(&ft->params,  m->allocator);
-	array_init(&ft->results, m->allocator);
-
-	if (wb_uses_sret(pt)) {
-		array_add(&ft->params, wbValType_i32);
-	}
-	if (pt->Proc.params != nullptr) {
-		for (Entity *e : pt->Proc.params->Tuple.variables) {
-			if (e->kind != Entity_Variable) {
-				continue; // polymorphic parameters ($T, constants) take no space
-			}
-			wbValType vt = wb_valtype_of(e->type);
-			if (vt == wbValType_Invalid) {
-				vt = wbValType_i32; // pointer to a copy
-			}
-			array_add(&ft->params, vt);
-		}
-	}
-	if (wb_is_odin_cc(pt)) {
-		array_add(&ft->params, wbValType_i32); // context pointer
-	}
-	if (pt->Proc.result_count == 1 && !wb_uses_sret(pt)) {
-		array_add(&ft->results, wb_valtype_of(wb_result_type(pt)));
-	}
-}
-
-gb_internal u32 wb_type_index_of_proc(wbModule *m, Type *pt) {
-	wbFuncType ft = {};
-	wb_functype_of_proc(m, pt, &ft);
-	return wb_add_functype(m, ft);
-}
-
-// Foreign procedures use the ABI the LLVM backend produces for wasm (lbAbiWasm
-// in llvm_abi.cpp) so that imports match the JavaScript/WASI hosts: aggregates
-// that consist of basic fields are flattened into one wasm parameter per field,
-// anything else is passed as a pointer.
+// Signatures follow the ABI the LLVM backend produces for wasm (lbAbiWasm in
+// llvm_abi.cpp) so that imports, exports and the vendor objects linked in
+// match: aggregates that consist of basic fields are flattened into one wasm
+// parameter per field, anything else is passed as a pointer. The same rules
+// apply to every procedure, whatever its calling convention, so procedure
+// values of foreign and Odin procedures are interchangeable.
 
 // A scalar piece of an aggregate passed directly
 struct wbAbiLeaf {
@@ -294,6 +259,30 @@ gb_internal bool wb_abi_is_basic(Type *t) {
 	return type_size_of(t) <= 8;
 }
 
+gb_internal bool wb_abi_is_int128(Type *t) {
+	t = core_type(t);
+	return t->kind == Type_Basic && (t->Basic.flags & BasicFlag_Integer) != 0 && type_size_of(t) == 16;
+}
+
+// Whether `t` is passed directly on its own or as part of an aggregate
+// (lbAbiWasm::is_basic_register_type): a basic scalar, or a 128 bit integer
+// which is split into two i64.
+gb_internal bool wb_abi_is_register(Type *t) {
+	return wb_abi_is_basic(t) || wb_abi_is_int128(t);
+}
+
+gb_internal void wb_abi_add_register(Type *t, i64 base_offset, Array<wbAbiLeaf> *leaves) {
+	if (wb_abi_is_int128(t)) {
+		wbAbiLeaf lo = {base_offset,   t_u64};
+		wbAbiLeaf hi = {base_offset+8, t_u64};
+		array_add(leaves, lo);
+		array_add(leaves, hi);
+	} else {
+		wbAbiLeaf leaf = {base_offset, t};
+		array_add(leaves, leaf);
+	}
+}
+
 // Appends the scalar leaves of `t` if it is passed directly, returns false if
 // it is passed indirectly (through a pointer). Zero sized types have no leaves.
 gb_internal bool wb_abi_flatten(Type *t, ProcCallingConvention cc, i64 base_offset, Array<wbAbiLeaf> *leaves) {
@@ -302,8 +291,13 @@ gb_internal bool wb_abi_flatten(Type *t, ProcCallingConvention cc, i64 base_offs
 	if (size == 0) {
 		return true;
 	}
-	if (wb_abi_is_basic(t)) {
-		wbAbiLeaf leaf = {base_offset, t};
+	if (wb_abi_is_register(t)) {
+		wb_abi_add_register(t, base_offset, leaves);
+		return true;
+	}
+	if (bt->kind == Type_Union && is_type_union_maybe_pointer(bt)) {
+		// represented as the pointer itself (nil when null)
+		wbAbiLeaf leaf = {base_offset, t_rawptr};
 		array_add(leaves, leaf);
 		return true;
 	}
@@ -321,20 +315,19 @@ gb_internal bool wb_abi_flatten(Type *t, ProcCallingConvention cc, i64 base_offs
 	}
 	switch (bt->kind) {
 	case Type_Array:
-		if (wb_abi_is_basic(bt->Array.elem)) {
-			i64 elem_size = type_size_of(bt->Array.elem);
-			for (i64 i = 0; i < bt->Array.count; i++) {
-				wbAbiLeaf leaf = {base_offset + i*elem_size, bt->Array.elem};
-				array_add(leaves, leaf);
-			}
-			return true;
-		}
-		return false;
-	case Type_Slice:
-	case Type_Basic: // string
-		if (bt->kind == Type_Basic && !is_type_string(bt)) {
+	case Type_Matrix: {
+		// Matrices are arrays of their element type, padding included
+		Type *elem = bt->kind == Type_Array ? bt->Array.elem : bt->Matrix.elem;
+		if (!wb_abi_is_register(elem)) {
 			return false;
 		}
+		i64 elem_size = type_size_of(elem);
+		for (i64 i = 0; i < size/elem_size; i++) {
+			wb_abi_add_register(elem, base_offset + i*elem_size, leaves);
+		}
+		return true;
+	}
+	case Type_Slice:
 		{
 			wbAbiLeaf data = {base_offset, t_rawptr};
 			wbAbiLeaf len  = {base_offset + build_context.int_size, t_int};
@@ -342,41 +335,63 @@ gb_internal bool wb_abi_flatten(Type *t, ProcCallingConvention cc, i64 base_offs
 			array_add(leaves, len);
 		}
 		return true;
+	case Type_Basic:
+		if (is_type_string(bt)) {
+			wbAbiLeaf data = {base_offset, t_rawptr};
+			wbAbiLeaf len  = {base_offset + build_context.int_size, t_int};
+			array_add(leaves, data);
+			array_add(leaves, len);
+			return true;
+		}
+		if (is_type_any(bt)) {
+			Type *ft = nullptr;
+			wbAbiLeaf data = {base_offset, t_rawptr};
+			wbAbiLeaf id   = {base_offset + type_offset_of(bt, 1, &ft), t_typeid};
+			array_add(leaves, data);
+			array_add(leaves, id);
+			return true;
+		}
+		if (is_type_complex(bt) || is_type_quaternion(bt)) {
+			Type *elem = base_complex_elem_type(bt);
+			i64 elem_size = type_size_of(elem);
+			for (i64 i = 0; i < size/elem_size; i++) {
+				wbAbiLeaf leaf = {base_offset + i*elem_size, elem};
+				array_add(leaves, leaf);
+			}
+			return true;
+		}
+		return false;
 	case Type_Struct:
 		if (bt->Struct.is_raw_union) {
 			return false;
 		}
 		for_array(i, bt->Struct.fields) {
-			if (!wb_abi_is_basic(bt->Struct.fields[i]->type)) {
+			if (!wb_abi_is_register(bt->Struct.fields[i]->type)) {
 				return false;
 			}
 		}
 		for_array(i, bt->Struct.fields) {
 			Type *ft = nullptr;
 			i64 offset = type_offset_of(bt, i, &ft);
-			wbAbiLeaf leaf = {base_offset+offset, ft};
-			array_add(leaves, leaf);
+			wb_abi_add_register(ft, base_offset+offset, leaves);
 		}
 		return true;
 	}
 	return false;
 }
 
-// Signature of a foreign procedure. Returns false if the type cannot be
-// expressed (aggregate results).
-gb_internal bool wb_functype_of_foreign(wbModule *m, Type *pt, wbFuncType *ft) {
+// Computes the wasm signature of a procedure type (see the calling convention
+// description in wasm_backend.hpp)
+gb_internal void wb_functype_of_proc(wbModule *m, Type *pt, wbFuncType *ft) {
 	pt = base_type(pt);
 	GB_ASSERT(pt->kind == Type_Proc);
 	array_init(&ft->params,  m->allocator);
 	array_init(&ft->results, m->allocator);
 	ProcCallingConvention cc = pt->Proc.calling_convention;
 
-	if (pt->Proc.result_count > 1) {
-		return false;
-	}
-	// An aggregate result is returned through a pointer passed as the first
-	// parameter (the C ABI's sret), as for Odin procedures
-	if (pt->Proc.result_count == 1 && wb_uses_sret(pt)) {
+	// Results that are not a single wasm value are returned through a pointer
+	// passed as the first parameter (the C ABI's sret)
+	if (wb_uses_sret(pt)) {
 		array_add(&ft->params, wbValType_i32);
 	}
 
@@ -384,7 +399,7 @@ gb_internal bool wb_functype_of_foreign(wbModule *m, Type *pt, wbFuncType *ft) {
 		for_array(i, pt->Proc.params->Tuple.variables) {
 			Entity *e = pt->Proc.params->Tuple.variables[i];
 			if (e->kind != Entity_Variable) {
-				continue;
+				continue; // polymorphic parameters ($T, constants) take no space
 			}
 			if (pt->Proc.c_vararg && pt->Proc.variadic && i == pt->Proc.variadic_index) {
 				continue; // the C variadic arguments are passed through the buffer pointer below
@@ -409,15 +424,16 @@ gb_internal bool wb_functype_of_foreign(wbModule *m, Type *pt, wbFuncType *ft) {
 	}
 	if (pt->Proc.result_count == 1 && !wb_uses_sret(pt)) {
 		Type *rt = wb_result_type(pt);
-		if (type_size_of(rt) == 0) {
-			// nothing
-		} else if (wb_abi_is_basic(rt)) {
+		if (type_size_of(rt) > 0) {
 			array_add(&ft->results, wb_valtype_of(rt));
-		} else {
-			return false;
 		}
 	}
-	return true;
+}
+
+gb_internal u32 wb_type_index_of_proc(wbModule *m, Type *pt) {
+	wbFuncType ft = {};
+	wb_functype_of_proc(m, pt, &ft);
+	return wb_add_functype(m, ft);
 }
 
 // Procedures
@@ -483,13 +499,7 @@ gb_internal wbProcedure *wb_procedure_for_entity(wbModule *m, Entity *e) {
 	}
 
 	wbFuncType ft = {};
-	if (p->is_foreign) {
-		if (!wb_functype_of_foreign(m, e->type, &ft)) {
-			wb_unsupported_type(p, nullptr, e->type);
-		}
-	} else {
-		wb_functype_of_proc(m, e->type, &ft);
-	}
+	wb_functype_of_proc(m, e->type, &ft);
 	p->type_index = wb_add_functype(m, ft);
 	for (wbValType vt : ft.results) {
 		array_add(&p->results, vt);
@@ -576,20 +586,14 @@ gb_internal bool wb_const_procedure_index(wbModule *m, String const &prefix, Ast
 
 // Index of a procedure in the function table (used for procedure values)
 gb_internal u32 wb_table_index(wbModule *m, wbProcedure *p) {
-	if (p->is_foreign) {
-		// Foreign procedures use the C ABI while procedure values are called
-		// with the convention of wb_functype_of_proc; the two agree only when
-		// the signature has no aggregates. The wasm signatures are deduplicated
-		// so equal type indices mean equal signatures.
-		bool compatible = !p->is_llvm_intrinsic && p->entity != nullptr && p->type_index == wb_type_index_of_proc(m, p->entity->type);
-		if (!compatible) {
-			if (!p->failed) {
-				gb_printf_err("wasm backend: taking the address of foreign procedure '%.*s' is not supported\n", LIT(p->name));
-				m->error_count += 1;
-				p->failed = true;
-			}
-			return 0;
+	if (p->is_llvm_intrinsic) {
+		// LLVM intrinsics are lowered at the call site, there is no function to point to
+		if (!p->failed) {
+			gb_printf_err("wasm backend: taking the address of intrinsic '%.*s' is not supported\n", LIT(p->name));
+			m->error_count += 1;
+			p->failed = true;
 		}
+		return 0;
 	}
 	if (p->table_index == 0) {
 		array_add(&m->table, p);
@@ -2028,22 +2032,32 @@ gb_internal void wb_build_procedure(wbProcedure *p) {
 	}
 	Type *pt = base_type(p->type);
 
-	// Parameters map 1:1 onto the first wasm locals
+	// Parameters occupy the first wasm locals, laid out by wb_functype_of_proc
 	if (wb_uses_sret(pt)) {
 		p->sret_local = cast(i32)wb_add_local(p, wbValType_i32, str_lit("sret"));
 	}
-	auto param_locals = array_make<u32>(temporary_allocator(), 0, 8);
+	struct wbParamLocals {
+		u32 first; // index of the first local, WB_NO_LOCAL if the parameter takes none
+		Array<wbAbiLeaf> leaves;
+		bool direct;
+	};
+	auto param_locals = array_make<wbParamLocals>(temporary_allocator(), 0, 8);
 	if (pt->Proc.params != nullptr) {
 		for (Entity *e : pt->Proc.params->Tuple.variables) {
-			if (e->kind != Entity_Variable) {
-				array_add(&param_locals, WB_NO_LOCAL);
-				continue;
+			wbParamLocals pl = {WB_NO_LOCAL};
+			if (e->kind == Entity_Variable) {
+				pl.leaves = array_make<wbAbiLeaf>(temporary_allocator(), 0, 8);
+				pl.direct = wb_abi_flatten(e->type, pt->Proc.calling_convention, 0, &pl.leaves);
+				if (!pl.direct) {
+					pl.first = wb_add_local(p, wbValType_i32, e->token.string);
+				} else if (pl.leaves.count > 0) {
+					pl.first = wb_add_local(p, wb_valtype_of(pl.leaves[0].type), e->token.string);
+					for (isize i = 1; i < pl.leaves.count; i++) {
+						wb_add_local(p, wb_valtype_of(pl.leaves[i].type), e->token.string);
+					}
+				}
 			}
-			wbValType vt = wb_valtype_of(e->type);
-			if (vt == wbValType_Invalid) {
-				vt = wbValType_i32;
-			}
-			array_add(&param_locals, wb_add_local(p, vt, e->token.string));
+			array_add(&param_locals, pl);
 		}
 	}
 	if (wb_is_odin_cc(pt)) {
@@ -2058,21 +2072,24 @@ gb_internal void wb_build_procedure(wbProcedure *p) {
 	if (pt->Proc.params != nullptr) {
 		for_array(i, pt->Proc.params->Tuple.variables) {
 			Entity *e = pt->Proc.params->Tuple.variables[i];
-			u32 idx = param_locals[i];
-			if (idx == WB_NO_LOCAL || e->token.string.len == 0 || is_blank_ident(e->token.string)) {
+			wbParamLocals const &pl = param_locals[i];
+			if (e->kind != Entity_Variable || e->token.string.len == 0 || is_blank_ident(e->token.string)) {
 				continue;
 			}
-			if (wb_is_scalar(e->type)) {
-				if (ptr_set_exists(&p->addressed, e)) {
-					wbAddr addr = wb_add_temp(p, e->type);
-					wb_emit_store(p, addr.index, addr.offset, wb_value_local(idx, p->locals[idx].vt, e->type), e->type);
-					map_set(&p->variables, e, addr);
-				} else {
-					map_set(&p->variables, e, wb_addr_local(idx, e->type));
-				}
+			if (!pl.direct) {
+				// Passed as a pointer to a caller-owned copy
+				map_set(&p->variables, e, wb_addr_memory(pl.first, 0, e->type));
+			} else if (wb_is_scalar(e->type) && pl.leaves.count == 1 && !ptr_set_exists(&p->addressed, e)) {
+				map_set(&p->variables, e, wb_addr_local(pl.first, e->type));
 			} else {
-				// Aggregates are passed as a pointer to a caller-owned copy
-				map_set(&p->variables, e, wb_addr_memory(idx, 0, e->type));
+				// Reassemble the flattened value in the frame
+				wbAddr addr = wb_add_temp(p, e->type);
+				for_array(j, pl.leaves) {
+					wbAbiLeaf const &leaf = pl.leaves[j];
+					u32 idx = pl.first + cast(u32)j;
+					wb_emit_store(p, addr.index, addr.offset + cast(i32)leaf.offset, wb_value_local(idx, p->locals[idx].vt, leaf.type), leaf.type);
+				}
+				map_set(&p->variables, e, addr);
 			}
 		}
 	}
@@ -2336,6 +2353,10 @@ gb_internal bool wb_generate_code(CheckerInfo *info) {
 			continue;
 		}
 		if (e->Procedure.is_foreign) {
+			continue;
+		}
+		if (build_context.wasm_lower_all && wasm_lower_all_root(info->init_package, e)) {
+			wb_procedure_for_entity(m, e);
 			continue;
 		}
 		if (!e->Procedure.is_export) {

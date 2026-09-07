@@ -724,7 +724,6 @@ gb_internal void wb_build_range_indexed(wbProcedure *p, AstRangeStmt *rs, Ast *n
 		// c, w := string_decode_rune(s[index:]) / string_decode_last_rune(s[:index])
 		wbProcedure *decode = wb_lookup_runtime_procedure(p->module, rs->reverse ? "string_decode_last_rune" : "string_decode_rune");
 		wbAddr arg = wb_add_temp(p, t_string);
-		wbAddr result = wb_add_temp(p, base_type(decode->type)->Proc.results);
 		if (rs->reverse) {
 			wb_emit_store(p, arg.index, arg.offset, wb_value_local(data_local, wbValType_i32, t_rawptr), t_rawptr);
 			wb_emit_store(p, arg.index, arg.offset + cast(i32)build_context.int_size, wb_value_local(index, wbValType_i32, t_int), t_int);
@@ -740,11 +739,9 @@ gb_internal void wb_build_range_indexed(wbProcedure *p, AstRangeStmt *rs, Ast *n
 			wbValue len = wb_pop_to_local(p, wbValType_i32, t_int);
 			wb_emit_store(p, arg.index, arg.offset + cast(i32)build_context.int_size, len, t_int);
 		}
-		wb_push_address(p, result.index, result.offset);
-		wb_push_address(p, arg.index, arg.offset);
-		wb_call(p, decode);
-
-		wbValue tuple = wb_value_memory(result.index, result.offset, result.type);
+		auto decode_args = array_make<wbValue>(temporary_allocator(), 1);
+		decode_args[0] = wb_value_memory(arg.index, arg.offset, t_string);
+		wbValue tuple = wb_emit_call(p, decode->type, decode, wb_value_invalid(), decode_args);
 		wbValue r = wb_tuple_field(p, tuple, 0);
 		wbValue w = wb_tuple_field(p, tuple, 1);
 		if (rs->reverse) {

@@ -27,13 +27,16 @@
 //   [data_end, ...)          free for the runtime heap (memory.grow)
 //
 // Calling convention:
-//   Scalar parameters are passed directly, aggregate parameters as an i32
-//   pointer to a copy made by the caller. If the procedure has a single
-//   scalar result it is returned directly; otherwise the caller passes a
-//   pointer to result storage (laid out as the result tuple) as the first
-//   parameter. "odin" calling convention procedures take the context pointer
-//   as the last parameter. Procedure values are indices into the function
-//   table (0 is nil).
+//   The ABI of the LLVM backend for wasm (lbAbiWasm), for every calling
+//   convention, so that imports, exports and linked objects agree: scalar
+//   parameters are passed directly, small aggregates of basic fields (and 128
+//   bit integers) are flattened into one wasm value per field, anything else
+//   is passed as an i32 pointer to a copy made by the caller (see
+//   wb_abi_flatten). If the procedure has a single scalar result it is
+//   returned directly; otherwise the caller passes a pointer to result storage
+//   (laid out as the result tuple) as the first parameter. "odin" calling
+//   convention procedures take the context pointer as the last parameter.
+//   Procedure values are indices into the function table (0 is nil).
 //
 // Control flow:
 //   Odin has no `goto`, so all control flow is structured and maps directly
