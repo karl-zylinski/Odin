@@ -29,11 +29,6 @@
 			body.splash #splash { display: flex; }
 			#splash img { width: min(70%, 460px); image-rendering: pixelated; }
 			#splash span { font-size: 14px; color: #aaa; }
-			/* Only on a narrow screen, where the game view is on its own: a
-			   back arrow over the game, the way a phone app has one */
-			#game-controls { position: absolute; left: 8px; top: 8px; z-index: 4; display: none; gap: 6px; }
-			#game-controls button { width: 40px; height: 40px; padding: 0; border-radius: 50%;
-			                        font-size: 22px; line-height: 1; background: rgba(0, 0, 0, 0.5); color: white; }
 			#console { margin: 0; padding: 8px; max-height: 30%; overflow: auto; font-family: monospace; font-size: 13px; white-space: pre-wrap; color: #f88; border-top: 1px solid #444; }
 			#console:empty { display: none; }
 
@@ -73,7 +68,6 @@
 				body.showing-game #left { display: none; }
 				body.showing-game #right { display: flex; }
 				body.showing-game header { display: none; }
-				#game-controls { display: flex; }
 				#files { max-height: 96px; }
 				/* Over whichever view is up, so that a compiler error can be
 				   read from the code view and a program's output from the game */
@@ -114,9 +108,6 @@
 					<div id="splash">
 						<img src="logo.png" alt="Karl2D">
 						<span id="splash-text"></span>
-					</div>
-					<div id="game-controls">
-						<button id="to-code" title="Back to the code" aria-label="Back to the code">&#8592;</button>
 					</div>
 				</div>
 				<pre id="console"></pre>

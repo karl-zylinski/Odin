@@ -31,8 +31,6 @@ let compiling = false;
 let gameFrame = document.getElementById("game");
 
 const splashText = document.getElementById("splash-text");
-const gameControls = document.getElementById("game-controls");
-const toCodeButton = document.getElementById("to-code");
 // One view at a time on a narrow screen (the same query as the CSS)
 const NARROW = window.matchMedia("(max-width: 820px)");
 let showingGame = false;
@@ -84,9 +82,8 @@ function hideSplash() {
 // to, so that is kept and put back on the way in.
 let editorScroll = null;
 
-// Going to the game view pushes a history entry, so that the phone's own way
-// back (its button, or a swipe) comes back to the code. Both that and the
-// arrow in the corner go through the history, so the two cannot disagree.
+// Going to the game view pushes a history entry: the phone's own way back
+// (its button, or a swipe) is what comes back to the code.
 function enterGameView() {
 	if (!inGameHistoryEntry()) {
 		history.pushState({view: "game"}, "");
@@ -405,7 +402,6 @@ window.addEventListener("message", (e) => {
 });
 
 runButton.addEventListener("click", compileAndRun);
-toCodeButton.addEventListener("click", leaveGameView);
 window.addEventListener("popstate", (event) => {
 	showGameView(NARROW.matches && event.state !== null && event.state.view === "game");
 });
