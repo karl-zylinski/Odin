@@ -95,7 +95,16 @@ async function fetchExampleFiles(example) {
 	}
 	const files = new Map();
 	await Promise.all(example.files.map(async (path) => {
-		files.set(path, await fetchBinary("examples/" + example.dir + "/" + path));
+		try {
+			files.set(path, await fetchBinary("examples/" + example.dir + "/" + path));
+		} catch (e) {
+			// A server may refuse to serve a file the example does not really
+			// need (dotfiles, say): only its sources are worth failing over
+			if (isSource(path)) {
+				throw e;
+			}
+			consoleElement.textContent += e.message + "\n";
+		}
 	}));
 	exampleFiles.set(example.dir, files);
 	return files;

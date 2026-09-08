@@ -444,6 +444,12 @@ collect_examples :: proc(examples_root, out_dir: string) -> [dynamic]Example {
 		ex := Example{dir = strings.clone(rel_dir), main = main_file}
 		copy_files :: proc(dir, rel_dir, out_dir: string, ex: ^Example) {
 			for info in read_dir(dir) {
+				// Repository bookkeeping (.gitignore and friends): the example
+				// does not need it, and a web server that refuses to serve
+				// dotfiles would answer the page's fetch of it with a 404
+				if strings.has_prefix(info.name, ".") {
+					continue
+				}
 				rel := info.name if rel_dir == "" else fmt.tprintf("%s/%s", rel_dir, info.name)
 				if info.type == .Directory {
 					if info.name != "bin" && info.name != "build" {
