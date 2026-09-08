@@ -2481,7 +2481,7 @@ gb_internal void wb_opt_peephole(wbOpt *o) {
 			if (v.kind == wbInstr_Load && v.op == wbOp_i32_load8_u)  have = 0xff;
 			if (v.kind == wbInstr_Load && v.op == wbOp_i32_load16_u) have = 0xffff;
 			if (v.kind == wbInstr_Other && v.op == wbOp_i32_and && wb_opt_is_i32_const(o, k-3, &have)) {}
-			if (have != 0 && (have & ~c) == 0) {
+			if (c == 0xffffffffu || (have != 0 && (have & ~c) == 0)) {
 				wb_opt_delete_range(o, k-1, k+1);
 				o->changed = true;
 			}
@@ -2496,7 +2496,7 @@ gb_internal void wb_opt_peephole(wbOpt *o) {
 			case wbOp_i32_shl: case wbOp_i32_shr_s: case wbOp_i32_shr_u:
 				identity = c == 0;
 				break;
-			case wbOp_i32_mul:
+			case wbOp_i32_mul: case wbOp_i32_div_s: case wbOp_i32_div_u:
 				identity = c == 1;
 				break;
 			}
@@ -2515,6 +2515,43 @@ gb_internal void wb_opt_peephole(wbOpt *o) {
 				o->deleted[k] = true;
 				o->changed = true;
 				continue;
+			}
+		}
+
+		// the same for `i64`
+		if (in.kind == wbInstr_Other && in.op >= wbOp_i64_add && in.op <= wbOp_i64_rotr) {
+			u64 c64 = 0;
+			bool identity = false;
+			bool commutative = in.op == wbOp_i64_add || in.op == wbOp_i64_or || in.op == wbOp_i64_xor || in.op == wbOp_i64_mul;
+			if (wb_opt_is_op(o, k-1, wbInstr_Const, wbOp_i64_const) && wb_opt_const_bits_of(o, k-1, &c64)) {
+				switch (in.op) {
+				case wbOp_i64_add: case wbOp_i64_sub: case wbOp_i64_or: case wbOp_i64_xor:
+				case wbOp_i64_shl: case wbOp_i64_shr_s: case wbOp_i64_shr_u: case wbOp_i64_rotl: case wbOp_i64_rotr:
+					identity = c64 == 0;
+					break;
+				case wbOp_i64_mul: case wbOp_i64_div_s: case wbOp_i64_div_u:
+					identity = c64 == 1;
+					break;
+				case wbOp_i64_and:
+					identity = c64 == ~cast(u64)0;
+					break;
+				default:
+					break;
+				}
+				if (identity) {
+					wb_opt_delete_range(o, k-1, k+1);
+					o->changed = true;
+					continue;
+				}
+			}
+			if (commutative && wb_opt_live(o, k-1) && o->producer[k-1] >= 1 && wb_opt_range_live(o, o->producer[k-1], k)) {
+				i32 j = o->producer[k-1] - 1;
+				if (wb_opt_is_op(o, j, wbInstr_Const, wbOp_i64_const) && wb_opt_const_bits_of(o, j, &c64) && c64 == (in.op == wbOp_i64_mul ? 1u : 0u)) {
+					o->deleted[j] = true;
+					o->deleted[k] = true;
+					o->changed = true;
+					continue;
+				}
 			}
 		}
 
