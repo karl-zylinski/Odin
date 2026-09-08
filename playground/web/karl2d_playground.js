@@ -30,6 +30,14 @@ let compilerReady = false;
 let compiling = false;
 let gameFrame = document.getElementById("game");
 
+const headerElement = document.querySelector("header");
+const splashText = document.getElementById("splash-text");
+const gameControls = document.getElementById("game-controls");
+const toCodeButton = document.getElementById("to-code");
+// One view at a time on a narrow screen (the same query as the CSS)
+const NARROW = window.matchMedia("(max-width: 820px)");
+let showingGame = false;
+
 const worker = new Worker("compiler_worker.js");
 
 worker.onmessage = (e) => {
@@ -48,6 +56,8 @@ worker.onmessage = (e) => {
 			runProgram(msg.wasm);
 		} else {
 			updateStatus("Compilation failed");
+			showSplash("");
+			showGameView(false);
 			markErrorLines();
 			testHook(false);
 		}
@@ -56,6 +66,37 @@ worker.onmessage = (e) => {
 
 function updateStatus(text) {
 	statusElement.textContent = text;
+}
+
+// The logo over the game view, with a line underneath while a compile runs.
+// Hidden once a program is running in there.
+function showSplash(text) {
+	document.body.classList.add("splash");
+	splashText.textContent = text || "";
+}
+
+function hideSplash() {
+	document.body.classList.remove("splash");
+	splashText.textContent = "";
+}
+
+// On a narrow screen the code and the game each get the whole screen, and the
+// run button follows the game so that it can be run again from there
+function showGameView(show) {
+	showingGame = show;
+	document.body.classList.toggle("showing-game", show);
+	placeRunButton();
+}
+
+function placeRunButton() {
+	const inGameView = NARROW.matches && showingGame;
+	if (inGameView) {
+		if (runButton.parentElement !== gameControls) {
+			gameControls.appendChild(runButton);
+		}
+	} else if (runButton.parentElement !== headerElement) {
+		headerElement.insertBefore(runButton, statusElement);
+	}
 }
 
 function updateButtons() {
@@ -274,6 +315,10 @@ async function compileAndRun() {
 	updateStatus("Compiling...");
 	consoleElement.textContent = "";
 	stopGame();
+	showSplash("Compiling...");
+	if (NARROW.matches) {
+		showGameView(true); // watch it compile where it is going to run
+	}
 
 	const example = current;
 	const list = await exampleFileList(example);
@@ -315,14 +360,18 @@ window.addEventListener("message", (e) => {
 	if (e.data.type === "game") {
 		consoleElement.textContent += e.data.text;
 	} else if (e.data.type === "game-started") {
+		hideSplash();
 		testHook(true);
 	} else if (e.data.type === "game-crashed") {
 		updateStatus("Program crashed");
+		showSplash("");
 		testHook(false);
 	}
 });
 
 runButton.addEventListener("click", compileAndRun);
+toCodeButton.addEventListener("click", () => showGameView(false));
+NARROW.addEventListener("change", placeRunButton);
 exampleSelect.addEventListener("change", () => selectExample(exampleSelect.value));
 
 document.addEventListener("keydown", (e) => {
