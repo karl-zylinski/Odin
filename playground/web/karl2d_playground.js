@@ -56,7 +56,7 @@ worker.onmessage = (e) => {
 		} else {
 			updateStatus("Compilation failed");
 			showSplash("");
-			showGameView(false);
+			leaveGameView();
 			markErrorLines();
 			testHook(false);
 		}
@@ -83,6 +83,28 @@ function hideSplash() {
 // editor is hidden while the game has it, which loses where it was scrolled
 // to, so that is kept and put back on the way in.
 let editorScroll = null;
+
+// Going to the game view pushes a history entry, so that the phone's own way
+// back (its button, or a swipe) comes back to the code. Both that and the
+// arrow in the corner go through the history, so the two cannot disagree.
+function enterGameView() {
+	if (!inGameHistoryEntry()) {
+		history.pushState({view: "game"}, "");
+	}
+	showGameView(true);
+}
+
+function leaveGameView() {
+	if (inGameHistoryEntry()) {
+		history.back(); // popstate switches the view
+	} else {
+		showGameView(false);
+	}
+}
+
+function inGameHistoryEntry() {
+	return history.state !== null && history.state.view === "game";
+}
 
 function showGameView(show) {
 	if (show && !showingGame) {
@@ -313,7 +335,7 @@ async function selectExample(dir) {
 		updateStatus("" + e);
 	}
 	updateButtons();
-	history.replaceState(null, "", "?example=" + encodeURIComponent(dir));
+	history.replaceState(history.state, "", "?example=" + encodeURIComponent(dir));
 }
 
 async function compileAndRun() {
@@ -329,7 +351,7 @@ async function compileAndRun() {
 	stopGame();
 	showSplash("Compiling...");
 	if (NARROW.matches) {
-		showGameView(true); // watch it compile where it is going to run
+		enterGameView(); // watch it compile where it is going to run
 	}
 
 	const example = current;
@@ -383,7 +405,10 @@ window.addEventListener("message", (e) => {
 });
 
 runButton.addEventListener("click", compileAndRun);
-toCodeButton.addEventListener("click", () => showGameView(false));
+toCodeButton.addEventListener("click", leaveGameView);
+window.addEventListener("popstate", (event) => {
+	showGameView(NARROW.matches && event.state !== null && event.state.view === "game");
+});
 exampleSelect.addEventListener("change", () => selectExample(exampleSelect.value));
 
 document.addEventListener("keydown", (e) => {
@@ -394,6 +419,9 @@ document.addEventListener("keydown", (e) => {
 });
 
 async function setup() {
+	if (inGameHistoryEntry()) {
+		history.replaceState(null, "", location.search); // nothing is running after a reload
+	}
 	const params = new URLSearchParams(window.location.search);
 	const [manifest, entry] = await Promise.all([fetch("examples/examples.json"), fetch("web_entry.odin")]);
 	examples = await manifest.json();
