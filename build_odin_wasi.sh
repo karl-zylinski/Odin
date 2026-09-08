@@ -41,6 +41,11 @@ DISABLED_WARNINGS="-Wno-switch -Wno-macro-redefined -Wno-unused-value -Wno-c++11
 LDFLAGS="$LDFLAGS -lwasi-emulated-signal -lwasi-emulated-process-clocks -lwasi-emulated-getpid"
 # The compiler keeps large arenas and deep recursion (the parser and checker)
 LDFLAGS="$LDFLAGS -Wl,-z,stack-size=8388608 -Wl,--initial-memory=67108864 -Wl,--max-memory=4294967296"
+if [ "$MODE" = release ]; then
+	# wasi-sdk ships its libraries with DWARF, which the linker would keep:
+	# 300 KB of a module whose whole point is to be downloaded
+	LDFLAGS="$LDFLAGS -Wl,--strip-debug"
+fi
 
 set -x
 $CXX src/main.cpp src/libtommath.cpp $DISABLED_WARNINGS $CPPFLAGS $CXXFLAGS $EXTRAFLAGS $LDFLAGS -o "$OUT"
