@@ -20,6 +20,7 @@ else
 	OUT="$DIST/odin.wasm" ./build_odin_wasi.sh release
 fi
 rm -rf "$DIST/packs"
+rm -f "$DIST/odin_root.pack" "$DIST/odin_root.pack.gz" # the one pack of every source, from before
 ./odin run playground/pack_root -- . "$DIST/packs" "$KARL2D" "$DIST/examples"
 # One gzipped pack per package: the worker fetches the ones a program imports
 find "$DIST/packs" -name '*.pack' -exec gzip -9 -f {} +
