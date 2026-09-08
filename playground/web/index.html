@@ -6,23 +6,23 @@
 		<title>Karl2D Playground</title>
 		<link rel="icon" href="logo.png">
 		<style>
-			/* Karl2D's colours: the site's dark red, the logo's yellow and red */
-			html, body { height: 100%; margin: 0; background: #210b0b; color: #f0e4e4; font-family: sans-serif; }
+			html, body { height: 100%; margin: 0; background: #1e1e1e; color: #d4d4d4; font-family: sans-serif; }
 			body { display: flex; flex-direction: column; }
-			header { display: flex; align-items: center; gap: 12px; padding: 8px 12px; background: #2e1111; }
+			header { display: flex; align-items: center; gap: 12px; padding: 8px 12px; background: #2d2d2d; }
 			header h1 { font-size: 16px; margin: 0 12px 0 0; }
-			select { background: #1a0808; color: #f0e4e4; border: 1px solid #5c2424; padding: 4px 6px; font-size: 14px; }
+			select { background: #1e1e1e; color: #d4d4d4; border: 1px solid #444; padding: 4px 6px; font-size: 14px; }
 			button { background: #ffd100; color: #210b0b; font-weight: 600; border: none; padding: 6px 16px; font-size: 14px; cursor: pointer; }
 			button:hover:enabled { background: #ffdd44; }
 			button:disabled { background: #59452a; color: #a2916f; cursor: default; }
-			#status { flex: 1; font-size: 13px; color: #c9a4a4; }
+			#status { flex: 1; font-size: 13px; color: #aaa; }
 			main { flex: 1; display: flex; min-height: 0; position: relative; }
 			#left { flex: 0 0 50%; display: flex; flex-direction: column; min-width: 0; }
 			#editor { flex: 1; min-height: 0; }
 			/* Drag to give the editor or the game more room, double click to even them out */
-			#divider { flex: none; width: 5px; background: #5c2424; cursor: col-resize; }
-			#divider:hover, #divider.dragging { background: #ffd100; }
+			#divider { flex: none; width: 5px; background: #444; cursor: col-resize; }
+			#divider:hover, #divider.dragging { background: #0e639c; }
 			#right { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+			/* Karl2D's own dark red, the colour the logo sits on */
 			#stage { position: relative; flex: 1; min-height: 0; background: #210b0b; }
 			#game { position: absolute; inset: 0; width: 100%; height: 100%; border: none; background: #210b0b; }
 			/* The logo fills the game view until a program runs in it */
@@ -30,17 +30,17 @@
 			          align-items: center; justify-content: center; gap: 16px; background: #210b0b; }
 			body.splash #splash { display: flex; }
 			#splash img { width: min(70%, 460px); image-rendering: pixelated; }
-			#splash span { font-size: 14px; color: #c9a4a4; }
+			#splash span { font-size: 14px; color: #aaa; }
 			/* Only on a narrow screen, where the game view is on its own */
 			#game-controls { position: absolute; left: 8px; top: 8px; z-index: 4; display: none; gap: 6px; }
 			#game-controls button { padding: 6px 10px; font-size: 13px; background: rgba(255, 209, 0, 0.9); }
-			#console { margin: 0; padding: 8px; max-height: 30%; overflow: auto; font-family: monospace; font-size: 13px; white-space: pre-wrap; color: #ff9b9b; background: #1a0808; border-top: 1px solid #5c2424; }
+			#console { margin: 0; padding: 8px; max-height: 30%; overflow: auto; font-family: monospace; font-size: 13px; white-space: pre-wrap; color: #f88; border-top: 1px solid #444; }
 			#console:empty { display: none; }
 
 			/* The editor: a transparent textarea over a highlighted <pre>, see editor.js.
 			   Both layers must use the same font metrics and the same padding. */
-			.ed { display: flex; overflow: hidden; background: #1c1414; font-family: monospace; font-size: 14px; line-height: 20px; tab-size: 4; }
-			.ed-gutter { position: relative; flex: none; overflow: hidden; padding: 0 8px; background: #241717; color: #8b6a6a; user-select: none; }
+			.ed { display: flex; overflow: hidden; background: #1e1e1e; font-family: monospace; font-size: 14px; line-height: 20px; tab-size: 4; }
+			.ed-gutter { position: relative; flex: none; overflow: hidden; padding: 0 8px; background: #252526; color: #6e7681; user-select: none; }
 			.ed-numbers { position: absolute; left: 8px; right: 8px; top: 0; padding: 8px 0; text-align: right; white-space: pre; }
 			.ed-errnum { color: #f88; }
 			.ed-wrap { position: relative; flex: 1; min-width: 0; overflow: hidden; }
@@ -78,13 +78,13 @@
 				/* Over whichever view is up, so that a compiler error can be
 				   read from the code view and a program's output from the game */
 				#console { position: fixed; left: 0; right: 0; bottom: 0; z-index: 5;
-				           max-height: 40%; border-top: 1px solid #5c2424; background: rgba(26, 8, 8, 0.96); }
+				           max-height: 40%; border-top: 1px solid #444; background: rgba(30, 30, 30, 0.96); }
 			}
 
 			/* The example's files, below the editor */
-			#files { flex: none; max-height: 152px; overflow-y: auto; display: flex; flex-wrap: wrap; align-content: flex-start; gap: 4px; padding: 6px; border-top: 1px solid #5c2424; background: #2a1212; }
-			.file { width: 76px; padding: 2px; border: 1px solid transparent; text-align: center; font-size: 11px; color: #c9a4a4; }
-			.file.open { border-color: #ffd100; background: #3a1818; color: #ffe9a0; }
+			#files { flex: none; max-height: 152px; overflow-y: auto; display: flex; flex-wrap: wrap; align-content: flex-start; gap: 4px; padding: 6px; border-top: 1px solid #444; background: #232323; }
+			.file { width: 76px; padding: 2px; border: 1px solid transparent; text-align: center; font-size: 11px; color: #aaa; }
+			.file.open { border-color: #0e639c; background: #2d2d2d; color: #d4d4d4; }
 			.file.source { cursor: pointer; }
 			.file.source:hover { border-color: #666; }
 			.file-thumb { display: flex; align-items: center; justify-content: center; height: 48px; background: #1b1b1b; border: 1px solid #3c3c3c; overflow: hidden; }
