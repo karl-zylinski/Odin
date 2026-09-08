@@ -800,9 +800,48 @@ gb_internal bool wb_bce_same_path(Ast *a, Ast *b) {
 	case Ast_SelectorExpr:
 		return a->SelectorExpr.selector->Ident.token.string == b->SelectorExpr.selector->Ident.token.string &&
 		       wb_bce_same_path(a->SelectorExpr.expr, b->SelectorExpr.expr);
+	case Ast_BasicLit:
+		return a->tav.mode == Addressing_Constant && b->tav.mode == Addressing_Constant &&
+		       compare_exact_values(Token_CmpEq, a->tav.value, b->tav.value);
+	case Ast_BinaryExpr:
+		return a->BinaryExpr.op.kind == b->BinaryExpr.op.kind &&
+		       wb_bce_same_path(a->BinaryExpr.left,  b->BinaryExpr.left) &&
+		       wb_bce_same_path(a->BinaryExpr.right, b->BinaryExpr.right);
 	default:
 		return false;
 	}
+}
+
+gb_internal bool wb_bce_body_writes(Ast *body, Entity *root);
+
+// An index of `off + i`, where `off` cannot change while the loop runs and
+// evaluating it once before the loop cannot trap or have an effect
+gb_internal bool wb_bce_invariant(wbProcedure *p, Ast *body, Ast *expr, Entity *iv) {
+	expr = unparen_expr(expr);
+	if (expr->tav.mode == Addressing_Constant) {
+		return expr->tav.value.kind == ExactValue_Integer;
+	}
+	switch (expr->kind) {
+	case Ast_Ident: {
+		Entity *e = entity_of_node(expr);
+		if (e == nullptr || e == iv) {
+			return false;
+		}
+		Entity *root = wb_bce_path_root(p, expr);
+		return root != nullptr && !wb_bce_body_writes(body, root);
+	}
+	case Ast_BinaryExpr:
+		switch (expr->BinaryExpr.op.kind) {
+		case Token_Add:
+		case Token_Sub:
+		case Token_Mul:
+			return wb_bce_invariant(p, body, expr->BinaryExpr.left, iv) &&
+			       wb_bce_invariant(p, body, expr->BinaryExpr.right, iv);
+		default:
+			return false;
+		}
+	}
+	return false;
 }
 
 // Whether assigning to `lhs` may change the value of `root` (writes through
@@ -908,10 +947,11 @@ gb_internal wbValue wb_bce_path_len(wbProcedure *p, Ast *path) {
 }
 
 struct wbBceLoop {
-	Array<Ast *> exprs;  // `path[i]` expressions of the body
-	Array<Ast *> paths;  // the distinct paths among them
-	Array<bool>  proven; // per path: in range by the loop bounds alone
-	bool test_lo;        // the lower bound is a signed variable: `lo >= 0` is to be tested
+	Array<Ast *> exprs;   // `path[off + i]` expressions of the body
+	Array<Ast *> paths;   // the distinct paths among them
+	Array<Ast *> offsets; // per path: the offset added to the loop value, nullptr for none
+	Array<bool>  proven;  // per path: in range by the loop bounds alone
+	bool test_lo;         // the lower bound is a signed variable: `lo >= 0` is to be tested
 };
 
 #define WB_BCE_MAX_BODY 400 // AST nodes of a body worth emitting twice
@@ -973,9 +1013,10 @@ gb_internal bool wb_bce_analyze(wbProcedure *p, AstRangeStmt *rs, AstBinaryExpr 
 	}
 
 	auto ta = temporary_allocator();
-	bce->exprs  = array_make<Ast *>(ta, 0, 8);
-	bce->paths  = array_make<Ast *>(ta, 0, 8);
-	bce->proven = array_make<bool>(ta, 0, 8);
+	bce->exprs   = array_make<Ast *>(ta, 0, 8);
+	bce->paths   = array_make<Ast *>(ta, 0, 8);
+	bce->offsets = array_make<Ast *>(ta, 0, 8);
+	bce->proven  = array_make<bool>(ta, 0, 8);
 	wb_walk_ast(rs->body, [&](Ast *n) -> bool {
 		if (n->kind == Ast_ProcLit) {
 			return false;
@@ -984,7 +1025,21 @@ gb_internal bool wb_bce_analyze(wbProcedure *p, AstRangeStmt *rs, AstBinaryExpr 
 			return true;
 		}
 		Ast *index = unparen_expr(n->IndexExpr.index);
-		if (index->kind != Ast_Ident || entity_of_node(index) != iv) {
+		Ast *offset = nullptr;
+		if (index->kind == Ast_BinaryExpr && index->BinaryExpr.op.kind == Token_Add) {
+			Ast *l = unparen_expr(index->BinaryExpr.left);
+			Ast *r = unparen_expr(index->BinaryExpr.right);
+			if (l->kind == Ast_Ident && entity_of_node(l) == iv) {
+				offset = index->BinaryExpr.right;
+			} else if (r->kind == Ast_Ident && entity_of_node(r) == iv) {
+				offset = index->BinaryExpr.left;
+			}
+			Type *ot = offset != nullptr ? type_of_expr(offset) : nullptr;
+			if (ot == nullptr || !is_type_integer(ot) || wb_valtype_of(ot) != wbValType_i32 ||
+			    !wb_bce_invariant(p, rs->body, offset, iv)) {
+				return true;
+			}
+		} else if (index->kind != Ast_Ident || entity_of_node(index) != iv) {
 			return true;
 		}
 		Ast *path = n->IndexExpr.expr;
@@ -1002,10 +1057,17 @@ gb_internal bool wb_bce_analyze(wbProcedure *p, AstRangeStmt *rs, AstBinaryExpr 
 		}
 		isize pi = -1;
 		for (isize i = 0; i < bce->paths.count; i++) {
-			if (wb_bce_same_path(bce->paths[i], path)) {
-				pi = i;
-				break;
+			if (!wb_bce_same_path(bce->paths[i], path)) {
+				continue;
 			}
+			if ((bce->offsets[i] == nullptr) != (offset == nullptr)) {
+				continue;
+			}
+			if (offset != nullptr && !wb_bce_same_path(bce->offsets[i], offset)) {
+				continue;
+			}
+			pi = i;
+			break;
 		}
 		if (pi < 0) {
 			// (the length of a fixed array is not something the body can change)
@@ -1013,7 +1075,9 @@ gb_internal bool wb_bce_analyze(wbProcedure *p, AstRangeStmt *rs, AstBinaryExpr 
 				return true;
 			}
 			bool proven = false;
-			if (hi_len_path != nullptr && !inclusive && wb_bce_same_path(hi_len_path, path)) {
+			if (offset != nullptr) {
+				proven = false; // an offset always needs a test of its own
+			} else if (hi_len_path != nullptr && !inclusive && wb_bce_same_path(hi_len_path, path)) {
 				proven = true;
 			} else if (hi->tav.mode == Addressing_Constant && bt->kind == Type_Array) {
 				i64 count = bt->Array.count;
@@ -1025,6 +1089,7 @@ gb_internal bool wb_bce_analyze(wbProcedure *p, AstRangeStmt *rs, AstBinaryExpr 
 			}
 			pi = bce->paths.count;
 			array_add(&bce->paths, path);
+			array_add(&bce->offsets, offset);
 			array_add(&bce->proven, proven);
 		}
 		array_add(&bce->exprs, n);
@@ -1144,11 +1209,27 @@ gb_internal void wb_build_range_interval(wbProcedure *p, AstRangeStmt *rs, Ast *
 		}
 		wbValue len = wb_bce_path_len(p, bce.paths[i]);
 		if (len.kind == wbValue_Invalid) {
-			continue;
+			wb_i32_const(p, 0); // nothing is proven: always take the checked loop
+		} else if (bce.offsets[i] != nullptr) {
+			// `off >= 0 && off + hi <= len`, in 64 bits so that it cannot overflow
+			wbValue off = wb_value_to_local(p, wb_emit_conv(p, wb_build_expr(p, bce.offsets[i]), t_i32));
+			wb_push(p, off);
+			wb_i32_const(p, 0);
+			wb_op(p, wbOp_i32_ge_s);
+			wb_push(p, off);
+			wb_op(p, wbOp_i64_extend_i32_s);
+			wb_push(p, upper);
+			wb_op(p, is_signed ? wbOp_i64_extend_i32_s : wbOp_i64_extend_i32_u);
+			wb_op(p, wbOp_i64_add);
+			wb_push(p, len);
+			wb_op(p, wbOp_i64_extend_i32_s);
+			wb_op(p, inclusive ? wbOp_i64_lt_s : wbOp_i64_le_s);
+			wb_op(p, wbOp_i32_and);
+		} else {
+			wb_push(p, upper);
+			wb_push(p, len);
+			wb_emit_binary_op(p, inclusive ? Token_Lt : Token_LtEq, wbValType_i32, is_signed);
 		}
-		wb_push(p, upper);
-		wb_push(p, len);
-		wb_emit_binary_op(p, inclusive ? Token_Lt : Token_LtEq, wbValType_i32, is_signed);
 		if (tests > 0) {
 			wb_op(p, wbOp_i32_and);
 		}

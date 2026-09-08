@@ -86,6 +86,16 @@ gb_internal bool wb_expr_yields_fresh_memory(wbProcedure *p, Ast *expr) {
 // True when `v` lives inside a parameter of the current procedure.
 // Parameters are immutable and cannot have their address taken, so such
 // memory can be passed along to a callee by pointer without a copy.
+// A value in the read-only part of the data segment: nothing ever writes it,
+// so it can be passed by pointer without a copy
+gb_internal bool wb_value_is_const_memory(wbProcedure *p, wbValue v) {
+	if (v.kind != wbValue_Memory || v.index != WB_NO_LOCAL || v.offset < 0 || v.type == nullptr) {
+		return false;
+	}
+	i64 size = type_size_of(v.type);
+	return size > 0 && wb_const_data_bytes(p->module, cast(u32)v.offset, cast(u32)size) != nullptr;
+}
+
 gb_internal bool wb_value_is_param_memory(wbProcedure *p, wbValue v) {
 	if (v.kind != wbValue_Memory || v.index == WB_NO_LOCAL || p->type == nullptr) {
 		return false;
@@ -2999,7 +3009,7 @@ gb_internal wbValue wb_emit_runtime_call(wbProcedure *p, char const *name, Array
 	wbProcedure *callee = wb_lookup_runtime_procedure(p->module, name);
 	auto copies = array_make<wbValue>(temporary_allocator(), 0, args.count);
 	for (wbValue v : args) {
-		if (v.kind == wbValue_Memory) {
+		if (v.kind == wbValue_Memory && !wb_value_is_const_memory(p, v)) {
 			v = wb_value_copy(p, v);
 		}
 		array_add(&copies, v);
@@ -3530,6 +3540,7 @@ gb_internal wbValue wb_source_code_location(wbProcedure *p, String const &proced
 
 	u32 addr = wb_data_alloc(p->module, size, type_align_of(type));
 	wb_data_write(p->module, addr, bytes, size);
+	wb_const_data_register(p->module, addr, size);
 	return wb_value_memory(WB_NO_LOCAL, cast(i32)addr, type);
 }
 
@@ -5047,7 +5058,7 @@ gb_internal wbValue wb_build_call_expr_internal(wbProcedure *p, Ast *expr) {
 		}
 		GB_ASSERT(arg_set[i]);
 		wbValue v = args[i];
-		if (v.kind == wbValue_Memory && !fresh[i] && !wb_value_is_param_memory(p, v)) {
+		if (v.kind == wbValue_Memory && !fresh[i] && !wb_value_is_param_memory(p, v) && !wb_value_is_const_memory(p, v)) {
 			v = wb_value_copy(p, v);
 		}
 		array_add(&final_args, v);
