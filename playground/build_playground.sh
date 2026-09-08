@@ -13,6 +13,27 @@ cd "$(dirname "$0")/.."
 KARL2D=${1:-../karl2d}
 DIST=playground/dist
 mkdir -p "$DIST"
+
+# The playground ships Karl2D's sources, so it is built from origin/master and
+# cannot quietly fall behind. A checkout that is dirty, on another branch or
+# diverged is packed as it is (someone may be trying a change in the
+# playground on purpose) but says so. KARL2D_NO_UPDATE=1 skips the fetch.
+if [ -d "$KARL2D/.git" ]; then
+	branch=$(git -C "$KARL2D" symbolic-ref --quiet --short HEAD || echo "(detached)")
+	if [ -n "${KARL2D_NO_UPDATE:-}" ]; then
+		echo "NOTE: not updating $KARL2D (KARL2D_NO_UPDATE is set)"
+	elif [ -n "$(git -C "$KARL2D" status --porcelain)" ]; then
+		echo "WARNING: $KARL2D has local changes: packing it as it is, not origin/master"
+	elif [ "$branch" != master ]; then
+		echo "WARNING: $KARL2D is on '$branch': packing it as it is, not origin/master"
+	elif ! git -C "$KARL2D" fetch -q origin; then
+		echo "WARNING: cannot reach $KARL2D's origin: packing what is checked out"
+	elif ! git -C "$KARL2D" merge --ff-only -q origin/master; then
+		echo "WARNING: $KARL2D cannot fast-forward to origin/master: packing it as it is"
+	fi
+	echo "Karl2D: $(git -C "$KARL2D" log --oneline -1)"
+fi
+
 rm -rf "$DIST/examples"
 if [ -n "${ODIN_WASM:-}" ]; then
 	cp "$ODIN_WASM" "$DIST/odin.wasm"
