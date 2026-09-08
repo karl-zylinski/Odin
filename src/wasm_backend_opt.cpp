@@ -25,6 +25,10 @@ gb_internal u8 const *wb_const_data_bytes(wbModule *m, u32 addr, u32 size);
 #define WB_OPT_MAX_PRODUCER 64
 #define WB_OPT_MAX_PASSES   16
 
+// The optimizer allocates a lot of scratch per procedure, which the compiler's
+// own temporary allocator never reuses on its own
+#define WB_TEMP_ARENA_GUARD() TEMP_ARENA_GUARD(get_arena(ThreadArena_Temporary))
+
 struct wbOptValue {
 	i32  producer;  // index of the first instruction computing the value, -1 if opaque
 	i32  pushed_at; // index of the instruction that pushed it
@@ -47,6 +51,7 @@ struct wbOptAccess {
 	u32 offset;     // within the slot
 	u8  width;
 	u8  op;         // load/store opcode
+	i32 index;      // the instruction it belongs to
 };
 
 struct wbOptSlot {
@@ -106,14 +111,25 @@ struct wbOpt {
 	i32          assume_count;
 	u32          assume_local[8];
 	u32          assume_value[8];
-	// and its memo, per instruction: 0 unknown, 1 constant, 2 not constant
+	// and its memo, per instruction: 0 unknown, 1 constant, 2 not constant.
+	// What it holds stays true until the code is edited, so it is kept
+	// between queries and dropped when `edits` changes
 	Array<u8>    memo_state;
 	Array<u32>   memo_local;
 	Array<u32>   memo_value;
 	Array<i32>   memo_touched;
+	i64          edits;
+	i64          memo_edits;
+	i32          memo_assume_at;
 	// per instruction: the local a load's value was kept in for later reads
 	// of the same address (load CSE), -1 if none
 	Array<i32>   cse_local;
+
+	// Filters for the constant queries, which are the expensive part of a
+	// pass: per local, whether any write of it could be of a constant at
+	// all, and per block, a mask of the locals written inside it
+	Array<bool>  maybe_const;
+	Array<u64>   block_writes;
 };
 
 gb_internal i32 wb_opt_br_target(wbOpt *o, i32 k);
@@ -445,7 +461,7 @@ gb_internal void wb_opt_simulate(wbOpt *o) {
 				} else if (abs + in.width > cast(i64)p->slots[si].offset + p->slots[si].size) {
 					o->slots[si].escaped = true;
 				} else {
-					wbOptAccess a = {cast(u32)(abs - p->slots[si].offset), in.width, in.op};
+					wbOptAccess a = {cast(u32)(abs - p->slots[si].offset), in.width, in.op, cast(i32)k};
 					array_add(&o->slots[si].accesses, a);
 					o->acc_abs[k]    = abs;
 					o->acc_astart[k] = ops[0].producer;
@@ -563,12 +579,14 @@ gb_internal void wb_opt_replace(wbOpt *o, isize k, wbInstr const &in) {
 		array_init(&o->replacement[k], temporary_allocator(), 0, 4);
 	}
 	array_add(&o->replacement[k], in);
+	o->edits++;
 }
 
 gb_internal void wb_opt_delete_range(wbOpt *o, i32 start, i32 end) {
 	for (i32 k = start; k < end; k++) {
 		o->deleted[k] = true;
 	}
+	o->edits++;
 }
 
 // True when the value a narrow store at `k` writes came straight from a load
@@ -825,9 +843,9 @@ gb_internal void wb_opt_promote_slots(wbOpt *o) {
 			continue;
 		}
 		// The address computations must be deletable
-		for (isize k = 0; k < o->n; k++) {
-			if (o->acc_abs[k] < 0 || o->deleted[k]) continue;
-			if (wb_opt_find_slot(o, o->acc_abs[k]) != si) continue;
+		for (wbOptAccess const &a : slot.accesses) {
+			i32 k = a.index;
+			if (o->deleted[k]) continue;
 			if (!wb_opt_is_frame_address_range(o, o->acc_astart[k], o->acc_aend[k])) {
 				slot.escaped = true;
 				break;
@@ -1567,7 +1585,56 @@ gb_internal i32 wb_opt_br_target(wbOpt *o, i32 k) {
 // execution reaches instruction `k`: the straight-line code before `k` is
 // walked backwards for the write of `l`, out of the blocks `k` is in and
 // into the blocks that end before it through every exit those have
+gb_internal u64 wb_opt_local_bit(u32 l) {
+	return cast(u64)1 << (l & 63);
+}
+
+// The filters the constant queries start from (see `maybe_const`)
+gb_internal void wb_opt_analyze_locals(wbOpt *o) {
+	gbAllocator ta = temporary_allocator();
+	o->maybe_const   = array_make<bool>(ta, o->p->locals.count);
+	o->block_writes  = array_make<u64>(ta, o->blocks.count);
+	for_array(i, o->maybe_const)  o->maybe_const[i] = false;
+	for_array(i, o->block_writes) o->block_writes[i] = 0;
+	for (i32 k = 0; k < o->n; k++) {
+		if (o->deleted[k]) {
+			continue;
+		}
+		wbInstr const &in = o->in[k];
+		if (in.kind != wbInstr_Local || in.op == wbOp_local_get || in.imm >= cast(u32)o->maybe_const.count) {
+			continue;
+		}
+		for (i32 b = o->block_of[k]; b >= 0; b = o->blocks[b].parent) {
+			u64 bit = wb_opt_local_bit(in.imm);
+			if (o->block_writes[b] & bit) {
+				break; // the ancestors have it too
+			}
+			o->block_writes[b] |= bit;
+			if (b == 0) {
+				break;
+			}
+		}
+		// The value stored: a constant, or an expression that may fold to one
+		if (!o->maybe_const[in.imm]) {
+			i32 start = o->op0_start[k];
+			bool ok = k >= 1 && o->in[k-1].kind == wbInstr_Const;
+			if (!ok && start >= 0 && o->op0_end[k] == k) {
+				ok = true;
+				for (i32 i = start; i < k && ok; i++) {
+					u8 kind = o->in[i].kind;
+					ok = kind == wbInstr_Const || kind == wbInstr_Other ||
+					     (kind == wbInstr_Local && o->in[i].op == wbOp_local_get);
+				}
+			}
+			o->maybe_const[in.imm] = ok;
+		}
+	}
+}
+
 gb_internal bool wb_opt_loop_writes_local(wbOpt *o, i32 blk, u32 l, i32 *budget) {
+	if (blk < o->block_writes.count && (o->block_writes[blk] & wb_opt_local_bit(l)) == 0) {
+		return false; // nothing in it writes any local that could be this one
+	}
 	i32 e = o->blocks[blk].end;
 	if (e < 0) return true;
 	for (i32 i = o->blocks[blk].start+1; i < e; i++) {
@@ -1721,18 +1788,29 @@ gb_internal bool wb_opt_local_const_before_scan(wbOpt *o, i32 k, u32 l, u32 *val
 	}
 	return false;
 }
+// Drops what the memo holds when the code it was derived from has changed
+gb_internal void wb_opt_memo_check(wbOpt *o) {
+	i32 assume_sig = o->assume_at * 16 + o->assume_count;
+	if (o->memo_edits != o->edits || o->memo_assume_at != assume_sig) {
+		wb_opt_memo_reset(o);
+		o->memo_edits = o->edits;
+		o->memo_assume_at = assume_sig;
+	}
+}
+
 gb_internal bool wb_opt_local_is_const(wbOpt *o, i32 k, u32 l, u32 *value) {
+	if (l < cast(u32)o->maybe_const.count && !o->maybe_const[l]) {
+		return false; // no write of it is of a constant
+	}
+	wb_opt_memo_check(o);
 	bool have = false;
 	i32 budget = WB_OPT_CONST_SCAN_BUDGET;
-	bool ok = wb_opt_local_const_before(o, k, l, value, &have, 0, &budget);
-	wb_opt_memo_reset(o);
-	return ok;
+	return wb_opt_local_const_before(o, k, l, value, &have, 0, &budget);
 }
 gb_internal bool wb_opt_eval_i32(wbOpt *o, i32 start, i32 end, i32 at, u32 *result) {
+	wb_opt_memo_check(o);
 	i32 budget = WB_OPT_CONST_SCAN_BUDGET;
-	bool ok = wb_opt_eval_i32(o, start, end, at, result, 0, &budget);
-	wb_opt_memo_reset(o);
-	return ok;
+	return wb_opt_eval_i32(o, start, end, at, result, 0, &budget);
 }
 // Evaluates a binary `i32` operation on constants (not the trapping ones)
 gb_internal bool wb_opt_fold_i32(wbOp op, u32 a, u32 c, u32 *r) {
@@ -3105,6 +3183,7 @@ gb_internal bool wb_opt_pass(wbProcedure *p, bool final_pass) {
 	}
 
 	wb_opt_simulate(o);
+	wb_opt_analyze_locals(o);
 	for (isize k = 0; k < o->n; k++) {
 		if (o->deleted[k]) o->changed = true;
 	}
@@ -3275,7 +3354,9 @@ gb_internal void wb_optimize_procedure(wbProcedure *p) {
 	if (build_context.optimization_level < 0) {
 		return;
 	}
-	TEMPORARY_ALLOCATOR_GUARD();
+	// Everything the passes allocate is scratch: the code they produce is
+	// copied into the procedure's own buffers before this returns
+	WB_TEMP_ARENA_GUARD();
 
 	bool debug = gb_get_env("ODIN_WB_OPT_DEBUG", temporary_allocator()) != nullptr;
 	if (debug) wb_opt_dump(p, "before");
