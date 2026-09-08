@@ -201,6 +201,58 @@ gb_internal bool wb_opt_writes_globals(wbInstr const &in) {
 	}
 }
 
+
+// The optimizer's per-instruction tables are the same in every pass and in
+// every procedure, and there are enough of them that allocating them anew
+// each time is a large part of the compile: they come from a pool instead,
+// which every pass initializes completely before use. (The backend runs on
+// one thread.)
+struct wbOptPool {
+	Array<i32>  producer, set_producer, block_of, height;
+	Array<i32>  acc_astart, acc_aend, op0_start, op0_end;
+	Array<i64>  acc_abs;
+	Array<bool> deleted, moved, addr_get, replaced;
+	Array<i32>  impure_prefix, memw_prefix, globw_prefix;
+	Array<u8>   memo_state;
+	Array<u32>  memo_local, memo_value;
+	Array<i32>  cse_local;
+	Array<bool> maybe_const;
+	Array<i32>  gets, sets, tees, single_set, single_get, moved_to, moved_start;
+	Array<Array<i32>> writes, reads;
+	Array<Array<wbInstr>> replacement;
+	Array<i32>  memo_touched;
+	Array<wbOptSlot> slots;
+	Array<wbOptBlock> blocks;
+	Array<u64>  block_writes;
+	Array<wbOptValue> stack;
+	wbBuffer    scratch;
+};
+gb_global wbOptPool wb_opt_pool;
+
+// An array inside a pooled one: it keeps the memory it had
+template <typename T>
+gb_internal void wb_pool_inner(Array<T> *a) {
+	if (a->allocator.proc == nullptr) {
+		a->allocator = heap_allocator();
+	}
+	a->count = 0;
+}
+
+// `count` entries of the pooled array, the new ones zeroed
+template <typename T>
+gb_internal Array<T> wb_pool_array(Array<T> *a, isize count) {
+	if (a->allocator.proc == nullptr) {
+		*a = array_make<T>(heap_allocator(), 0, gb_max(count, cast(isize)256));
+		gb_zero_size(a->data, a->capacity*gb_size_of(T));
+	} else if (a->capacity < count) {
+		isize old_capacity = a->capacity;
+		array_reserve(a, gb_max(count, 2*old_capacity));
+		gb_zero_size(a->data + old_capacity, (a->capacity - old_capacity)*gb_size_of(T));
+	}
+	a->count = count;
+	return *a;
+}
+
 gb_internal bool wb_opt_reads_memory(wbInstr const &in) {
 	return in.kind == wbInstr_Load || (in.kind == wbInstr_Other && in.op == wbOp_memory_size);
 }
@@ -213,21 +265,21 @@ gb_internal void wb_opt_simulate(wbOpt *o) {
 	gbAllocator ta = temporary_allocator();
 	isize n = o->n;
 
-	o->producer      = array_make<i32>(ta, n);
-	o->set_producer  = array_make<i32>(ta, n);
-	o->block_of      = array_make<i32>(ta, n);
-	o->height        = array_make<i32>(ta, n);
-	o->deleted       = array_make<bool>(ta, n);
-	o->moved         = array_make<bool>(ta, n);
-	o->acc_abs       = array_make<i64>(ta, n);
-	o->acc_astart    = array_make<i32>(ta, n);
-	o->addr_get      = array_make<bool>(ta, n);
-	o->op0_start     = array_make<i32>(ta, n);
-	o->op0_end       = array_make<i32>(ta, n);
-	o->acc_aend      = array_make<i32>(ta, n);
-	o->impure_prefix = array_make<i32>(ta, n+1);
-	o->memw_prefix   = array_make<i32>(ta, n+1);
-	o->globw_prefix  = array_make<i32>(ta, n+1);
+	o->producer      = wb_pool_array(&wb_opt_pool.producer, n);
+	o->set_producer  = wb_pool_array(&wb_opt_pool.set_producer, n);
+	o->block_of      = wb_pool_array(&wb_opt_pool.block_of, n);
+	o->height        = wb_pool_array(&wb_opt_pool.height, n);
+	o->deleted       = wb_pool_array(&wb_opt_pool.deleted, n);
+	o->moved         = wb_pool_array(&wb_opt_pool.moved, n);
+	o->acc_abs       = wb_pool_array(&wb_opt_pool.acc_abs, n);
+	o->acc_astart    = wb_pool_array(&wb_opt_pool.acc_astart, n);
+	o->addr_get      = wb_pool_array(&wb_opt_pool.addr_get, n);
+	o->op0_start     = wb_pool_array(&wb_opt_pool.op0_start, n);
+	o->op0_end       = wb_pool_array(&wb_opt_pool.op0_end, n);
+	o->acc_aend      = wb_pool_array(&wb_opt_pool.acc_aend, n);
+	o->impure_prefix = wb_pool_array(&wb_opt_pool.impure_prefix, n+1);
+	o->memw_prefix   = wb_pool_array(&wb_opt_pool.memw_prefix, n+1);
+	o->globw_prefix  = wb_pool_array(&wb_opt_pool.globw_prefix, n+1);
 	for (isize k = 0; k < n; k++) {
 		o->producer[k] = -1;
 		o->addr_get[k] = false;
@@ -237,33 +289,33 @@ gb_internal void wb_opt_simulate(wbOpt *o) {
 		o->deleted[k] = false;
 		o->moved[k] = false;
 		o->acc_abs[k] = -1;
+		o->acc_astart[k] = -1;
+		o->acc_aend[k] = -1;
 	}
 	isize local_count = p->locals.count;
-	o->gets = array_make<i32>(ta, local_count);
-	o->sets = array_make<i32>(ta, local_count);
-	o->tees = array_make<i32>(ta, local_count);
-	o->single_set  = array_make<i32>(ta, local_count);
-	o->single_get  = array_make<i32>(ta, local_count);
-	o->writes      = array_make<Array<i32>>(ta, local_count);
-	o->reads       = array_make<Array<i32>>(ta, local_count);
-	o->moved_to    = array_make<i32>(ta, local_count);
-	o->moved_start = array_make<i32>(ta, local_count);
+	o->gets = wb_pool_array(&wb_opt_pool.gets, local_count);
+	o->sets = wb_pool_array(&wb_opt_pool.sets, local_count);
+	o->tees = wb_pool_array(&wb_opt_pool.tees, local_count);
+	o->single_set  = wb_pool_array(&wb_opt_pool.single_set, local_count);
+	o->single_get  = wb_pool_array(&wb_opt_pool.single_get, local_count);
+	o->writes      = wb_pool_array(&wb_opt_pool.writes, local_count);
+	o->reads       = wb_pool_array(&wb_opt_pool.reads, local_count);
+	o->moved_to    = wb_pool_array(&wb_opt_pool.moved_to, local_count);
+	o->moved_start = wb_pool_array(&wb_opt_pool.moved_start, local_count);
 	for (isize i = 0; i < local_count; i++) {
 		o->gets[i] = o->sets[i] = o->tees[i] = 0;
 		o->single_set[i] = o->single_get[i] = -1;
 		o->moved_to[i] = -1;
-		o->writes[i] = {};
-		o->writes[i].allocator = ta;
-		o->reads[i] = {};
-		o->reads[i].allocator = ta;
+		wb_pool_inner(&o->writes[i]);
+		wb_pool_inner(&o->reads[i]);
 	}
 
-	o->blocks = array_make<wbOptBlock>(ta, 0, 64);
+	o->blocks = wb_pool_array(&wb_opt_pool.blocks, 0);
 	wbOptBlock root = {0, 0, false, -1, -1};
 	array_add(&o->blocks, root);
 	i32 block = 0;
 
-	auto stack = array_make<wbOptValue>(ta, 0, 64);
+	auto stack = wb_pool_array(&wb_opt_pool.stack, 0);
 	bool unreachable = false;
 	i32  dead_depth = 0;
 
@@ -490,6 +542,9 @@ gb_internal void wb_opt_simulate(wbOpt *o) {
 	o->impure_prefix[n] = impure;
 	o->memw_prefix[n]   = memw;
 	o->globw_prefix[n]  = globw;
+	// the pool keeps what growing them allocated
+	wb_opt_pool.blocks = o->blocks;
+	wb_opt_pool.stack  = stack;
 	o->blocks[0].end = cast(i32)n;
 	for_array(i, stack) {
 		if (stack[i].is_frame) wb_opt_escape(o, stack[i].offset);
@@ -576,7 +631,7 @@ gb_internal void wb_opt_scratch_end(wbOpt *o, wbInstr *in) {
 gb_internal void wb_opt_replace(wbOpt *o, isize k, wbInstr const &in) {
 	if (!o->replaced[k]) {
 		o->replaced[k] = true;
-		array_init(&o->replacement[k], temporary_allocator(), 0, 4);
+		wb_pool_inner(&o->replacement[k]);
 	}
 	array_add(&o->replacement[k], in);
 	o->edits++;
@@ -823,12 +878,6 @@ gb_internal void wb_opt_promote_slots(wbOpt *o) {
 				}
 			}
 			if (!ok) break;
-			if (slot.leaf_offsets.allocator.proc == nullptr) {
-				array_init(&slot.leaf_offsets, ta, 0, 8);
-				array_init(&slot.leaf_locals,  ta, 0, 8);
-				array_init(&slot.leaf_ext,     ta, 0, 8);
-				array_init(&slot.leaf_width,   ta, 0, 8);
-			}
 			array_add(&slot.leaf_offsets, a.offset);
 			array_add(&slot.leaf_locals,  WB_NO_LOCAL);
 			array_add(&slot.leaf_ext,     cast(u8)load_ext);
@@ -1592,8 +1641,8 @@ gb_internal u64 wb_opt_local_bit(u32 l) {
 // The filters the constant queries start from (see `maybe_const`)
 gb_internal void wb_opt_analyze_locals(wbOpt *o) {
 	gbAllocator ta = temporary_allocator();
-	o->maybe_const   = array_make<bool>(ta, o->p->locals.count);
-	o->block_writes  = array_make<u64>(ta, o->blocks.count);
+	o->maybe_const   = wb_pool_array(&wb_opt_pool.maybe_const, o->p->locals.count);
+	o->block_writes  = wb_pool_array(&wb_opt_pool.block_writes, o->blocks.count);
 	for_array(i, o->maybe_const)  o->maybe_const[i] = false;
 	for_array(i, o->block_writes) o->block_writes[i] = 0;
 	for (i32 k = 0; k < o->n; k++) {
@@ -3162,22 +3211,31 @@ gb_internal bool wb_opt_pass(wbProcedure *p, bool final_pass) {
 	o->assume_at = -1;
 	o->in = p->instrs;
 	o->n  = p->instrs.count;
-	wb_buffer_init(&o->scratch, ta, 256);
-	o->memo_state   = array_make<u8>(ta, o->n);
-	o->memo_local   = array_make<u32>(ta, o->n);
-	o->memo_value   = array_make<u32>(ta, o->n);
-	o->memo_touched = array_make<i32>(ta, 0, 64);
+	o->scratch = wb_opt_pool.scratch;
+	if (o->scratch.data.allocator.proc == nullptr) {
+		wb_buffer_init(&o->scratch, heap_allocator(), 256);
+	}
+	o->scratch.data.count = 0;
+	o->memo_state   = wb_pool_array(&wb_opt_pool.memo_state, o->n);
+	o->memo_local   = wb_pool_array(&wb_opt_pool.memo_local, o->n);
+	o->memo_value   = wb_pool_array(&wb_opt_pool.memo_value, o->n);
+	o->memo_touched = wb_pool_array(&wb_opt_pool.memo_touched, 0);
 	for (isize k = 0; k < o->n; k++) o->memo_state[k] = 0;
-	o->cse_local = array_make<i32>(ta, o->n);
+	o->cse_local = wb_pool_array(&wb_opt_pool.cse_local, o->n);
 	for (isize k = 0; k < o->n; k++) o->cse_local[k] = -1;
 
-	o->slots = array_make<wbOptSlot>(ta, p->slots.count);
+	o->slots = wb_pool_array(&wb_opt_pool.slots, p->slots.count);
 	for_array(i, o->slots) {
-		o->slots[i] = {};
-		o->slots[i].accesses = array_make<wbOptAccess>(ta, 0, 8);
+		wbOptSlot &slot = o->slots[i];
+		slot.escaped = slot.promote_failed = false;
+		wb_pool_inner(&slot.accesses);
+		wb_pool_inner(&slot.leaf_offsets);
+		wb_pool_inner(&slot.leaf_locals);
+		wb_pool_inner(&slot.leaf_ext);
+		wb_pool_inner(&slot.leaf_width);
 	}
-	o->replacement = array_make<Array<wbInstr>>(ta, o->n);
-	o->replaced    = array_make<bool>(ta, o->n);
+	o->replacement = wb_pool_array(&wb_opt_pool.replacement, o->n);
+	o->replaced    = wb_pool_array(&wb_opt_pool.replaced, o->n);
 	for (isize k = 0; k < o->n; k++) {
 		o->replaced[k] = false;
 	}
@@ -3207,6 +3265,8 @@ gb_internal bool wb_opt_pass(wbProcedure *p, bool final_pass) {
 	}
 
 	if (!o->changed && !final_pass) {
+		wb_opt_pool.scratch      = o->scratch;
+		wb_opt_pool.memo_touched = o->memo_touched;
 		return false;
 	}
 
@@ -3265,6 +3325,9 @@ gb_internal bool wb_opt_pass(wbProcedure *p, bool final_pass) {
 	array_free(&p->instrs);
 	p->code = code;
 	p->instrs = out;
+	// the pool keeps what growing them allocated
+	wb_opt_pool.scratch      = o->scratch;
+	wb_opt_pool.memo_touched = o->memo_touched;
 	return true;
 }
 
