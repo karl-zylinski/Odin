@@ -2725,6 +2725,81 @@ gb_internal void wb_opt_peephole(wbOpt *o) {
 			continue;
 		}
 
+		// `x = x` does nothing
+		if (in.kind == wbInstr_Local && in.op == wbOp_local_set && wb_opt_live(o, k) &&
+		    wb_opt_is_op(o, k-1, wbInstr_Local, wbOp_local_get) && o->in[k-1].imm == in.imm && wb_opt_live(o, k-1)) {
+			wb_opt_delete_range(o, k-1, k+1);
+			o->changed = true;
+			continue;
+		}
+
+		// A condition is only ever tested against zero, so `!!c` is `c`
+		if ((in.kind == wbInstr_If || in.kind == wbInstr_BrIf) &&
+		    wb_opt_is_op(o, k-1, wbInstr_Other, wbOp_i32_eqz) && wb_opt_is_op(o, k-2, wbInstr_Other, wbOp_i32_eqz) &&
+		    wb_opt_range_live(o, k-2, k-1)) {
+			wb_opt_delete_range(o, k-2, k);
+			o->changed = true;
+			continue;
+		}
+
+		// `a / b` and `a % b` of the same pair of locals (the digit loop of the
+		// integer formatting) share one division: `a % b` is `a - (a / b) * b`
+		if (in.kind == wbInstr_Other &&
+		    (in.op == wbOp_i32_div_s || in.op == wbOp_i32_div_u || in.op == wbOp_i32_rem_u ||
+		     in.op == wbOp_i64_div_s || in.op == wbOp_i64_div_u || in.op == wbOp_i64_rem_u) &&
+		    o->producer[k] == k-2 && wb_opt_range_live(o, k-2, k) &&
+		    wb_opt_is_op(o, k-2, wbInstr_Local, wbOp_local_get) && wb_opt_is_op(o, k-1, wbInstr_Local, wbOp_local_get)) {
+			bool is64 = in.op == wbOp_i64_div_s || in.op == wbOp_i64_div_u || in.op == wbOp_i64_rem_u;
+			bool div  = in.op != wbOp_i32_rem_u && in.op != wbOp_i64_rem_u;
+			wbOp other = cast(wbOp)(div ? in.op + 2 : in.op - 2); // div_x <-> rem_x
+			wbOp mulop = is64 ? wbOp_i64_mul : wbOp_i32_mul;
+			wbOp subop = is64 ? wbOp_i64_sub : wbOp_i32_sub;
+			u32 a = o->in[k-2].imm, b = o->in[k-1].imm;
+			i32 end = o->blocks[o->block_of[k]].end;
+			if (end < 0) end = cast(i32)o->n;
+			for (i32 j = k+3; j < end; j++) {
+				if (!wb_opt_is_op(o, j, wbInstr_Other, other) || o->producer[j] != j-2 || !wb_opt_range_live(o, j-2, j)) continue;
+				if (o->in[j-2].imm != a || o->in[j-1].imm != b) continue;
+				if (wb_opt_local_written_between(o, a, k, j) || wb_opt_local_written_between(o, b, k, j)) break;
+				// the first one has to run before the second one always does
+				i32 blk = o->block_of[j];
+				while (blk != o->block_of[k] && blk > 0 && o->blocks[blk].start > k) blk = o->blocks[blk].parent;
+				if (blk != o->block_of[k]) break;
+
+				u32 q = wb_add_local(o->p, is64 ? wbValType_i64 : wbValType_i32, {});
+				wbInstr mul = wb_opt_scratch_begin(o, wbInstr_Other, mulop, 2, 1);
+				wb_opt_scratch_end(o, &mul);
+				wbInstr sub = wb_opt_scratch_begin(o, wbInstr_Other, subop, 2, 1);
+				wb_opt_scratch_end(o, &sub);
+				if (div) {
+					// `a / b` stays where it is, the remainder reuses the quotient
+					wb_opt_replace(o, k, wb_opt_copy_instr(o, k));
+					wb_opt_replace(o, k, wb_opt_local_instr(wbOp_local_tee, q));
+					wb_opt_replace(o, j-1, wb_opt_local_instr(wbOp_local_get, q));
+					wb_opt_replace(o, j-1, wb_opt_local_instr(wbOp_local_get, b));
+					wb_opt_replace(o, j-1, mul);
+					wb_opt_replace(o, j,   sub);
+				} else {
+					// the division moves up to the remainder (unsigned only:
+					// a signed division traps where the remainder does not)
+					wbInstr d = wb_opt_scratch_begin(o, wbInstr_Other, other, 2, 1);
+					wb_opt_scratch_end(o, &d);
+					wb_opt_replace(o, k-1, wb_opt_local_instr(wbOp_local_get, a));
+					wb_opt_replace(o, k-1, wb_opt_local_instr(wbOp_local_get, b));
+					wb_opt_replace(o, k-1, d);
+					wb_opt_replace(o, k-1, wb_opt_local_instr(wbOp_local_tee, q));
+					wb_opt_replace(o, k-1, wb_opt_local_instr(wbOp_local_get, b));
+					wb_opt_replace(o, k-1, mul);
+					wb_opt_replace(o, k,   sub);
+					wb_opt_delete_range(o, j-2, j);
+					wb_opt_replace(o, j, wb_opt_local_instr(wbOp_local_get, q));
+				}
+				o->changed = true;
+				break;
+			}
+			if (!wb_opt_live(o, k)) continue;
+		}
+
 		// A call through a constant procedure value
 		if (in.kind == wbInstr_CallIndirect && wb_opt_is_i32_const(o, k-1, &c)) {
 			wbModule *m = o->p->module;
