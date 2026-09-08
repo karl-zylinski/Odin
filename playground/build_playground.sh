@@ -23,7 +23,9 @@ rm -rf "$DIST/packs"
 rm -f "$DIST/odin_root.pack" "$DIST/odin_root.pack.gz" # the one pack of every source, from before
 ./odin run playground/pack_root -- . "$DIST/packs" "$KARL2D" "$DIST/examples"
 # One gzipped pack per package: the worker fetches the ones a program imports
-find "$DIST/packs" -name '*.pack' -exec gzip -9 -f {} +
+# -n leaves out the timestamp, so that a pack whose sources did not change
+# stays byte identical: caches (and the site's git history) are spared
+find "$DIST/packs" -name '*.pack' -exec gzip -9 -n -f {} +
 cp core/sys/wasm/js/odin.js playground/web/* "$DIST/"
 cp "$KARL2D/audio_backend_web_audio.js" "$KARL2D/audio_backend_web_audio_processor.js" "$DIST/"
 cp "$KARL2D/build_web/web_entry_templates/web_entry_template.odin" "$DIST/web_entry.odin"
