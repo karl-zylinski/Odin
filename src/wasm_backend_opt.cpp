@@ -1627,7 +1627,7 @@ gb_internal i32 wb_opt_br_target(wbOpt *o, i32 k) {
 	return b;
 }
 
-#define WB_OPT_CONST_SCAN_BUDGET 4096
+#define WB_OPT_CONST_SCAN_BUDGET 1024
 #define WB_OPT_PEEL_MAX_INSTRS   512
 
 // Whether local `l` certainly holds the `i32` constant `*value` when
