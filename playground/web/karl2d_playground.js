@@ -30,7 +30,6 @@ let compilerReady = false;
 let compiling = false;
 let gameFrame = document.getElementById("game");
 
-const headerElement = document.querySelector("header");
 const splashText = document.getElementById("splash-text");
 const gameControls = document.getElementById("game-controls");
 const toCodeButton = document.getElementById("to-code");
@@ -80,22 +79,25 @@ function hideSplash() {
 	splashText.textContent = "";
 }
 
-// On a narrow screen the code and the game each get the whole screen, and the
-// run button follows the game so that it can be run again from there
+// On a narrow screen the code and the game each get the whole screen
 function showGameView(show) {
 	showingGame = show;
 	document.body.classList.toggle("showing-game", show);
-	placeRunButton();
 }
 
-function placeRunButton() {
-	const inGameView = NARROW.matches && showingGame;
-	if (inGameView) {
-		if (runButton.parentElement !== gameControls) {
-			gameControls.appendChild(runButton);
+// The program reads the keyboard through the window of its iframe, which only
+// gets the keys while it has the focus: pressing Run hands it over, so that
+// the game can be played without clicking it first
+function focusGame() {
+	const frame = gameFrame;
+	try {
+		frame.focus();
+		const canvas = frame.contentWindow.document.getElementById("webgl-canvas");
+		if (canvas !== null) {
+			canvas.focus();
 		}
-	} else if (runButton.parentElement !== headerElement) {
-		headerElement.insertBefore(runButton, statusElement);
+	} catch (e) {
+		// the frame was replaced by another run in the meantime
 	}
 }
 
@@ -361,6 +363,7 @@ window.addEventListener("message", (e) => {
 		consoleElement.textContent += e.data.text;
 	} else if (e.data.type === "game-started") {
 		hideSplash();
+		focusGame();
 		testHook(true);
 	} else if (e.data.type === "game-crashed") {
 		updateStatus("Program crashed");
@@ -371,7 +374,6 @@ window.addEventListener("message", (e) => {
 
 runButton.addEventListener("click", compileAndRun);
 toCodeButton.addEventListener("click", () => showGameView(false));
-NARROW.addEventListener("change", placeRunButton);
 exampleSelect.addEventListener("change", () => selectExample(exampleSelect.value));
 
 document.addEventListener("keydown", (e) => {

@@ -12,7 +12,8 @@
 		<link id="karl2d-favicon" rel="icon" href="">
 	</head>
 	<body id="body" style="height: 100%; padding: 0; margin: 0; overflow: hidden; background-color: black;">
-		<canvas id="webgl-canvas" style="touch-action: none;" oncontextmenu="return false;" onmousedown="event.target.focus()" onkeydown="event.preventDefault()"></canvas>
+		<!-- tabindex so that the page can hand it the focus after a run -->
+		<canvas id="webgl-canvas" tabindex="0" style="touch-action: none; outline: none;" oncontextmenu="return false;" onmousedown="event.target.focus()" onkeydown="event.preventDefault()"></canvas>
 
 		<script type="text/javascript" src="audio_backend_web_audio.js"></script>
 		<script type="text/javascript" src="odin.js"></script>
