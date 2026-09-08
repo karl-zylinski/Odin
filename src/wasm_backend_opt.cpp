@@ -2725,6 +2725,30 @@ gb_internal void wb_opt_peephole(wbOpt *o) {
 			continue;
 		}
 
+		// The frame pointer is never null, and neither is `fp + c`
+		if (in.kind == wbInstr_Other && (in.op == wbOp_i32_eq || in.op == wbOp_i32_ne || in.op == wbOp_i32_eqz) &&
+		    o->producer[k] >= 0 && wb_opt_range_live(o, o->producer[k], k)) {
+			i32 s = o->producer[k];
+			i32 fs = -1, fe = -1;
+			u32 c = 0;
+			if (in.op == wbOp_i32_eqz) {
+				fs = s; fe = k-1;
+			} else if (wb_opt_is_i32_const(o, k-1, &c) && c == 0) {
+				fs = s; fe = k-2;
+			} else if (wb_opt_is_i32_const(o, s, &c) && c == 0) {
+				fs = s+1; fe = k-1;
+			}
+			bool frame = fs >= 0 && fs <= fe && wb_opt_is_op(o, fs, wbInstr_Local, wbOp_local_get) && o->in[fs].imm == o->p->fp_local &&
+			             (fs == fe || (fe == fs+2 && wb_opt_is_i32_const(o, fs+1, &c) &&
+			                           wb_opt_is_op(o, fs+2, wbInstr_Other, wbOp_i32_add)));
+			if (frame) {
+				wb_opt_delete_range(o, s, k);
+				wb_opt_replace(o, k, wb_opt_i32_const(o, in.op == wbOp_i32_ne ? 1 : 0));
+				o->changed = true;
+				continue;
+			}
+		}
+
 		// `x = x` does nothing
 		if (in.kind == wbInstr_Local && in.op == wbOp_local_set && wb_opt_live(o, k) &&
 		    wb_opt_is_op(o, k-1, wbInstr_Local, wbOp_local_get) && o->in[k-1].imm == in.imm && wb_opt_live(o, k-1)) {
