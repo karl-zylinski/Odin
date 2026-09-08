@@ -926,8 +926,11 @@ gb_internal void wb_emit_copy(wbProcedure *p, u32 dst_base, i32 dst_offset, u32 
 	}
 }
 
+gb_internal i32  wb_union_tag_offset(Type *ut);
+gb_internal bool wb_union_has_tag(Type *ut);
+
 // Appends the scalar leaves (field/element offsets and types) of `type`, returns
-// false for types that have to be copied as raw bytes (unions, huge arrays...)
+// false for types that have to be copied as raw bytes (raw unions, huge arrays...)
 gb_internal bool wb_copy_leaves(Type *type, i64 base_offset, Array<wbAbiLeaf> *leaves) {
 	enum { MAX_LEAVES = 32 };
 	if (leaves->count >= MAX_LEAVES) {
@@ -971,6 +974,23 @@ gb_internal bool wb_copy_leaves(Type *type, i64 base_offset, Array<wbAbiLeaf> *l
 	}
 	case Type_Map:
 		return t_raw_map != nullptr && wb_copy_leaves(t_raw_map, base_offset, leaves);
+	case Type_Union: {
+		// A `Maybe(T)` is copied as its variant and its tag; the variants
+		// of other unions overlap and are copied as raw bytes (a gap)
+		if (is_type_union_maybe_pointer(bt)) {
+			wbAbiLeaf leaf = {base_offset, t_rawptr};
+			array_add(leaves, leaf);
+			return true;
+		}
+		if (bt->Union.variants.count == 1 && !wb_copy_leaves(bt->Union.variants[0], base_offset, leaves)) {
+			return false;
+		}
+		if (wb_union_has_tag(bt)) {
+			wbAbiLeaf tag = {base_offset + wb_union_tag_offset(bt), union_tag_type(bt)};
+			array_add(leaves, tag);
+		}
+		return true;
+	}
 	case Type_DynamicArray: {
 		// Raw_Dynamic_Array: data, len, cap, allocator{procedure, data}
 		i64 ps = build_context.ptr_size;
@@ -989,8 +1009,9 @@ gb_internal bool wb_copy_leaves(Type *type, i64 base_offset, Array<wbAbiLeaf> *l
 	case Type_Slice: case Type_Proc: case Type_Pointer: case Type_MultiPointer: case Type_SoaPointer:
 	case Type_Basic:
 		if (is_type_string(bt) || is_type_any(bt) || bt->kind == Type_Slice) {
+			Type *ft = nullptr;
 			wbAbiLeaf data = {base_offset, t_rawptr};
-			wbAbiLeaf len  = {base_offset + build_context.int_size, is_type_any(bt) ? t_typeid : t_int};
+			wbAbiLeaf len  = {base_offset + (is_type_any(bt) ? type_offset_of(bt, 1, &ft) : build_context.int_size), is_type_any(bt) ? t_typeid : t_int};
 			array_add(leaves, data);
 			array_add(leaves, len);
 			return true;

@@ -51,6 +51,7 @@ struct wbOptAccess {
 
 struct wbOptSlot {
 	bool escaped;
+	bool promote_failed; // escaped for mixed access widths rather than by its address
 	Array<wbOptAccess> accesses;
 	Array<u32> leaf_offsets; // promoted leaves, increasing
 	Array<u32> leaf_locals;
@@ -96,6 +97,7 @@ struct wbOpt {
 	Array<wbOptSlot> slots;
 	bool         all_escaped;
 	bool         changed;
+	bool         split_stores; // constant stores were split for a slot to promote next pass
 	u32          fp_refs; // remaining local.get fp after the rewrite
 
 	// Facts assumed by wb_opt_local_const_before on entry to the loop at
@@ -651,7 +653,7 @@ gb_internal bool wb_opt_split_const_stores(wbOpt *o, isize si) {
 			u32 end = off + st.width;
 			// Boundaries of the other accesses inside the store: pieces
 			// crossing the store's ends cannot be matched
-			u32 bounds[16];
+			u32 bounds[2 + 2*8]; // a store is at most 8 bytes wide
 			isize nb = 0;
 			bounds[nb++] = off;
 			bounds[nb++] = end;
@@ -817,8 +819,9 @@ gb_internal void wb_opt_promote_slots(wbOpt *o) {
 			i = j;
 		}
 		if (!ok) {
-			if (wb_opt_split_const_stores(o, si)) o->changed = true;
+			if (wb_opt_split_const_stores(o, si)) o->changed = o->split_stores = true;
 			slot.escaped = true;
+			slot.promote_failed = true;
 			continue;
 		}
 		// The address computations must be deletable
@@ -1012,6 +1015,125 @@ gb_internal void wb_opt_merge_copies(wbOpt *o) {
 	wb_opt_merge_copy_run(o, run);
 }
 
+// Stores of constants into consecutive bytes (the zeroing of an aggregate
+// that stays in memory, leaf by leaf) are merged the same way
+enum { WB_OPT_CONST_RUN_MAX = 128 };
+
+gb_internal wbInstr wb_opt_const_bits(wbOpt *o, wbValType vt, u64 bits);
+
+struct wbOptConstStore {
+	i32 first, last; // the local.get of the base and the store
+	u32 base, off, width;
+	u64 bits;
+};
+
+gb_internal i32 wb_opt_match_const_store(wbOpt *o, i32 k, wbOptConstStore *cs) {
+	i32 idx[3];
+	int n = 0;
+	for (i32 j = k; j < o->n && n < 3; j++) {
+		if (o->deleted[j]) continue;
+		if (o->replaced[j] || o->moved[j]) return -1;
+		idx[n++] = j;
+	}
+	if (n < 3) {
+		return -1;
+	}
+	wbInstr const &b  = o->in[idx[0]];
+	wbInstr const &c  = o->in[idx[1]];
+	wbInstr const &st = o->in[idx[2]];
+	if (b.kind != wbInstr_Local || b.op != wbOp_local_get || o->moved_to[b.imm] == idx[0]) return -1;
+	if (st.kind != wbInstr_Store || wb_opt_access_valtype(st.op) == wbValType_f32 || wb_opt_access_valtype(st.op) == wbValType_f64) return -1;
+	i64 value = 0;
+	if (!wb_opt_const_int(o, c, &value)) return -1;
+	if (o->acc_abs[idx[2]] >= 0) {
+		// a frame slot: only when it stays in memory for good
+		isize si = wb_opt_find_slot(o, o->acc_abs[idx[2]]);
+		if (si >= 0 && (!o->slots[si].escaped || o->slots[si].promote_failed)) return -1;
+	}
+	cs->first = idx[0];
+	cs->last  = idx[2];
+	cs->base  = b.imm;
+	cs->off   = st.imm;
+	cs->width = st.width;
+	cs->bits  = cast(u64)value;
+	if (st.width < 8) cs->bits &= (cast(u64)1 << (8*st.width)) - 1;
+	return idx[2]+1;
+}
+
+gb_internal void wb_opt_merge_const_store_run(wbOpt *o, Array<wbOptConstStore> const &run) {
+	if (run.count < 2) {
+		return;
+	}
+	wbOptConstStore const &r0 = run[0];
+	u32 total = 0;
+	u64 bytes[WB_OPT_CONST_RUN_MAX/8] = {};
+	for (wbOptConstStore const &r : run) {
+		u32 at = r.off - r0.off;
+		for (u32 i = 0; i < r.width; i++) {
+			bytes[(at+i)/8] |= ((r.bits >> (8*i)) & 0xff) << (8*((at+i)%8));
+		}
+		total += r.width;
+	}
+	isize chunks = 0;
+	for (u32 done = 0; done < total; chunks++) {
+		u32 left = total - done;
+		done += left >= 8 ? 8 : left >= 4 ? 4 : left >= 2 ? 2 : 1;
+	}
+	if (chunks >= run.count) {
+		return;
+	}
+	wb_opt_delete_range(o, r0.first+1, r0.last+1);
+	for (isize i = 1; i < run.count; i++) {
+		wb_opt_delete_range(o, run[i].first, run[i].last+1);
+	}
+	isize k = r0.first;
+	for (u32 done = 0; done < total; ) {
+		u32 left = total - done;
+		u32 w = left >= 8 ? 8 : left >= 4 ? 4 : left >= 2 ? 2 : 1;
+		u64 bits = 0;
+		for (u32 i = 0; i < w; i++) {
+			bits |= ((bytes[(done+i)/8] >> (8*((done+i)%8))) & 0xff) << (8*i);
+		}
+		wbOp sop = w == 8 ? wbOp_i64_store : w == 4 ? wbOp_i32_store : w == 2 ? wbOp_i32_store16 : wbOp_i32_store8;
+		wb_opt_replace(o, k, wb_opt_local_instr(wbOp_local_get, r0.base));
+		wb_opt_replace(o, k, wb_opt_const_bits(o, w == 8 ? wbValType_i64 : wbValType_i32, bits));
+		wbInstr st = wb_opt_scratch_begin(o, wbInstr_Store, sop, 2, 0);
+		wb_uleb(&o->scratch, 0);
+		wb_uleb(&o->scratch, r0.off + done);
+		st.imm   = r0.off + done;
+		st.width = cast(u8)w;
+		wb_opt_scratch_end(o, &st);
+		wb_opt_replace(o, k, st);
+		done += w;
+	}
+	o->changed = true;
+}
+
+gb_internal void wb_opt_merge_const_stores(wbOpt *o) {
+	auto run = array_make<wbOptConstStore>(temporary_allocator(), 0, 16);
+	i32 k = 0;
+	while (k < o->n) {
+		wbOptConstStore cs;
+		i32 next = wb_opt_match_const_store(o, k, &cs);
+		if (next < 0) {
+			wb_opt_merge_const_store_run(o, run);
+			run.count = 0;
+			k++;
+			continue;
+		}
+		if (run.count > 0) {
+			wbOptConstStore const &prev = run[run.count-1];
+			if (cs.base != prev.base || cs.off != prev.off + prev.width || cs.off + cs.width - run[0].off > WB_OPT_CONST_RUN_MAX) {
+				wb_opt_merge_const_store_run(o, run);
+				run.count = 0;
+			}
+		}
+		array_add(&run, cs);
+		k = next;
+	}
+	wb_opt_merge_const_store_run(o, run);
+}
+
 // Whether the procedure has two adjacent leaf copies wb_opt_merge_copies
 // could merge, for skipping the optimization after inlining
 gb_internal bool wb_has_copy_runs(wbProcedure *p) {
@@ -1024,6 +1146,15 @@ gb_internal bool wb_has_copy_runs(wbProcedure *p) {
 		if (in[k+5].kind != wbInstr_Local || in[k+5].imm != in[k+1].imm) continue;
 		if (in[k+6].kind != wbInstr_Load || in[k+7].kind != wbInstr_Store) continue;
 		if (in[k+6].imm == in[k+2].imm + in[k+2].width && in[k+7].imm == in[k+3].imm + in[k+3].width) {
+			return true;
+		}
+	}
+	for (isize k = 0; k + 6 <= in.count; k++) {
+		if (in[k].kind != wbInstr_Local || in[k].op != wbOp_local_get) continue;
+		if (in[k+1].kind != wbInstr_Const || in[k+2].kind != wbInstr_Store) continue;
+		if (in[k+3].kind != wbInstr_Local || in[k+3].imm != in[k].imm) continue;
+		if (in[k+4].kind != wbInstr_Const || in[k+5].kind != wbInstr_Store) continue;
+		if (in[k+5].imm == in[k+2].imm + in[k+2].width) {
 			return true;
 		}
 	}
@@ -2488,6 +2619,31 @@ gb_internal void wb_opt_peephole(wbOpt *o) {
 			continue;
 		}
 
+		// `x + a + b` -> `x + (a+b)` (the frame addresses of inlined callees)
+		if (in.kind == wbInstr_Other && in.op == wbOp_i32_add && wb_opt_is_i32_const(o, k-1, &c) &&
+		    wb_opt_is_op(o, k-2, wbInstr_Other, wbOp_i32_add) && wb_opt_range_live(o, k-3, k+1)) {
+			u32 a = 0;
+			if (wb_opt_is_i32_const(o, k-3, &a)) {
+				wb_opt_replace(o, k-3, wb_opt_i32_const(o, a + c));
+				wb_opt_delete_range(o, k-2, k);
+				o->changed = true;
+				continue;
+			}
+		}
+		// `fp + c` as the address of a load or store becomes an offset (the
+		// frame never wraps around the address space)
+		if ((in.kind == wbInstr_Load || in.kind == wbInstr_Store) && o->op0_start[k] >= 0 && o->op0_end[k] == o->op0_start[k] + 3) {
+			i32 s = o->op0_start[k];
+			if (wb_opt_is_op(o, s, wbInstr_Local, wbOp_local_get) && o->in[s].imm == o->p->fp_local && wb_opt_is_i32_const(o, s+1, &c) &&
+			    wb_opt_is_op(o, s+2, wbInstr_Other, wbOp_i32_add) && wb_opt_range_live(o, s, s+3) && wb_opt_live(o, k) &&
+			    cast(i32)c >= 0 && cast(u64)in.imm + c <= 0x7fffffffu) {
+				wb_opt_delete_range(o, s+1, s+3);
+				wb_opt_replace(o, k, wb_opt_memarg(o, cast(wbOp)in.op, in.imm + c, in.width));
+				o->changed = true;
+				continue;
+			}
+		}
+
 		// `x + 0`, `x - 0`, `x | 0`, `x ^ 0`, `x << 0`, `x >> 0`, `x * 1`
 		if (in.kind == wbInstr_Other && wb_opt_is_i32_const(o, k-1, &c)) {
 			bool identity = false;
@@ -2773,11 +2929,50 @@ gb_internal void wb_opt_emit_range(wbOpt *o, Array<wbInstr> *out, i32 start, i32
 	}
 }
 
+gb_internal char const *wb_op_names[256] = {
+	"unreachable", "nop", "block", "loop", "if", "else", "", "",
+	"", "", "", "end", "br", "br_if", "br_table", "return",
+	"call", "call_indirect", "", "", "", "", "", "",
+	"", "", "drop", "select", "", "", "", "",
+	"local_get", "local_set", "local_tee", "global_get", "global_set", "", "", "",
+	"i32_load", "i64_load", "f32_load", "f64_load", "i32_load8_s", "i32_load8_u", "i32_load16_s", "i32_load16_u",
+	"i64_load8_s", "i64_load8_u", "i64_load16_s", "i64_load16_u", "i64_load32_s", "i64_load32_u", "i32_store", "i64_store",
+	"f32_store", "f64_store", "i32_store8", "i32_store16", "i64_store8", "i64_store16", "i64_store32", "memory_size",
+	"memory_grow", "i32_const", "i64_const", "f32_const", "f64_const", "i32_eqz", "i32_eq", "i32_ne",
+	"i32_lt_s", "i32_lt_u", "i32_gt_s", "i32_gt_u", "i32_le_s", "i32_le_u", "i32_ge_s", "i32_ge_u",
+	"i64_eqz", "i64_eq", "i64_ne", "i64_lt_s", "i64_lt_u", "i64_gt_s", "i64_gt_u", "i64_le_s",
+	"i64_le_u", "i64_ge_s", "i64_ge_u", "f32_eq", "f32_ne", "f32_lt", "f32_gt", "f32_le",
+	"f32_ge", "f64_eq", "f64_ne", "f64_lt", "f64_gt", "f64_le", "f64_ge", "i32_clz",
+	"i32_ctz", "i32_popcnt", "i32_add", "i32_sub", "i32_mul", "i32_div_s", "i32_div_u", "i32_rem_s",
+	"i32_rem_u", "i32_and", "i32_or", "i32_xor", "i32_shl", "i32_shr_s", "i32_shr_u", "i32_rotl",
+	"i32_rotr", "i64_clz", "i64_ctz", "i64_popcnt", "i64_add", "i64_sub", "i64_mul", "i64_div_s",
+	"i64_div_u", "i64_rem_s", "i64_rem_u", "i64_and", "i64_or", "i64_xor", "i64_shl", "i64_shr_s",
+	"i64_shr_u", "i64_rotl", "i64_rotr", "f32_abs", "f32_neg", "f32_ceil", "f32_floor", "f32_trunc",
+	"f32_nearest", "f32_sqrt", "f32_add", "f32_sub", "f32_mul", "f32_div", "f32_min", "f32_max",
+	"f32_copysign", "f64_abs", "f64_neg", "f64_ceil", "f64_floor", "f64_trunc", "f64_nearest", "f64_sqrt",
+	"f64_add", "f64_sub", "f64_mul", "f64_div", "f64_min", "f64_max", "f64_copysign", "i32_wrap_i64",
+	"i32_trunc_f32_s", "i32_trunc_f32_u", "i32_trunc_f64_s", "i32_trunc_f64_u", "i64_extend_i32_s", "i64_extend_i32_u", "i64_trunc_f32_s", "i64_trunc_f32_u",
+	"i64_trunc_f64_s", "i64_trunc_f64_u", "f32_convert_i32_s", "f32_convert_i32_u", "f32_convert_i64_s", "f32_convert_i64_u", "f32_demote_f64", "f64_convert_i32_s",
+	"f64_convert_i32_u", "f64_convert_i64_s", "f64_convert_i64_u", "f64_promote_f32", "i32_reinterpret_f32", "i64_reinterpret_f64", "f32_reinterpret_i32", "f64_reinterpret_i64",
+	"i32_extend8_s", "i32_extend16_s", "i64_extend8_s", "i64_extend16_s", "i64_extend32_s", "", "", "",
+	"", "", "", "", "", "", "", "",
+	"", "", "", "", "", "", "", "",
+	"", "", "", "", "", "", "", "",
+	"", "", "", "", "", "", "", "",
+	"", "", "", "", "", "", "", "",
+	"", "", "", "", "", "", "", "",
+	"", "", "", "", "", "", "", "",
+};
+
 gb_internal void wb_opt_dump(wbProcedure *p, char const *title) {
 	gb_printf_err("== %s %.*s (%td instrs, %td locals, frame %u)\n", title, LIT(p->name), p->instrs.count, p->locals.count, p->frame_size);
 	for_array(i, p->instrs) {
 		wbInstr const &in = p->instrs[i];
-		gb_printf_err("  %4td: op=%02x kind=%d pops=%d pushes=%d imm=%u len=%u\n", i, in.op, in.kind, in.pops, in.pushes, in.imm, in.length);
+		char name[24];
+		gb_snprintf(name, sizeof(name), "%s", wb_op_names[in.op]);
+		for (isize c = gb_strlen(name); c < 16; c++) name[c] = ' ';
+		name[16] = 0;
+		gb_printf_err("  %4td: %s kind=%d pops=%d pushes=%d imm=%u len=%u\n", i, name, in.kind, in.pops, in.pushes, in.imm, in.length);
 	}
 }
 
@@ -2825,8 +3020,10 @@ gb_internal bool wb_opt_pass(wbProcedure *p, bool final_pass) {
 		wb_opt_move_producers(o);
 		wb_opt_remove_overwritten_sets(o);
 		wb_opt_remove_dead_sets(o);
-		if (p->merge_copies) {
+		if (p->merge_copies && !o->split_stores) {
+			// (a slot promoted next pass keeps its leaf copies)
 			wb_opt_merge_copies(o);
+			wb_opt_merge_const_stores(o);
 		}
 		wb_opt_peephole(o);
 	}
