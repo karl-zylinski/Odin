@@ -19,7 +19,7 @@ CXX="$WASI_SDK/bin/clang++"
 MODE=${1:-release}
 case $MODE in
 debug)   EXTRAFLAGS="-g" ;;
-release) EXTRAFLAGS="-O2" ;;
+release) EXTRAFLAGS="${OPT:--O2}" ;;
 *)       echo "ERROR: Build mode \"$MODE\" unsupported!"; exit 1 ;;
 esac
 
