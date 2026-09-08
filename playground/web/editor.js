@@ -338,6 +338,16 @@ function createEditor(container) {
 		focus() {
 			input.focus();
 		},
+		// Hiding the editor (the game view taking the screen on a phone)
+		// loses where the textarea was scrolled to, so the page can put it back
+		getScroll() {
+			return {top: input.scrollTop, left: input.scrollLeft};
+		},
+		setScroll(scroll) {
+			input.scrollTop = scroll.top;
+			input.scrollLeft = scroll.left;
+			render(false);
+		},
 		onChange(callback) {
 			changeCallbacks.push(callback);
 		},

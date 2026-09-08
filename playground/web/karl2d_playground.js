@@ -79,10 +79,20 @@ function hideSplash() {
 	splashText.textContent = "";
 }
 
-// On a narrow screen the code and the game each get the whole screen
+// On a narrow screen the code and the game each get the whole screen. The
+// editor is hidden while the game has it, which loses where it was scrolled
+// to, so that is kept and put back on the way in.
+let editorScroll = null;
+
 function showGameView(show) {
+	if (show && !showingGame) {
+		editorScroll = editor.getScroll();
+	}
 	showingGame = show;
 	document.body.classList.toggle("showing-game", show);
+	if (!show && editorScroll !== null) {
+		editor.setScroll(editorScroll);
+	}
 }
 
 // The program reads the keyboard through the window of its iframe, which only
