@@ -110,6 +110,24 @@ async function fetchExampleFiles(example) {
 	return files;
 }
 
+function exampleRoot(example) {
+	return "odin/karl2d/examples/" + example.dir + "/";
+}
+
+// The example as the compiler sees it: its files (edited ones as text, the
+// rest as the bytes that were fetched) and Karl2D's web entry point
+async function exampleFileList(example) {
+	const files = await fetchExampleFiles(example);
+	const root = exampleRoot(example);
+	const list = [];
+	for (const [path, data] of files) {
+		const key = fileKey(example.dir, path);
+		list.push({path: root + path, data: edited.has(key) ? edited.get(key) : data});
+	}
+	list.push({path: root + "build/web/entry.odin", data: entrySource});
+	return list;
+}
+
 function fileKey(dir, path) {
 	return dir + "/" + path;
 }
@@ -230,10 +248,12 @@ async function selectExample(dir) {
 		updateStatus("Loading " + dir + "...");
 	}
 	try {
-		await fetchExampleFiles(example);
+		const list = await exampleFileList(example);
 		if (current !== example) {
 			return; // another example was picked while this one was loading
 		}
+		// Get the packages it imports on their way before Run is pressed
+		worker.postMessage({type: "prefetch", files: list});
 		openFile(example.main);
 		updateStatus(compilerReady ? "Ready" : "Loading compiler...");
 	} catch (e) {
@@ -256,19 +276,11 @@ async function compileAndRun() {
 	stopGame();
 
 	const example = current;
-	const files = await fetchExampleFiles(example);
-	const root = "odin/karl2d/examples/" + example.dir + "/";
-	const list = [];
-	for (const [path, data] of files) {
-		// Every edited source is sent as text, the rest as the bytes fetched
-		const key = fileKey(example.dir, path);
-		list.push({path: root + path, data: edited.has(key) ? edited.get(key) : data});
-	}
-	list.push({path: root + "build/web/entry.odin", data: entrySource});
+	const list = await exampleFileList(example);
 	worker.postMessage({
 		type: "compile",
 		files: list,
-		dir: "/" + root + "build/web",
+		dir: "/" + exampleRoot(example) + "build/web",
 		flags: ["-target:js_wasm32"],
 	});
 }

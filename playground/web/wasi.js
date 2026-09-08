@@ -50,9 +50,21 @@ function wasiParentPath(path) {
 	return i < 0 ? "" : path.slice(0, i);
 }
 
+// Thrown when the compiler reads a file whose pack has not been fetched. The
+// worker catches it, fetches that pack and runs the compile again on a fresh
+// instance (see compiler_worker.js): a prefetch that guessed wrong costs time,
+// never correctness.
+class WasiMissingPack extends Error {
+	constructor(pack, path) {
+		super("pack not loaded: " + pack + " (for " + path + ")");
+		this.pack = pack;
+		this.path = path;
+	}
+}
+
 class WasiFileSystem {
 	constructor() {
-		this.files = new Map(); // path -> {data: Uint8Array, size: number}
+		this.files = new Map(); // path -> {data: Uint8Array|null, size: number, pack?: string}
 		this.dirs  = new Set([""]);
 	}
 
@@ -74,7 +86,32 @@ class WasiFileSystem {
 
 	readFile(path) {
 		const f = this.files.get(wasiNormalizePath(path));
-		return f ? f.data.subarray(0, f.size) : null;
+		if (f === undefined) {
+			return null;
+		}
+		this.needData(f, path);
+		return f.data.subarray(0, f.size);
+	}
+
+	// The contents of a file listed in the manifest arrive with its pack
+	needData(f, path) {
+		if (f.data === null) {
+			throw new WasiMissingPack(f.pack, path);
+		}
+	}
+
+	// Lists every file of every package with its size, but without contents:
+	// what the compiler needs to look around the file system (`fd_readdir`,
+	// `path_filestat_get`) before any pack has been fetched
+	loadManifest(packages, prefix) {
+		for (const [dir, pkg] of Object.entries(packages)) {
+			this.mkdirAll(prefix + "/" + dir);
+			for (const [name, size] of pkg.files) {
+				const path = wasiNormalizePath(prefix + "/" + dir + "/" + name);
+				this.mkdirAll(wasiParentPath(path));
+				this.files.set(path, {data: null, size: size, pack: dir});
+			}
+		}
 	}
 
 	// Loads a file made by playground/pack_root under `prefix`
@@ -191,6 +228,10 @@ class Wasi {
 	}
 
 	ensureCapacity(f, size) {
+		if (f.data === null) {
+			f.data = new Uint8Array(0);
+			f.size = 0;
+		}
 		if (size <= f.data.length) {
 			return;
 		}
@@ -205,6 +246,7 @@ class Wasi {
 
 	// Reads the iovs into `bytes` starting at `offset` of the file; returns the count read
 	readIovs(f, iovs, iovsLen, offset) {
+		this.fs.needData(f, "read");
 		const v = this.view();
 		const mem = this.bytes();
 		let total = 0;
@@ -513,7 +555,10 @@ class Wasi {
 						return WASI_EEXIST;
 					}
 					if (oflags & WASI_OFLAGS_TRUNC) {
+						file.data = new Uint8Array(0);
 						file.size = 0;
+					} else {
+						self.fs.needData(file, path); // fetch its pack and come back
 					}
 				} else {
 					if (!(oflags & WASI_OFLAGS_CREAT)) {

@@ -19,8 +19,10 @@ if [ -n "${ODIN_WASM:-}" ]; then
 else
 	OUT="$DIST/odin.wasm" ./build_odin_wasi.sh release
 fi
-./odin run playground/pack_root -- . "$DIST/odin_root.pack" "$KARL2D" "$DIST/examples"
-gzip -9 -f "$DIST/odin_root.pack"
+rm -rf "$DIST/packs"
+./odin run playground/pack_root -- . "$DIST/packs" "$KARL2D" "$DIST/examples"
+# One gzipped pack per package: the worker fetches the ones a program imports
+find "$DIST/packs" -name '*.pack' -exec gzip -9 -f {} +
 cp core/sys/wasm/js/odin.js playground/web/* "$DIST/"
 cp "$KARL2D/audio_backend_web_audio.js" "$KARL2D/audio_backend_web_audio_processor.js" "$DIST/"
 cp "$KARL2D/build_web/web_entry_templates/web_entry_template.odin" "$DIST/web_entry.odin"

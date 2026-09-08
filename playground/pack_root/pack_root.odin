@@ -514,11 +514,243 @@ write_manifest :: proc(examples: []Example, path: string) {
 	}
 }
 
+
+// One pack per package, so that the playground only downloads the packages a
+// program actually imports (see `manifest.json` and the worker's prefetch).
+//
+// A package is a directory with `.odin` files in it. Every other collected
+// file (a wasm object, a `#load`ed asset) belongs to the nearest package at or
+// above it, so that it travels with the code that needs it.
+Package :: struct {
+	dir:     string,
+	entries: [dynamic]Entry,
+	imports: [dynamic]string,
+}
+
+dir_of :: proc(pack_path: string) -> string {
+	if i := strings.last_index_byte(pack_path, '/'); i >= 0 {
+		return pack_path[:i]
+	}
+	return ""
+}
+
+// The package a collected file belongs to: its own directory when that holds
+// sources, otherwise the closest one above it that does
+owning_package :: proc(dir: string, package_dirs: map[string]bool) -> string {
+	d := dir
+	for {
+		if d in package_dirs {
+			return d
+		}
+		i := strings.last_index_byte(d, '/')
+		if i < 0 {
+			return dir // nothing above it: keep it where it is
+		}
+		d = d[:i]
+	}
+}
+
+// Strips an attribute in front of a declaration: `@(require) import ...`
+strip_attribute :: proc(line: string) -> string {
+	l := strings.trim_space(line)
+	for strings.has_prefix(l, "@") {
+		i := strings.index_byte(l, ')')
+		if i < 0 {
+			return l
+		}
+		l = strings.trim_space(l[i+1:])
+	}
+	return l
+}
+
+// The files a `foreign import` links, which may sit outside the package that
+// links them (`foreign import lib "../lib/thing_wasm.o"`)
+foreign_import_paths :: proc(text: string) -> [dynamic]string {
+	paths := make([dynamic]string, context.temp_allocator)
+	text := text
+	in_group := false
+	for line in strings.split_lines_iterator(&text) {
+		l := strings.trim_space(line)
+		if !in_group {
+			stripped := strip_attribute(l)
+			if !strings.has_prefix(stripped, "foreign import") {
+				continue
+			}
+			l = stripped
+			in_group = strings.contains(l, "{") && !strings.contains(l, "}")
+		} else if strings.contains(l, "}") {
+			in_group = false
+		}
+		rest := l
+		for {
+			i := strings.index_byte(rest, '"')
+			if i < 0 {
+				break
+			}
+			rest = rest[i+1:]
+			end := strings.index_byte(rest, '"')
+			if end < 0 {
+				break
+			}
+			append(&paths, rest[:end])
+			rest = rest[end+1:]
+		}
+	}
+	return paths
+}
+
+// The packages a source file imports. `import "core:fmt"` names a collection,
+// anything else is relative to the importing file's own directory.
+source_imports :: proc(text: string, dir: string, out: ^[dynamic]string) {
+	text := text
+	for line in strings.split_lines_iterator(&text) {
+		l := strip_attribute(line)
+		if !strings.has_prefix(l, "import") {
+			continue
+		}
+		rest := strings.trim_space(l[len("import"):])
+		if strings.has_prefix(rest, "\"") {
+			// no alias
+		} else if i := strings.index_byte(rest, '"'); i > 0 {
+			rest = rest[i:] // `import alias "path"`
+		} else {
+			continue
+		}
+		body := rest[1:]
+		end := strings.index_byte(body, '"')
+		if end < 0 {
+			continue
+		}
+		path := body[:end]
+		pkg: string
+		if i := strings.index_byte(path, ':'); i >= 0 {
+			collection, name := path[:i], path[i+1:]
+			if collection != "base" && collection != "core" && collection != "vendor" {
+				continue // a collection the playground does not pack
+			}
+			pkg = name == "" ? collection : fmt.tprintf("%s/%s", collection, name)
+		} else {
+			cleaned, _ := filepath.clean(join(dir, path))
+			pkg = cleaned
+		}
+		pkg = strings.trim_prefix(pkg, "/")
+		if pkg != "" && !slice.contains(out[:], pkg) {
+			append(out, strings.clone(pkg))
+		}
+	}
+}
+
+// Splits what was collected into one pack per package
+group_packages :: proc(p: ^Packer) -> [dynamic]Package {
+	package_dirs := make(map[string]bool, context.allocator)
+	for e in p.entries {
+		if filepath.ext(e.path) == ".odin" {
+			package_dirs[dir_of(e.path)] = true
+		}
+	}
+	index := make(map[string]int, context.allocator)
+	owner := make(map[string]string, context.allocator) // file -> its package
+	packages := make([dynamic]Package, context.allocator)
+	for e in p.entries {
+		dir := owning_package(dir_of(e.path), package_dirs)
+		i, found := index[dir]
+		if !found {
+			i = len(packages)
+			index[strings.clone(dir)] = i
+			append(&packages, Package{dir = strings.clone(dir)})
+		}
+		owner[e.path] = packages[i].dir
+		append(&packages[i].entries, e)
+	}
+	for &pkg in packages {
+		for e in pkg.entries {
+			if filepath.ext(e.path) != ".odin" {
+				continue
+			}
+			text := string(e.data)
+			source_imports(text, dir_of(e.path), &pkg.imports)
+			// A file it links or loads may live in another package (an
+			// object in a `lib` directory, say), which then has to come along
+			referenced := foreign_import_paths(text)
+			append(&referenced, ..load_paths(text)[:])
+			for path in referenced {
+				resolved, _ := filepath.clean(join(dir_of(e.path), path))
+				resolved = strings.trim_prefix(resolved, "/")
+				holder, found := owner[resolved]
+				if found && holder != pkg.dir && !slice.contains(pkg.imports[:], holder) {
+					append(&pkg.imports, strings.clone(holder))
+				}
+			}
+		}
+		// A package does not have to list itself
+		for i := 0; i < len(pkg.imports); {
+			if pkg.imports[i] == pkg.dir || !(pkg.imports[i] in index) {
+				ordered_remove(&pkg.imports, i)
+			} else {
+				i += 1
+			}
+		}
+	}
+	return packages
+}
+
+write_pack :: proc(entries: []Entry, path: string) -> int {
+	out: [dynamic]byte
+	defer delete(out)
+	put_u32 :: proc(out: ^[dynamic]byte, v: u32) {
+		append(out, byte(v), byte(v >> 8), byte(v >> 16), byte(v >> 24))
+	}
+	append(&out, "ODINPK01")
+	put_u32(&out, u32(len(entries)))
+	total := 0
+	for e in entries {
+		put_u32(&out, u32(len(e.path)))
+		append(&out, e.path)
+		put_u32(&out, u32(len(e.data)))
+		append(&out, ..e.data)
+		total += len(e.data)
+	}
+	if err := os.make_directory_all(filepath.dir(path)); err != nil && err != .Exist {
+		fatal("Cannot create directory for %s: %v", path, err)
+	}
+	if err := os.write_entire_file(path, out[:]); err != nil {
+		fatal("Cannot write %s: %v", path, err)
+	}
+	return total
+}
+
+// What the worker needs to serve the file system without the packs: every
+// file with its size, and what each package imports, so that the closure of
+// a program's imports can be resolved before any pack is fetched
+write_pack_manifest :: proc(packages: []Package, path: string) {
+	b: strings.Builder
+	strings.builder_init(&b, context.allocator)
+	strings.write_string(&b, "{\"packages\":{")
+	for pkg, i in packages {
+		strings.write_string(&b, ",\n" if i > 0 else "\n")
+		fmt.sbprintf(&b, "%q", pkg.dir)
+		strings.write_string(&b, ":{\"files\":[")
+		for e, j in pkg.entries {
+			name := e.path[len(pkg.dir)+1:] if len(pkg.dir) > 0 else e.path
+			fmt.sbprintf(&b, "%s[%q,%d]", "," if j > 0 else "", name, len(e.data))
+		}
+		strings.write_string(&b, "],\"imports\":[")
+		for imp, j in pkg.imports {
+			fmt.sbprintf(&b, "%s%q", "," if j > 0 else "", imp)
+		}
+		strings.write_string(&b, "]}")
+	}
+	strings.write_string(&b, "\n}}\n")
+	if err := os.write_entire_file(path, b.buf[:]); err != nil {
+		fatal("Cannot write %s: %v", path, err)
+	}
+}
+
 main :: proc() {
 	if len(os.args) != 5 {
-		fatal("Usage: pack_root <odin root> <output pack> <karl2d dir> <examples output dir>")
+		fatal("Usage: pack_root <odin root> <packs output dir> <karl2d dir> <examples output dir>")
 	}
-	odin_root, out_path, karl2d_root, examples_out := os.args[1], os.args[2], os.args[3], os.args[4]
+	odin_root, packs_out, karl2d_root, examples_out := os.args[1], os.args[2], os.args[3], os.args[4]
 	// Directory listings give absolute paths, so the roots must be absolute too
 	abs :: proc(path: string) -> string {
 		absolute, err := os.get_absolute_path(path, context.allocator)
@@ -545,22 +777,15 @@ main :: proc() {
 	examples := collect_examples(join(karl2d_root, "examples"), examples_out)
 	write_manifest(examples[:], join(examples_out, "examples.json"))
 
-	out: [dynamic]byte
-	put_u32 :: proc(out: ^[dynamic]byte, v: u32) {
-		append(out, byte(v), byte(v >> 8), byte(v >> 16), byte(v >> 24))
+	if err := os.make_directory_all(packs_out); err != nil && err != .Exist {
+		fatal("Cannot create %s: %v", packs_out, err)
 	}
-	append(&out, "ODINPK01")
-	put_u32(&out, u32(len(p.entries)))
+	packages := group_packages(&p)
 	total := 0
-	for e in p.entries {
-		put_u32(&out, u32(len(e.path)))
-		append(&out, e.path)
-		put_u32(&out, u32(len(e.data)))
-		append(&out, ..e.data)
-		total += len(e.data)
+	for pkg in packages {
+		total += write_pack(pkg.entries[:], join(packs_out, fmt.tprintf("%s.pack", pkg.dir)))
 	}
-	if err := os.write_entire_file(out_path, out[:]); err != nil {
-		fatal("Cannot write %s: %v", out_path, err)
-	}
-	fmt.printfln("%s: %d files, %d bytes; %d examples in %s", out_path, len(p.entries), total, len(examples), examples_out)
+	write_pack_manifest(packages[:], join(packs_out, "manifest.json"))
+	fmt.printfln("%s: %d packages, %d files, %d bytes; %d examples in %s",
+	             packs_out, len(packages), len(p.entries), total, len(examples), examples_out)
 }
