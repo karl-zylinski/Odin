@@ -14,9 +14,12 @@
 			button:disabled { background: #555; }
 			#status { flex: 1; font-size: 13px; color: #aaa; }
 			main { flex: 1; display: flex; min-height: 0; }
-			#left { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+			#left { flex: 0 0 50%; display: flex; flex-direction: column; min-width: 0; }
 			#editor { flex: 1; min-height: 0; }
-			#right { flex: 1; display: flex; flex-direction: column; min-width: 0; border-left: 1px solid #444; }
+			/* Drag to give the editor or the game more room, double click to even them out */
+			#divider { flex: none; width: 5px; background: #444; cursor: col-resize; }
+			#divider:hover, #divider.dragging { background: #0e639c; }
+			#right { flex: 1; display: flex; flex-direction: column; min-width: 0; }
 			#game { flex: 1; border: none; background: black; min-height: 0; }
 			#console { margin: 0; padding: 8px; max-height: 30%; overflow: auto; font-family: monospace; font-size: 13px; white-space: pre-wrap; color: #f88; border-top: 1px solid #444; }
 			#console:empty { display: none; }
@@ -70,6 +73,7 @@
 				<div id="editor"></div>
 				<div id="files"></div>
 			</div>
+			<div id="divider" title="Drag to resize"></div>
 			<div id="right">
 				<iframe id="game" title="Game"></iframe>
 				<pre id="console"></pre>

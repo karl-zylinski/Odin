@@ -390,4 +390,53 @@ if (testParams.has("test")) {
 	}, 100);
 }
 
+// The divider between the editor and the game. The game runs in an iframe,
+// which would swallow the pointer events of a drag that passes over it, so it
+// is made transparent to them while the divider is held.
+const SPLIT_KEY = "karl2d-playground-split";
+{
+	const divider = document.getElementById("divider");
+	const leftPane = document.getElementById("left");
+	const mainElement = document.querySelector("main");
+	const MIN_PANE = 180; // px, so neither side can be dragged away entirely
+
+	const setSplit = (fraction) => {
+		leftPane.style.flexBasis = (fraction*100).toFixed(3) + "%";
+	};
+	const saved = parseFloat(localStorage.getItem(SPLIT_KEY));
+	if (saved > 0 && saved < 1) {
+		setSplit(saved);
+	}
+
+	divider.addEventListener("pointerdown", (event) => {
+		event.preventDefault();
+		divider.classList.add("dragging");
+		// The drag is followed on the window, so that it keeps up with a
+		// pointer that has left the divider (or the window)
+		gameFrame.style.pointerEvents = "none";
+
+		const move = (ev) => {
+			const rect = mainElement.getBoundingClientRect();
+			const x = Math.min(Math.max(ev.clientX - rect.left, MIN_PANE), rect.width - MIN_PANE);
+			const fraction = x/rect.width;
+			setSplit(fraction);
+			localStorage.setItem(SPLIT_KEY, String(fraction));
+		};
+		const up = () => {
+			divider.classList.remove("dragging");
+			gameFrame.style.pointerEvents = "";
+			window.removeEventListener("pointermove", move);
+			window.removeEventListener("pointerup", up);
+			window.removeEventListener("pointercancel", up);
+		};
+		window.addEventListener("pointermove", move);
+		window.addEventListener("pointerup", up);
+		window.addEventListener("pointercancel", up);
+	});
+	divider.addEventListener("dblclick", () => {
+		setSplit(0.5);
+		localStorage.removeItem(SPLIT_KEY);
+	});
+}
+
 setup().catch((e) => updateStatus("Failed to load: " + e));
