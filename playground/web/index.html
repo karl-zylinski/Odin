@@ -33,7 +33,9 @@
 			.ed-code, .ed-input { margin: 0; padding: 8px; font-family: inherit; font-size: inherit; line-height: inherit; tab-size: inherit; white-space: pre; }
 			.ed-code { position: absolute; left: 0; top: 0; color: #d4d4d4; pointer-events: none; }
 			.ed-input { position: absolute; inset: 0; width: 100%; height: 100%; box-sizing: border-box; border: none; outline: none; resize: none; overflow: auto; background: transparent; color: transparent; caret-color: #d4d4d4; }
-			.ed-input::selection { background: #264f78; }
+			/* The textarea's own text is transparent, so the selection has to be
+			   translucent for the colours of the layer behind to show through */
+			.ed-input::selection { background: rgba(70, 130, 200, 0.45); }
 			.ed-com { color: #6a9955; }
 			.ed-str { color: #ce9178; }
 			.ed-num { color: #b5cea8; }
