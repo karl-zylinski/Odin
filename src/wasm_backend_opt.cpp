@@ -3278,8 +3278,8 @@ gb_internal void wb_optimize_procedure(wbProcedure *p) {
 
 gb_internal void wb_link_mark_object_refs(wbModule *m);
 
-#define WB_INLINE_MAX_INSTRS       48   // callee size, in instructions
-#define WB_INLINE_MAX_IN_LOOP      96   // for calls inside a loop of the caller
+#define WB_INLINE_MAX_INSTRS       64   // callee size, in instructions
+#define WB_INLINE_MAX_IN_LOOP      160  // for calls inside a loop of the caller
 #define WB_INLINE_MAX_FORCED       512  // for #force_inline
 #define WB_INLINE_MAX_SINGLE       512  // callee with a single call site (nothing else can reach it)
 #define WB_INLINE_MAX_GROWTH       4096 // instructions added per caller
