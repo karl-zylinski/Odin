@@ -4596,15 +4596,33 @@ gb_internal wbValue wb_emit_call(wbProcedure *p, Type *pt, wbProcedure *callee, 
 		}
 		return wb_value_memory(result_addr.index, result_addr.offset, pt->Proc.results);
 	}
+	if (pt->Proc.result_count == 0) {
+		return wb_value_invalid();
+	}
 	if (pt->Proc.result_count == 1) {
 		Type *rt = wb_result_type(pt);
 		if (type_size_of(rt) == 0) {
 			return wb_value_invalid();
 		}
-		wbValType vt = wb_valtype_of(rt);
-		return wb_pop_to_local(p, vt, rt);
+		if (wb_is_scalar(rt)) {
+			return wb_pop_to_local(p, wb_valtype_of(rt), rt);
+		}
 	}
-	return wb_value_invalid();
+
+	// multi-value: the results are on the stack, gather them into a temporary
+	auto leaves = array_make<wbAbiLeaf>(temporary_allocator(), 0, 8);
+	bool direct = wb_abi_direct_results(pt, &leaves);
+	GB_ASSERT(direct);
+	Type *result_type = pt->Proc.result_count == 1 ? wb_result_type(pt) : pt->Proc.results;
+	wbAddr addr = wb_add_temp(p, pt->Proc.results);
+	auto tmps = array_make<wbValue>(temporary_allocator(), leaves.count);
+	for (isize i = leaves.count-1; i >= 0; i--) {
+		tmps[i] = wb_pop_to_local(p, wb_valtype_of(leaves[i].type), leaves[i].type);
+	}
+	for_array(i, leaves) {
+		wb_emit_store(p, addr.index, addr.offset + cast(i32)leaves[i].offset, tmps[i], leaves[i].type);
+	}
+	return wb_value_memory(addr.index, addr.offset, result_type);
 }
 
 // Converts an argument of a `#c_vararg` procedure to the type C's default

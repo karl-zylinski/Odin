@@ -3370,13 +3370,24 @@ gb_internal void wb_inline_body(wbProcedure *p, wbProcedure *c) {
 	}
 
 	wbFuncType const &ft = p->module->types[c->type_index];
-	u32 wrapper = wb_open_block(p, ft.results.count == 0 ? 0x40 : cast(u8)ft.results[0]);
+	// Several results go through locals: a block can only carry one value
+	// without a type index of its own
+	auto result_locals = array_make<u32>(ta, 0, ft.results.count);
+	if (ft.results.count > 1) {
+		for (wbValType vt : ft.results) {
+			array_add(&result_locals, wb_add_local(p, vt, {}));
+		}
+	}
+	u32 wrapper = wb_open_block(p, ft.results.count != 1 ? 0x40 : cast(u8)ft.results[0]);
 	for (wbInstr const &in : c->instrs) {
 		switch (in.kind) {
 		case wbInstr_EpilogueGet:
 		case wbInstr_EpilogueSet:
 			break;
 		case wbInstr_Return:
+			for (isize i = result_locals.count-1; i >= 0; i--) {
+				wb_local_set(p, result_locals[i]);
+			}
 			wb_br(p, wrapper);
 			break;
 		case wbInstr_Block: wb_open_block(p, cast(u8)in.imm); break;
@@ -3406,6 +3417,9 @@ gb_internal void wb_inline_body(wbProcedure *p, wbProcedure *c) {
 		}
 	}
 	wb_close(p);
+	for (u32 l : result_locals) {
+		wb_local_get(p, l);
+	}
 }
 
 // The procedure `c` only forwards its parameters to (a generated hasher

@@ -287,7 +287,14 @@ gb_internal void wb_emit_return_values(wbProcedure *p, Array<wbValue> const &val
 			wb_addr_store(p, wb_addr_memory(cast(u32)p->sret_local, cast(i32)offset, ft), values[i]);
 		}
 	} else if (values.count > 0) {
-		wb_push(p, values[0]);
+		if (values.count == 1 && wb_is_scalar(values[0].type)) {
+			wb_push(p, values[0]);
+		} else {
+			// multi-value: the leaves of every result, in order
+			for_array(i, values) {
+				wb_push_abi_arg(p, values[i], pt->Proc.results->Tuple.variables[i]->type, pt->Proc.calling_convention);
+			}
+		}
 	}
 	wb_emit_epilogue(p);
 	wb_op(p, wbOp_return);

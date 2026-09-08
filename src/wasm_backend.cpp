@@ -211,18 +211,6 @@ gb_internal Type *wb_result_type(Type *pt) {
 	return pt->Proc.results->Tuple.variables[0]->type;
 }
 
-// True if the results are returned through a pointer passed as the first parameter
-gb_internal bool wb_uses_sret(Type *pt) {
-	pt = base_type(pt);
-	if (pt->Proc.result_count == 0) {
-		return false;
-	}
-	if (pt->Proc.result_count > 1) {
-		return true;
-	}
-	return !wb_is_scalar(wb_result_type(pt));
-}
-
 gb_internal u32 wb_add_functype(wbModule *m, wbFuncType const &ft) {
 	for_array(i, m->types) {
 		wbFuncType const &other = m->types[i];
@@ -385,6 +373,55 @@ gb_internal bool wb_abi_flatten(Type *t, ProcCallingConvention cc, i64 base_offs
 	return false;
 }
 
+// A procedure returns at most this many wasm values before the results go
+// through a pointer instead
+#define WB_MAX_RESULT_LEAVES 8
+
+// The results of `pt` as the wasm values a call leaves on the stack, at the
+// offsets they have in the result tuple. False when they are returned through
+// a pointer passed as the first parameter (the C ABI's sret) instead.
+gb_internal bool wb_abi_direct_results(Type *pt, Array<wbAbiLeaf> *leaves) {
+	pt = base_type(pt);
+	GB_ASSERT(pt->kind == Type_Proc);
+	if (pt->Proc.result_count == 0) {
+		return false;
+	}
+	if (pt->Proc.result_count == 1) {
+		Type *rt = wb_result_type(pt);
+		if (wb_is_scalar(rt)) {
+			if (type_size_of(rt) > 0) {
+				wbAbiLeaf leaf = {0, rt};
+				array_add(leaves, leaf);
+			}
+			return true;
+		}
+	}
+	// Several results, or one that is not a single wasm value, come back as
+	// several wasm results. Only for Odin's own calling convention: foreign
+	// code and the host expect the C ABI that LLVM's wasm backend uses.
+	if (pt->Proc.calling_convention != ProcCC_Odin) {
+		return false;
+	}
+	for_array(i, pt->Proc.results->Tuple.variables) {
+		Type *ft = nullptr;
+		i64 offset = type_offset_of(pt->Proc.results, i, &ft);
+		if (!wb_abi_flatten(ft, pt->Proc.calling_convention, offset, leaves)) {
+			return false;
+		}
+	}
+	return leaves->count <= WB_MAX_RESULT_LEAVES;
+}
+
+// True if the results are returned through a pointer passed as the first parameter
+gb_internal bool wb_uses_sret(Type *pt) {
+	pt = base_type(pt);
+	if (pt->Proc.result_count == 0) {
+		return false;
+	}
+	auto leaves = array_make<wbAbiLeaf>(temporary_allocator(), 0, 8);
+	return !wb_abi_direct_results(pt, &leaves);
+}
+
 // Computes the wasm signature of a procedure type (see the calling convention
 // description in wasm_backend.hpp)
 gb_internal void wb_functype_of_proc(wbModule *m, Type *pt, wbFuncType *ft) {
@@ -427,10 +464,12 @@ gb_internal void wb_functype_of_proc(wbModule *m, Type *pt, wbFuncType *ft) {
 	if (cc == ProcCC_Odin) {
 		array_add(&ft->params, wbValType_i32); // context pointer
 	}
-	if (pt->Proc.result_count == 1 && !wb_uses_sret(pt)) {
-		Type *rt = wb_result_type(pt);
-		if (type_size_of(rt) > 0) {
-			array_add(&ft->results, wb_valtype_of(rt));
+	{
+		auto leaves = array_make<wbAbiLeaf>(temporary_allocator(), 0, 8);
+		if (wb_abi_direct_results(pt, &leaves)) {
+			for (wbAbiLeaf const &leaf : leaves) {
+				array_add(&ft->results, wb_valtype_of(leaf.type));
+			}
 		}
 	}
 }
