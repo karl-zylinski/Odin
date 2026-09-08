@@ -1873,6 +1873,24 @@ gb_internal void wb_write_const_data(wbModule *m, Type *type, ExactValue const &
 	GB_PANIC("wasm backend: cannot serialize constant of type %s", type_to_string(type));
 }
 
+// Marks [addr, addr+size) of the data segment as never written at runtime, so
+// that loads of it can be folded (`wb_const_data_bytes`). Kept in address order.
+gb_internal void wb_const_data_register(wbModule *m, u32 addr, i64 size) {
+	if (size <= 0) {
+		return;
+	}
+	u64 entry = (cast(u64)addr << 32) | cast(u64)size;
+	isize i = m->const_data.count;
+	while (i > 0 && m->const_data[i-1] > entry) {
+		i--;
+	}
+	array_add(&m->const_data, entry);
+	for (isize k = m->const_data.count-1; k > i; k--) {
+		m->const_data[k] = m->const_data[k-1];
+	}
+	m->const_data[i] = entry;
+}
+
 // Places a constant in the data segment and returns its absolute address
 gb_internal u32 wb_const_data_addr(wbModule *m, Type *type, ExactValue const &value) {
 	if (is_type_untyped(type)) {
@@ -1884,9 +1902,7 @@ gb_internal u32 wb_const_data_addr(wbModule *m, Type *type, ExactValue const &va
 	wb_write_const_data(m, type, value, bytes);
 	u32 addr = wb_data_alloc(m, size, type_align_of(type));
 	wb_data_write(m, addr, bytes, size);
-	if (size > 0) {
-		array_add(&m->const_data, (cast(u64)addr << 32) | cast(u64)size);
-	}
+	wb_const_data_register(m, addr, size);
 	return addr;
 }
 

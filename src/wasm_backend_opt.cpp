@@ -1633,6 +1633,55 @@ gb_internal bool wb_opt_fold_i32(wbOp op, u32 a, u32 c, u32 *r) {
 	return true;
 }
 
+// Evaluates a binary `i64` operation on constants (not the trapping ones)
+gb_internal bool wb_opt_fold_i64(wbOp op, u64 a, u64 c, u64 *r) {
+	i64 sa = cast(i64)a, sc = cast(i64)c;
+	switch (op) {
+	case wbOp_i64_add:   *r = a + c;  break;
+	case wbOp_i64_sub:   *r = a - c;  break;
+	case wbOp_i64_mul:   *r = a * c;  break;
+	case wbOp_i64_and:   *r = a & c;  break;
+	case wbOp_i64_or:    *r = a | c;  break;
+	case wbOp_i64_xor:   *r = a ^ c;  break;
+	case wbOp_i64_shl:   *r = a << (c & 63); break;
+	case wbOp_i64_shr_u: *r = a >> (c & 63); break;
+	case wbOp_i64_shr_s: *r = cast(u64)(sa >> (c & 63)); break;
+	case wbOp_i64_div_u: if (c == 0) return false; *r = a / c; break;
+	case wbOp_i64_rem_u: if (c == 0) return false; *r = a % c; break;
+	case wbOp_i64_eq:    *r = a == c;   break;
+	case wbOp_i64_ne:    *r = a != c;   break;
+	case wbOp_i64_lt_s:  *r = sa < sc;  break;
+	case wbOp_i64_lt_u:  *r = a < c;    break;
+	case wbOp_i64_gt_s:  *r = sa > sc;  break;
+	case wbOp_i64_gt_u:  *r = a > c;    break;
+	case wbOp_i64_le_s:  *r = sa <= sc; break;
+	case wbOp_i64_le_u:  *r = a <= c;   break;
+	case wbOp_i64_ge_s:  *r = sa >= sc; break;
+	case wbOp_i64_ge_u:  *r = a >= c;   break;
+	default: return false;
+	}
+	return true;
+}
+
+// Evaluates a unary integer conversion on a constant
+gb_internal bool wb_opt_fold_int_unary(wbOp op, u64 a, u64 *r, wbValType *rt) {
+	*rt = wbValType_i32;
+	switch (op) {
+	case wbOp_i32_eqz:           *r = cast(u32)a == 0; break;
+	case wbOp_i64_eqz:           *r = a == 0; break;
+	case wbOp_i32_wrap_i64:      *r = cast(u32)a; break;
+	case wbOp_i32_extend8_s:     *r = cast(u32)cast(i32)cast(i8)a; break;
+	case wbOp_i32_extend16_s:    *r = cast(u32)cast(i32)cast(i16)a; break;
+	case wbOp_i64_extend_i32_s:  *r = cast(u64)cast(i64)cast(i32)cast(u32)a; *rt = wbValType_i64; break;
+	case wbOp_i64_extend_i32_u:  *r = cast(u64)cast(u32)a; *rt = wbValType_i64; break;
+	case wbOp_i64_extend8_s:     *r = cast(u64)cast(i64)cast(i8)a; *rt = wbValType_i64; break;
+	case wbOp_i64_extend16_s:    *r = cast(u64)cast(i64)cast(i16)a; *rt = wbValType_i64; break;
+	case wbOp_i64_extend32_s:    *r = cast(u64)cast(i64)cast(i32)a; *rt = wbValType_i64; break;
+	default: return false;
+	}
+	return true;
+}
+
 // Evaluates the `i32` expression in [start, end) when it is made of
 // constants, locals known to hold constants at `at` and foldable operations
 gb_internal bool wb_opt_local_const_before(wbOpt *o, i32 k, u32 l, u32 *value, bool *have, int depth, i32 *budget);
@@ -2142,13 +2191,14 @@ gb_internal void wb_opt_peephole(wbOpt *o) {
 					empty = e2 >= 0 && wb_opt_live(o, e2) && wb_opt_next_live(o, e1) == e2;
 				}
 				if (empty) {
-					o->deleted[k] = true;
 					o->deleted[e1] = true;
 					o->deleted[e2] = true;
 					i32 q = wb_opt_prev_live(o, k);
 					if (q >= 0 && o->producer[q] >= 0 && wb_opt_range_untouched(o, o->producer[q], q+1)) {
 						wb_opt_delete_range(o, o->producer[q], q+1);
+						o->deleted[k] = true;
 					} else {
+						// (the condition may just have been replaced by this pass)
 						wbInstr drop = wb_opt_scratch_begin(o, wbInstr_Other, wbOp_drop, 1, 0);
 						wb_opt_scratch_end(o, &drop);
 						wb_opt_replace(o, k, drop);
@@ -2520,6 +2570,30 @@ gb_internal void wb_opt_peephole(wbOpt *o) {
 					o->changed = true;
 					continue;
 				}
+			}
+		}
+
+		if (in.kind == wbInstr_Other && in.pops == 1 && in.pushes == 1 && in.op != wbOp_i32_eqz && in.op >= wbOp_i64_eqz) {
+			u64 a = 0, r = 0;
+			wbValType rt = wbValType_i32;
+			if (wb_opt_const_bits_of(o, k-1, &a) && o->in[k-1].op != wbOp_f32_const && o->in[k-1].op != wbOp_f64_const && wb_opt_fold_int_unary(cast(wbOp)in.op, a, &r, &rt)) {
+				o->deleted[k-1] = true;
+				wb_opt_replace(o, k, wb_opt_const_bits(o, rt, r));
+				o->changed = true;
+				continue;
+			}
+		}
+		if (in.kind == wbInstr_Other && in.pops == 2 && in.pushes == 1 && wb_opt_is_op(o, k-1, wbInstr_Const, wbOp_i64_const) && wb_opt_is_op(o, k-2, wbInstr_Const, wbOp_i64_const)) {
+			u64 a = 0, c = 0, r = 0;
+			wb_opt_const_bits_of(o, k-2, &a);
+			wb_opt_const_bits_of(o, k-1, &c);
+			if (wb_opt_fold_i64(cast(wbOp)in.op, a, c, &r)) {
+				bool is_cmp = in.op >= wbOp_i64_eq && in.op <= wbOp_i64_ge_u;
+				o->deleted[k-2] = true;
+				o->deleted[k-1] = true;
+				wb_opt_replace(o, k, wb_opt_const_bits(o, is_cmp ? wbValType_i32 : wbValType_i64, r));
+				o->changed = true;
+				continue;
 			}
 		}
 

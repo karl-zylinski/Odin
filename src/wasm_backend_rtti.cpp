@@ -489,7 +489,9 @@ gb_internal void wb_setup_type_info_data(wbModule *m) {
 			wb_write_le(bytes + tag_offset, cast(u64)tag_index, type_size_of(tag_type));
 		}
 		wb_data_write(m, m->type_info_addrs[entry_index], bytes, ti_size);
+		wb_const_data_register(m, m->type_info_addrs[entry_index], ti_size);
 	}
+	wb_const_data_register(m, m->type_info_addrs[0], ti_size);
 
 	// type_table: []^Type_Info over the hash map slots
 	i64 ptr_size = build_context.ptr_size;
@@ -500,6 +502,7 @@ gb_internal void wb_setup_type_info_data(wbModule *m) {
 		wb_write_le(ptr_bytes + i*ptr_size, m->type_info_addrs[i], ptr_size);
 	}
 	wb_data_write(m, ptrs, ptr_bytes, ptr_size*count);
+	wb_const_data_register(m, ptrs, ptr_size*count);
 
 	Entity *type_table = scope_lookup_current(info->runtime_package->scope, string_interner_insert(str_lit("type_table")));
 	GB_ASSERT(type_table != nullptr);
@@ -510,6 +513,7 @@ gb_internal void wb_setup_type_info_data(wbModule *m) {
 	wb_write_le(slice_bytes, ptrs, ptr_size);
 	wb_write_le(slice_bytes + type_offset_of(slice_type, 1, nullptr), count, build_context.int_size);
 	wb_data_write(m, table_addr, slice_bytes, type_size_of(slice_type));
+	wb_const_data_register(m, table_addr, type_size_of(slice_type));
 }
 
 // The `^Type_Info` constant for a type

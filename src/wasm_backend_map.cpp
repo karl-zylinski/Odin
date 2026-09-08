@@ -374,7 +374,7 @@ gb_internal u32 wb_map_cell_info_addr(wbModule *m, Type *type) {
 
 	u32 addr = wb_data_alloc(m, st_size, type_align_of(st));
 	wb_data_write(m, addr, bytes, st_size);
-	array_add(&m->const_data, (cast(u64)addr << 32) | cast(u64)st_size);
+	wb_const_data_register(m, addr, st_size);
 	string_map_set(&m->map_cell_infos, name, addr);
 	return addr;
 }
@@ -405,7 +405,7 @@ gb_internal u32 wb_map_info_addr(wbModule *m, Type *map_type) {
 
 	u32 addr = wb_data_alloc(m, st_size, type_align_of(st));
 	wb_data_write(m, addr, bytes, st_size);
-	array_add(&m->const_data, (cast(u64)addr << 32) | cast(u64)st_size);
+	wb_const_data_register(m, addr, st_size);
 	string_map_set(&m->map_infos, name, addr);
 	return addr;
 }

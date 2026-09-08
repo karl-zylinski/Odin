@@ -287,8 +287,31 @@ negated_constants :: proc() {
 	fmt.printf("negconst bits %08x %016x\n", bits32(-cf), bits64(-cd))
 }
 
+// An `if` whose condition folds to a constant in the same optimizer pass
+// that empties its body (the flag is set from constants once the call is
+// inlined): the condition must still be dropped
+verb_flags :: proc(fi: ^bool, verb: rune) {
+	x := verb == 'b' || verb == 'o'
+	if x && !fi^ {
+		fi^ = true
+	}
+	fmt.println("verb_flags", fi^, verb)
+}
+
+// `i64` operations and integer conversions on constants fold
+i64_folding :: proc() {
+	n := i64(359)
+	m := u64(0xFFFF_FFFF_0000_0001)
+	neg := i32(-5)
+	wide := i32(200)
+	fmt.println("i64", n * 3, m % 7, m >> 3, i32(n) << 2, u32(m), u64(transmute(u32)neg), i64(i8(wide)), n == 359, m < 12)
+}
+
 main :: proc() {
 	const_aggregates()
+	flag := false
+	verb_flags(&flag, 'v')
+	i64_folding()
 
 	dead_stores(opaque_int(6))
 	dead_stores(opaque_int(2))
