@@ -5930,7 +5930,10 @@ gb_internal Entity *check_entity_from_ident_or_selector(CheckerContext *c, Ast *
 				if (entity->kind == Entity_ProcGroup) {
 					return entity;
 				}
-				GB_ASSERT_MSG(entity->type != nullptr, "%.*s (%.*s)", LIT(entity->token.string), LIT(entity_strings[entity->kind]));
+				// GB_ASSERT_MSG(entity->type != nullptr, "%.*s (%.*s)", LIT(entity->token.string), LIT(entity_strings[entity->kind]));
+				if (entity->type == nullptr) {
+					return nullptr;
+				}
 			}
 		}
 
@@ -6061,7 +6064,10 @@ gb_internal Entity *check_selector(CheckerContext *c, Operand *operand, Ast *nod
 				add_type_and_value(c, operand->expr, operand->mode, operand->type, operand->value);
 				return entity;
 			}
-			GB_ASSERT_MSG(entity->type != nullptr, "%.*s (%.*s)", LIT(entity->token.string), LIT(entity_strings[entity->kind]));
+			// GB_ASSERT_MSG(entity->type != nullptr, "%.*s (%.*s)", LIT(entity->token.string), LIT(entity_strings[entity->kind]));
+			if (entity->type == nullptr) {
+				return nullptr;
+			}
 		}
 	}
 
@@ -13943,22 +13949,36 @@ gb_internal gbString write_expr_to_string(gbString str, Ast *node, bool shorthan
 		}
 	case_end;
 
+	case_ast_node(term, AsmMemoryTerm, node);
+		GB_ASSERT(term->operand != nullptr);
+		str = write_expr_to_string(str, term->operand, shorthand);
+		if (term->scale != nullptr) {
+			str = gb_string_append_length(str, term->scale_op.string.text, term->scale_op.string.len);
+			str = write_expr_to_string(str, term->scale, shorthand);
+		}
+	case_end;
 	case_ast_node(op, AsmMemoryOperand, node);
 		str = gb_string_appendc(str, "[");
-		str = write_expr_to_string(str, op->base, shorthand);
-		if (op->index) {
-			str = gb_string_appendc(str, " + ");
-			str = write_expr_to_string(str, op->index, shorthand);
-			if (op->scale) {
-				str = gb_string_appendc(str, "*");
-				str = write_expr_to_string(str, op->scale, shorthand);
-			}
+		if (op->segment_override != nullptr) {
+			str = write_expr_to_string(str, op->segment_override, shorthand);
+			str = gb_string_appendc(str, ":");
 		}
-		if (op->disp) {
-			str = gb_string_appendc(str, " + ");
-			str = write_expr_to_string(str, op->disp, shorthand);
+		for_array(i, op->terms) {
+			Ast *term = op->terms[i];
+			GB_ASSERT(term->kind == Ast_AsmMemoryTerm);
+			Token tok = term->AsmMemoryTerm.op;
+			if (i > 0 || tok.kind != Token_Add) {
+				str = gb_string_appendc(str, " ");
+				str = gb_string_append_length(str, tok.string.text, tok.string.len);
+				str = gb_string_appendc(str, " ");
+			}
+			str = write_expr_to_string(str, term, shorthand);
 		}
 		str = gb_string_appendc(str, "]");
+		if (op->type != nullptr) {
+			str = gb_string_appendc(str, ":");
+			str = write_expr_to_string(str, op->type, shorthand);
+		}
 	case_end;
 	}
 
