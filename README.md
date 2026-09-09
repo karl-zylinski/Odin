@@ -1,3 +1,11 @@
+This is a fork of the Odin compiler that is possible to run inside a web browser. It has:
+- A WASM backend: Emit WASM directly without LLVM
+- Possibility to exclude LLVM completely
+
+It is what enables the [Karl2D Playground](https://karl2d.com/playground) to compile Odin programs directly in your browser.
+
+---
+
 <p align="center">
     <img src="misc/logo-slim.png" alt="Odin logo" style="width:65%">
     <br/>
