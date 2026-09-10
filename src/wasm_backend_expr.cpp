@@ -3884,6 +3884,14 @@ gb_internal wbValue wb_build_builtin_call_internal(wbProcedure *p, Ast *expr, Bu
 	}
 	case BuiltinProc_min:
 	case BuiltinProc_max: {
+		// An endian-specific scalar is computed in its platform type and put
+		// back afterwards, as arithmetic on one is: its local holds the bytes
+		// the other way round, which f32.abs and an i32 compare know nothing of
+		Type *result_type = type;
+		if (is_type_different_to_arch_endianness(type)) {
+			type = integer_endian_type_to_platform_type(type);
+			vt = wb_valtype_of(type);
+		}
 		wbValue acc = wb_emit_conv(p, wb_build_expr(p, args[0]), type);
 		for (isize i = 1; i < args.count; i++) {
 			if (wb_expr_has_call(args[i])) acc = wb_value_fresh(p, acc);
@@ -3902,7 +3910,7 @@ gb_internal wbValue wb_build_builtin_call_internal(wbProcedure *p, Ast *expr, Bu
 			}
 			acc = wb_pop_to_local(p, vt, type);
 		}
-		return acc;
+		return wb_emit_conv(p, acc, result_type);
 	}
 	case BuiltinProc_abs: {
 		Type *at = type_of_expr(args[0]);
@@ -3918,11 +3926,19 @@ gb_internal wbValue wb_build_builtin_call_internal(wbProcedure *p, Ast *expr, Bu
 			cargs[0] = wb_emit_conv(p, wb_build_expr(p, args[0]), at);
 			return wb_emit_conv(p, wb_emit_runtime_call(p, name, cargs), type);
 		}
+		// An endian-specific scalar is computed in its platform type and put
+		// back afterwards, as arithmetic on one is: its local holds the bytes
+		// the other way round, which f32.abs and an i32 compare know nothing of
+		Type *result_type = type;
+		if (is_type_different_to_arch_endianness(type)) {
+			type = integer_endian_type_to_platform_type(type);
+			vt = wb_valtype_of(type);
+		}
 		wbValue x = wb_emit_conv(p, wb_build_expr(p, args[0]), type);
 		if (x.kind == wbValue_Invalid) return x;
 		if (wb_is_int128(type)) {
 			if (!wb_type_is_signed(type)) {
-				return x;
+				return wb_emit_conv(p, x, result_type);
 			}
 			// res = x; if high word < 0 { res = 0 - x }
 			x = wb_value_copy(p, x);
@@ -3934,7 +3950,7 @@ gb_internal wbValue wb_build_builtin_call_internal(wbProcedure *p, Ast *expr, Bu
 			wbValue neg = wb_emit_arith128(p, expr, Token_Sub, wb_emit_conv(p, wb_value_const_int(t_int, 0), type), x, type, type);
 			wb_addr_store(p, res, neg);
 			wb_close(p);
-			return x;
+			return wb_emit_conv(p, x, result_type);
 		}
 		if (vt == wbValType_f32 || vt == wbValType_f64) {
 			wb_push(p, x);
@@ -3950,11 +3966,19 @@ gb_internal wbValue wb_build_builtin_call_internal(wbProcedure *p, Ast *expr, Bu
 			else                     { wb_i32_const(p, 0); wb_op(p, wbOp_i32_ge_s); }
 			wb_op(p, wbOp_select);
 		} else {
-			return x;
+			return wb_emit_conv(p, x, result_type);
 		}
-		return wb_pop_to_local(p, vt, type);
+		return wb_emit_conv(p, wb_pop_to_local(p, vt, type), result_type);
 	}
 	case BuiltinProc_clamp: {
+		// An endian-specific scalar is computed in its platform type and put
+		// back afterwards, as arithmetic on one is: its local holds the bytes
+		// the other way round, which f32.abs and an i32 compare know nothing of
+		Type *result_type = type;
+		if (is_type_different_to_arch_endianness(type)) {
+			type = integer_endian_type_to_platform_type(type);
+			vt = wb_valtype_of(type);
+		}
 		wbValue x  = wb_emit_conv(p, wb_build_expr(p, args[0]), type);
 		if (wb_expr_has_call(args[1]) || wb_expr_has_call(args[2])) x = wb_value_fresh(p, x);
 		wbValue lo = wb_emit_conv(p, wb_build_expr(p, args[1]), type);
@@ -3966,7 +3990,7 @@ gb_internal wbValue wb_build_builtin_call_internal(wbProcedure *p, Ast *expr, Bu
 			wb_op(p, vt == wbValType_f32 ? wbOp_f32_max : wbOp_f64_max);
 			wb_push(p, hi);
 			wb_op(p, vt == wbValType_f32 ? wbOp_f32_min : wbOp_f64_min);
-			return wb_pop_to_local(p, vt, type);
+			return wb_emit_conv(p, wb_pop_to_local(p, vt, type), result_type);
 		}
 		bool is_signed = wb_type_is_signed(type);
 		wb_push(p, x); wb_push(p, lo); wb_push(p, x); wb_push(p, lo);
@@ -3976,7 +4000,7 @@ gb_internal wbValue wb_build_builtin_call_internal(wbProcedure *p, Ast *expr, Bu
 		wb_push(p, m); wb_push(p, hi); wb_push(p, m); wb_push(p, hi);
 		wb_emit_binary_op(p, Token_Lt, vt, is_signed);
 		wb_op(p, wbOp_select);
-		return wb_pop_to_local(p, vt, type);
+		return wb_emit_conv(p, wb_pop_to_local(p, vt, type), result_type);
 	}
 	case BuiltinProc_mem_copy:
 	case BuiltinProc_mem_copy_non_overlapping: {

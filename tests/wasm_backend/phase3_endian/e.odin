@@ -69,6 +69,18 @@ main :: proc() {
 	delete(m)
 	bs2()
 
+	// abs, min, max and clamp on endian-specific scalars are computed in the
+	// platform type, not on the swapped bytes the local holds
+	nf: f32be = -1.25
+	nd: f64be = -1e10
+	ni: i32be = -77
+	nu: u32be = 77
+	nl: i64be = -9876543210
+	fmt.println(abs(nf), abs(nd), abs(ni), abs(nu), abs(nl), transmute([4]u8)abs(nf), transmute([4]u8)abs(ni))
+	fmt.println(min(nf, f32be(2)), max(nf, f32be(2)), min(ni, i32be(3)), max(ni, i32be(3)), min(nu, u32be(1000)), max(nu, u32be(1000)), min(nd, f64be(0)), max(nl, i64be(0)))
+	fmt.println(clamp(nf, f32be(-1), f32be(1)), clamp(ni, i32be(-10), i32be(10)), clamp(nu, u32be(100), u32be(200)), clamp(nd, f64be(-5), f64be(5)), transmute([4]u8)clamp(ni, i32be(-10), i32be(10)))
+	fmt.println(abs(f16be(-2.5)), min(f16be(1), f16be(-1)), abs(i128be(-5)), abs(i16be(-300)), max(u16be(7), u16be(9)))
+
 	bs: bit_set[0..<32; u32be] = {1, 5, 31}
 	fmt.println(bs, 5 in bs, 6 in bs, transmute([4]u8)bs, bs + {2}, bs - {1}, card(bs))
 }
